@@ -134,12 +134,15 @@ export async function createApp(logging = true) {
       && (query.favorites !== 'true' || favorites.has(work.id)))
     if (!query.q?.trim() || query.sort !== 'relevance') {
       // by=collected 时「最新 / 最早」指收藏顺序（文件名开头的收藏编号），否则仍按发布日期。
+      // 收藏编号只在同一个媒体目录内部可比：Pixiv 的 bmk_id 和 Telegram 的消息号含义与量级都不同，
+      // 所以结果里涉及多个来源（混合显示）时忽略 by=collected，退回发布日期排序。
+      const byCollected = query.by === 'collected' && new Set(results.map(({ work }) => work.sourceId)).size === 1
       const collected = (work: { collected?: number }) => work.collected ?? 0
       const compare = query.sort === 'title' ? (a: typeof results[number], b: typeof results[number]) => a.work.title.localeCompare(b.work.title, 'zh-CN')
-        : query.sort === 'oldest' ? (a: typeof results[number], b: typeof results[number]) => query.by === 'collected'
+        : query.sort === 'oldest' ? (a: typeof results[number], b: typeof results[number]) => byCollected
           ? collected(a.work) - collected(b.work) || a.work.updated - b.work.updated
           : a.work.date.localeCompare(b.work.date)
-          : (a: typeof results[number], b: typeof results[number]) => query.by === 'collected'
+          : (a: typeof results[number], b: typeof results[number]) => byCollected
             ? collected(b.work) - collected(a.work) || b.work.updated - a.work.updated
             : b.work.date.localeCompare(a.work.date)
       results = results.sort(compare)

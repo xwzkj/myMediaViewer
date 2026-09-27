@@ -93,6 +93,7 @@ test('媒体库端到端：目录管理、分组、搜索、收藏、媒体流�
   }
   const add = (name: string, dir: string, kind: string) => app.inject({ method: 'POST', url: '/api/sources', payload: { name, path: dir, kind } })
   let sourceId = ''
+  let telegramId = ''
   let workId = ''
   try {
     await t.test('文件夹选择器：磁盘、中文路径、数字排序、空目录和非法路径', async () => {
@@ -126,7 +127,9 @@ test('媒体库端到端：目录管理、分组、搜索、收藏、媒体流�
       sourceId = added.json().id
       await waitScan()
       assert.equal((await add('duplicate', folder, 'pixiv')).statusCode, 409)
-      assert.equal((await add('影像', tele, 'telegram')).statusCode, 201)
+      const addedTelegram = await add('影像', tele, 'telegram')
+      assert.equal(addedTelegram.statusCode, 201)
+      telegramId = addedTelegram.json().id
       await waitScan()
       const status = (await app.inject('/api/status')).json()
       assert.equal(status.works, 4)
@@ -233,6 +236,8 @@ test('媒体库端到端：目录管理、分组、搜索、收藏、媒体流�
       assert.equal((await app.inject({ method: 'DELETE', url: `/api/sources/${sourceId}` })).statusCode, 200)
       assert.equal((await readFile(path.join(moved, '100-12_p0.png'))).length, image.length)
       assert.equal((await app.inject('/api/status')).json().works, 2)
+      // 只剩一个媒体目录时，不带 source 参数也能按该目录自己的收藏编号排序。
+      assert.deepEqual((await app.inject('/api/works?sort=newest&by=collected')).json().items.map((item: { externalId: string }) => item.externalId), ['23_202405', '22_202405'])
       assert.equal((await app.inject('/api/works?favorites=true')).json().total, 0)
       const persisted = JSON.parse(await readFile(path.join(root, 'database', 'sources.json'), 'utf8'))
       assert.equal(persisted.length, 1)
@@ -258,6 +263,14 @@ test('媒体库端到端：目录管理、分组、搜索、收藏、媒体流�
       assert.deepEqual(ids((await app.inject(`/api/works?source=${sortSourceId}&sort=oldest&by=collected`)).json()), ['23', '22', '21'])
       assert.deepEqual(ids((await app.inject(`/api/works?source=${sortSourceId}&sort=newest&by=published`)).json()), ['22', '23', '21'])
       assert.deepEqual(ids((await app.inject(`/api/works?source=${sortSourceId}&sort=oldest&by=published`)).json()), ['21', '23', '22'])
+      // 单个 Telegram 目录内按消息号排序，方向同样跟随「最新 / 最早」。
+      assert.deepEqual(ids((await app.inject(`/api/works?source=${telegramId}&sort=newest&by=collected`)).json()), ['23_202405', '22_202405'])
+      assert.deepEqual(ids((await app.inject(`/api/works?source=${telegramId}&sort=oldest&by=collected`)).json()), ['22_202405', '23_202405'])
+      // 不限定来源时收藏编号不可比，忽略 by=collected 退回发布日期排序。
+      const mixed = (await app.inject('/api/works?sort=newest&by=collected')).json()
+      const published = (await app.inject('/api/works?sort=newest&by=published')).json()
+      assert.deepEqual(mixed.items.map((item: { id: string }) => item.id), published.items.map((item: { id: string }) => item.id))
+      assert.deepEqual(ids(mixed).length, 5)
       // 不指定排序依据时保持原来的发布日期排序，标题排序也不受影响。
       assert.deepEqual(ids((await app.inject(`/api/works?source=${sortSourceId}&sort=newest`)).json()), ['22', '23', '21'])
       assert.deepEqual(ids((await app.inject(`/api/works?source=${sortSourceId}&sort=title`)).json()), ['21', '22', '23'])
