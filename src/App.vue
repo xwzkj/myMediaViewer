@@ -87,11 +87,22 @@ async function loadPage(target: number, silent = false) {
   }
 }
 function loadWorks() { void loadPage(1) }
-function loadMore(force = false) {
+async function loadMore(force = false) {
   if (force) moreFailed.value = false
   if (loading.value || loadingMore.value || moreFailed.value) return
   if (result.value.page >= result.value.pages) return
-  void loadPage(result.value.page + 1)
+  await loadPage(result.value.page + 1)
+}
+// 查看器里左右滑动其他区域时切换上 / 下一个作品，走到已加载内容的尽头就先取下一页。
+async function navigateWork(direction: number, auto = false) {
+  const list = result.value.items
+  const at = list.findIndex(work => work.id === selected.value?.id)
+  if (at < 0) return
+  if (at + direction >= list.length && result.value.page < result.value.pages) await loadMore()
+  const target = result.value.items[at + direction]
+  // 自动翻页走到尽头时安静停下，只有用户自己滑动才提示。
+  if (!target) { if (!auto) notice(direction > 0 ? '已经是最后一组作品' : '已经是第一组作品'); return }
+  selected.value = target
 }
 async function refreshStatus() {
   if (refreshInProgress) return
@@ -178,6 +189,14 @@ function searchByTag(tag: string) {
   closeSuggestions()
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
+// 点击作者名直接按这个作者搜索。
+function searchByAuthor(author: string) {
+  query.value = author
+  view.value = 'library'; source.value = ''; kind.value = ''; fuzzy.value = false
+  selected.value = null
+  closeSuggestions()
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
 function navigate(next: 'library' | 'favorites', sourceId = '') { view.value = next; source.value = sourceId; query.value = ''; kind.value = '' }
 function resetFilters() { query.value = ''; source.value = ''; kind.value = ''; fuzzy.value = false }
 function retryLoadMore() { loadMore(true) }
@@ -233,7 +252,7 @@ onUnmounted(() => { destroyed = true; clearInterval(poll); clearTimeout(debounce
     </main>
     <nav class="mobile-nav" aria-label="手机导航"><button :class="{ active: view === 'library' }" @click="navigate('library')"><span><Icon name="gallery" /></span>媒体库</button><button :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><span><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /></span>我的收藏</button><button @click="settings = true"><span><Icon name="settings" /></span>设置</button></nav>
     <SettingsDialog v-if="settings" :status="status" @close="settings = false" @changed="sourcesChanged" @notice="notice" />
-    <ViewerDialog v-if="selected" :work="selected" @close="selected = null" @favorite="toggleFavorite" @notice="notice" @search-tag="searchByTag" />
+    <ViewerDialog v-if="selected" :work="selected" @close="selected = null" @favorite="toggleFavorite" @notice="notice" @search-tag="searchByTag" @search-author="searchByAuthor" @navigate="navigateWork" />
     <Transition name="toast"><div v-if="toast" class="snackbar" role="status"><Icon name="success" :size="20" /><span>{{ toast }}</span><button class="icon-button" aria-label="关闭提示" @click="toast = ''"><Icon name="close" :size="18" /></button></div></Transition>
   </div>
 </template>
