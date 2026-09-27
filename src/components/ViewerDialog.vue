@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import type { WorkDetail, Work } from '../../shared/types'
+import { Viewer } from 'v-viewer'
 import { api, formatSize, kindLabel } from '../api'
 import Icon from './Icon.vue'
 
@@ -13,8 +14,7 @@ const detail = ref<WorkDetail | null>(null)
 const index = ref(0)
 const error = ref('')
 const mediaError = ref(false)
-const zoom = ref(false)
-const showInfo = ref(true)
+const previewing = ref(false)
 const slideshow = ref(false)
 const converting = ref(false)
 const convertMessage = ref('')
@@ -46,12 +46,12 @@ onMounted(async () => {
   document.body.style.overflow = 'hidden'
   if (gap > 0) document.body.style.paddingRight = `${gap}px`
   await load()
-  timer = setInterval(() => { if (slideshow.value && !isVideo.value && !zoom.value) next(1, true) }, 4500)
+  timer = setInterval(() => { if (slideshow.value && !isVideo.value && !previewing.value) next(1, true) }, 4500)
 })
 // 滑动切换到别的作品后重新取详情，并回到第一张。
-watch(() => props.work.id, () => { index.value = 0; zoom.value = false; mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; void load() })
-onUnmounted(() => { disposed = true; clearInterval(timer); clearTimeout(conversionTimer); document.body.style.overflow = previousOverflow; document.body.style.paddingRight = previousPadding })
-watch(index, () => { zoom.value = false; mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; clearTimeout(conversionTimer) })
+watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; void load() })
+onUnmounted(() => { disposed = true; destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); document.body.style.overflow = previousOverflow; document.body.style.paddingRight = previousPadding })
+watch(index, () => { destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; clearTimeout(conversionTimer) })
 watch(slideshow, value => { if (value && isVideo.value) void video.value?.play().catch(() => {}) })
 // 分 P 到头后继续滑动就切换作品：往后进入下一组的第 1 页，往回停在上一组的最后一页。
 function goWork(direction: number, auto = false) {
@@ -75,16 +75,22 @@ const mediaKey = computed(() => `${props.work.id}:${asset.value?.id || (error.va
 const slideName = computed(() => slide.value >= 0 ? 'media-next' : 'media-prev')
 let gesture: { pointerId: number; startX: number; startY: number; mode: 'page' | 'work' | 'ignore' } | null = null
 let suppressClick = false
+// viewer.js 浮层实例，以及给它提供图片的隐藏节点。
+let preview: InstanceType<typeof Viewer> | undefined
+let previewToken: HTMLDivElement | undefined
+let previewDestroying = false
 // 往回切换作品时，载入完成后停在最后一页。
 let startAtLast = false
 function gestureMode(target: EventTarget | null): 'page' | 'work' | 'ignore' {
   if (!(target instanceof Element)) return 'ignore'
-  // 放大后的图片要能自由平移，交给浏览器处理。
-  if (target.closest('.media-stage')) return zoom.value ? 'ignore' : 'page'
+  // viewer.js 浮层里的手势交给它自己处理。
+  if (target.closest('.viewer-container')) return 'ignore'
+  if (target.closest('.media-stage')) return 'page'
   if (target.closest('.filmstrip') || target.closest('button,a,input,select,textarea')) return 'ignore'
   return 'work'
 }
 function startGesture(target: EventTarget | null, x: number, y: number, id: number) {
+  if (previewing.value) return
   gesture = { pointerId: id, startX: x, startY: y, mode: gestureMode(target) }
   dragX.value = 0
 }
@@ -124,7 +130,8 @@ function pointerCancel() { gesture = null; dragX.value = 0 }
 // 触屏用 touch 事件，滑到视频画面上也能收到（视频控件不会把它吞掉）。
 function touchStart(event: TouchEvent) {
   const touch = event.changedTouches[0]
-  if (touch) startGesture(event.target, touch.clientX, touch.clientY, touch.identifier)
+  if (!touch) return
+  startGesture(event.target, touch.clientX, touch.clientY, touch.identifier)
 }
 function touchMove(event: TouchEvent) {
   const touch = Array.from(event.changedTouches).find(item => item.identifier === gesture?.pointerId)
@@ -135,12 +142,84 @@ function touchEnd(event: TouchEvent) {
   if (touch) endGesture(touch.identifier, touch.clientX, touch.clientY)
 }
 function touchCancel() { gesture = null; dragX.value = 0 }
-function stageClick() { if (!suppressClick) zoom.value = !zoom.value }
+// 点按图片交给 viewer.js 打开浮层，缩放、拖动、双击、捏合都由它负责。
+function openPreview() {
+  if (suppressClick || !asset.value) return
+  const host = dialog.value
+  if (!host) return
+  destroyPreview()
+  const token = document.createElement('div')
+  token.style.display = 'none'
+  const image = document.createElement('img')
+  image.src = asset.value.url
+  image.alt = props.work.title
+  token.appendChild(image)
+  // 浮层必须挂在 dialog 内部，否则会被顶层对话框盖住。
+  host.appendChild(token)
+  previewToken = token
+  previewing.value = true
+  const instance = new Viewer(token, {
+    container: host,
+    zIndex: 2200,
+    navbar: false,
+    title: false,
+    fullscreen: false,
+    keyboard: true,
+    backdrop: true,
+    movable: true,
+    zoomable: true,
+    rotatable: true,
+    scalable: true,
+    zoomOnWheel: true,
+    zoomRatio: 0.3,
+    zoomOnTouch: true,
+    zoomOnGesture: true,
+    slideOnTouch: false,
+    toggleOnDblclick: true,
+    tooltip: true,
+    toolbar: { zoomIn: true, zoomOut: true, oneToOne: true, reset: true, rotateLeft: true, rotateRight: true, prev: false, next: false, play: false, flipHorizontal: true, flipVertical: true },
+    hidden: () => { previewing.value = false; setTimeout(() => { if (!previewing.value) destroyPreview() }, 0) }
+  })
+  preview = instance
+  instance.show()
+  bindBackdropClose(host)
+}
+// 点浮层空白处关闭，拖动过图片时不触发。
+function bindBackdropClose(host: HTMLElement) {
+  const overlay = host.querySelector<HTMLElement>('.viewer-container')
+  if (!overlay) return
+  let start: { x: number; y: number } | null = null
+  overlay.addEventListener('pointerdown', event => { start = { x: (event as PointerEvent).clientX, y: (event as PointerEvent).clientY } })
+  overlay.addEventListener('click', (event: MouseEvent) => {
+    const target = event.target as HTMLElement
+    const moved = start ? Math.abs(event.clientX - start.x) > 6 || Math.abs(event.clientY - start.y) > 6 : false
+    start = null
+    if (moved) return
+    if (target.classList.contains('viewer-container') || target.classList.contains('viewer-canvas')) destroyPreview()
+  })
+}
+function destroyPreview() {
+  if (previewDestroying) return
+  previewDestroying = true
+  try { preview?.destroy() } catch { /* 浮层可能已经关闭 */ }
+  preview = undefined
+  previewToken?.remove()
+  previewToken = undefined
+  previewing.value = false
+  previewDestroying = false
+}
+// 浮层打开时按 Esc 只关浮层，不关整个查看器。
+function onCancel(event: Event) {
+  if (!previewing.value) return
+  event.preventDefault()
+  destroyPreview()
+}
 function selectPage(target: number) {
   slide.value = target >= index.value ? 1 : -1
   index.value = target
 }
 function keyboard(event: KeyboardEvent) {
+  if (previewing.value) return
   if ((event.target as HTMLElement).matches('input,textarea,video')) return
   if (event.key === 'ArrowRight') { event.preventDefault(); next(1) }
   if (event.key === 'ArrowLeft') { event.preventDefault(); next(-1) }
@@ -170,27 +249,26 @@ async function makeCompatible() {
 </script>
 
 <template>
-  <dialog ref="dialog" class="viewer-dialog" aria-labelledby="viewer-title" @close="emit('close')" @keydown="keyboard" @pointerdown="pointerDown" @pointermove="pointerMove" @pointerup="pointerUp" @pointercancel="pointerCancel" @touchstart.passive="touchStart" @touchmove.passive="touchMove" @touchend="touchEnd" @touchcancel="touchCancel">
-    <header class="viewer-toolbar"><button class="icon-button" aria-label="关闭查看器" @click="dialog?.close()"><Icon name="close" /></button><div class="viewer-title"><h2 id="viewer-title">{{ work.title }}</h2><span>{{ work.author || work.sourceName }}</span></div><span class="viewer-counter">{{ index + 1 }} / {{ detail?.assets.length || work.count }}</span><button class="icon-button" :class="{ selected: work.favorite }" :aria-label="work.favorite ? '取消收藏' : '收藏作品'" :aria-pressed="work.favorite" @click="emit('favorite', work)"><Icon :name="work.favorite ? 'heart-filled' : 'heart'" /></button><button class="icon-button" :class="{ selected: showInfo }" aria-label="作品信息" :aria-pressed="showInfo" @click="showInfo = !showInfo"><Icon name="info" /></button></header>
-    <div class="viewer-content" :class="{ 'without-info': !showInfo }">
+  <dialog ref="dialog" class="viewer-dialog" :aria-label="work.title" @close="emit('close')" @cancel="onCancel" @keydown="keyboard" @pointerdown="pointerDown" @pointermove="pointerMove" @pointerup="pointerUp" @pointercancel="pointerCancel" @touchstart.passive="touchStart" @touchmove.passive="touchMove" @touchend="touchEnd" @touchcancel="touchCancel">
+    <div class="viewer-content">
       <div class="viewer-main">
-        <div ref="stage" class="media-stage" :class="{ zoomed: zoom }" :style="dragX ? { transform: `translateX(${dragX}px)`, transition: 'none' } : undefined">
+        <div ref="stage" class="media-stage" :style="dragX ? { transform: `translateX(${dragX}px)`, transition: 'none' } : undefined">
           <Transition :name="slideName" mode="out-in">
             <div :key="mediaKey" class="media-frame">
               <p v-if="error" class="inline-error">{{ error }}</p><div v-else-if="!asset" class="loading-state"><span class="spinner" />正在打开作品…</div>
               <template v-else>
                 <video v-if="isVideo" ref="video" :key="mediaUrl" :src="mediaUrl" :poster="asset.thumbnail" controls playsinline preload="metadata" :autoplay="slideshow || asset.kind === 'animation'" :muted="asset.kind === 'animation'" :loop="asset.kind === 'animation' && !slideshow" @error="mediaError = true" @ended="slideshow && next(1, true)" />
-                <img v-else :key="asset.id" :src="asset.url" draggable="false" :alt="`${work.title}，第 ${index + 1} 张`" @click="stageClick" @error="mediaError = true" />
+                <img v-else :key="asset.id" :src="asset.url" draggable="false" :alt="`${work.title}，第 ${index + 1} 张`" @click="openPreview" @error="mediaError = true" />
                 <div v-if="mediaError" class="media-error"><Icon name="warning" :size="32" /><p>{{ isVideo ? '浏览器无法播放这个视频' : '无法读取这张图片' }}</p><button v-if="isVideo" class="button tonal" :disabled="converting" @click="makeCompatible">{{ converting ? '正在处理…' : '生成兼容版本' }}</button></div>
               </template>
             </div>
           </Transition>
-          <button v-if="!zoom && (detail?.assets.length || 0) > 1" class="viewer-arrow previous" aria-label="上一张" @click="next(-1)"><Icon name="left" :size="32" /></button><button v-if="!zoom && (detail?.assets.length || 0) > 1" class="viewer-arrow next" aria-label="下一张" @click="next(1)"><Icon name="right" :size="32" /></button>
+          <button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow previous" aria-label="上一张" @click="next(-1)"><Icon name="left" :size="32" /></button><button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow next" aria-label="下一张" @click="next(1)"><Icon name="right" :size="32" /></button>
         </div>
-        <div class="viewer-controls"><span>{{ asset ? `${kindLabel(asset.kind)} · ${formatSize(asset.size)}` : '' }}</span><div><button class="icon-button" :aria-label="slideshow ? '停止自动翻页' : '自动翻页'" :aria-pressed="slideshow" @click="slideshow = !slideshow"><Icon :name="slideshow ? 'pause' : 'play'" :size="22" /></button><button class="icon-button" aria-label="全屏" @click="fullscreen"><Icon name="fullscreen" :size="22" /></button><a v-if="asset" class="icon-button" :href="asset.url" target="_blank" rel="noopener" aria-label="打开原文件"><Icon name="external" :size="22" /></a></div></div>
+        <div class="viewer-controls"><span>{{ asset ? `${kindLabel(asset.kind)} · ${formatSize(asset.size)}` : '' }}</span><div><button class="icon-button" :class="{ selected: work.favorite }" :aria-label="work.favorite ? '取消收藏' : '收藏作品'" :aria-pressed="work.favorite" @click="emit('favorite', work)"><Icon :name="work.favorite ? 'heart-filled' : 'heart'" :size="20" /></button><button class="icon-button" :aria-label="slideshow ? '停止自动翻页' : '自动翻页'" :aria-pressed="slideshow" @click="slideshow = !slideshow"><Icon :name="slideshow ? 'pause' : 'play'" :size="22" /></button><button class="icon-button" aria-label="全屏" @click="fullscreen"><Icon name="fullscreen" :size="22" /></button><button class="icon-button" aria-label="关闭查看器" @click="dialog?.close()"><Icon name="close" :size="22" /></button></div></div>
         <div v-if="(detail?.assets.length || 0) > 1" class="filmstrip"><button v-for="(item, i) in detail?.assets" :key="item.id" :class="{ active: index === i }" :aria-label="`第 ${i + 1} 项`" :aria-pressed="index === i" @click="selectPage(i)"><img :src="item.thumbnail" loading="lazy" alt="" /><span>{{ i + 1 }}</span></button></div>
       </div>
-      <aside v-if="showInfo" class="work-info"><Transition name="info-fade" mode="out-in"><div :key="work.id"><span class="eyebrow">ABOUT THIS WORK</span><h2>{{ work.title }}</h2><p class="work-author"><button v-if="work.author" type="button" class="author-link" title="按这个作者搜索" @click="emit('searchAuthor', work.author)">{{ work.author }}</button><span v-else>{{ work.sourceName }}</span></p><dl><div><dt>来源</dt><dd>{{ work.sourceName }}</dd></div><div><dt>日期</dt><dd>{{ new Date(work.date).toLocaleDateString('zh-CN') }}</dd></div><div><dt>作品编号</dt><dd>{{ work.externalId }}</dd></div><div><dt>内容</dt><dd>{{ work.count }} 项媒体</dd></div></dl><div v-if="work.tags.length" class="tag-list" aria-label="作品标签"><button v-for="tag in work.tags" :key="tag" type="button" class="tag-chip" title="按这个标签搜索" @click="emit('searchTag', tag)">#{{ tag }}</button></div><h3>作品描述</h3><p class="description">{{ detail?.description || '这组作品暂时没有文字描述。' }}</p><a v-if="detail?.originalUrl" class="button outlined small" :href="detail.originalUrl" target="_blank" rel="noopener noreferrer">前往原作品<Icon name="external" :size="18" /></a><div v-if="isVideo" class="compatibility-panel"><p>遇到黑屏或只有声音？</p><button class="button tonal small" :disabled="converting || compatible" @click="makeCompatible"><Icon name="video" :size="18" />{{ compatible ? '已切换兼容版本' : converting ? '正在处理…' : '生成兼容版本' }}</button><span v-if="convertMessage" role="status">{{ convertMessage }}</span><small>生成的文件只保存在缓存中，原文件保持不变。</small></div></div></Transition></aside>
+      <aside class="work-info"><Transition name="info-fade" mode="out-in"><div :key="work.id"><span class="eyebrow">ABOUT THIS WORK</span><h2>{{ work.title }}</h2><p class="work-author"><button v-if="work.author" type="button" class="author-link" title="按这个作者搜索" @click="emit('searchAuthor', work.author)">{{ work.author }}</button><span v-else>{{ work.sourceName }}</span></p><dl><div><dt>来源</dt><dd>{{ work.sourceName }}</dd></div><div><dt>日期</dt><dd>{{ new Date(work.date).toLocaleDateString('zh-CN') }}</dd></div><div><dt>作品编号</dt><dd>{{ work.externalId }}</dd></div><div><dt>内容</dt><dd>{{ work.count }} 项媒体</dd></div></dl><div v-if="work.tags.length" class="tag-list" aria-label="作品标签"><button v-for="tag in work.tags" :key="tag" type="button" class="tag-chip" title="按这个标签搜索" @click="emit('searchTag', tag)">#{{ tag }}</button></div><h3>作品描述</h3><p class="description">{{ detail?.description || '这组作品暂时没有文字描述。' }}</p><a v-if="detail?.originalUrl" class="button outlined small" :href="detail.originalUrl" target="_blank" rel="noopener noreferrer">前往原作品<Icon name="external" :size="18" /></a><div v-if="isVideo" class="compatibility-panel"><p>遇到黑屏或只有声音？</p><button class="button tonal small" :disabled="converting || compatible" @click="makeCompatible"><Icon name="video" :size="18" />{{ compatible ? '已切换兼容版本' : converting ? '正在处理…' : '生成兼容版本' }}</button><span v-if="convertMessage" role="status">{{ convertMessage }}</span><small>生成的文件只保存在缓存中，原文件保持不变。</small></div></div></Transition></aside>
     </div>
   </dialog>
 </template>

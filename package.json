@@ -4,7 +4,9 @@
   "private": true,
   "packageManager": "pnpm@11.19.0",
   "type": "module",
-  "engines": { "node": ">=24.0.0" },
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "dev": "concurrently -k -n server,web \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
     "build": "vue-tsc --noEmit && tsc -p tsconfig.server.json && vite build",
@@ -21,6 +23,8 @@
     "opencc-js": "^1.0.5",
     "pinyin-pro": "^3.27.0",
     "sharp": "^0.34.5",
+    "v-viewer": "^3.0.23",
+    "viewerjs": "^1.15.0",
     "vue": "^3.5.22"
   },
   "devDependencies": {
