@@ -129,8 +129,10 @@ export async function createApp(logging = true) {
     const started = performance.now()
     const query = request.query
     const favorites = favoriteIds()
+    // kind 支持逗号分隔的多个值，例如 kind=video,animation：界面把视频和动图合并成了一个筛选。
+    const kinds = (query.kind || '').split(',').map(value => value.trim()).filter(Boolean)
     let results = searchWorks((query.q || '').slice(0, 500), query.fuzzy === 'true').filter(({ work }) =>
-      (!query.source || work.sourceId === query.source) && (!query.kind || work.kind === query.kind)
+      (!query.source || work.sourceId === query.source) && (!kinds.length || kinds.includes(work.kind))
       && (query.favorites !== 'true' || favorites.has(work.id)))
     if (!query.q?.trim() || query.sort !== 'relevance') {
       // by=collected 时「最新 / 最早」指收藏顺序（文件名开头的收藏编号），否则仍按发布日期。
