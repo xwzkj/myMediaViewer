@@ -1,1 +1,2 @@
-pnpm start
+call pnpm start
+pause
