@@ -5,7 +5,8 @@ import { stat, realpath } from 'node:fs/promises'
 import { networkInterfaces } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
-import { sources, saveSources, port } from './config.js'
+import { sources, saveSources, port, allowPublicAccess } from './config.js'
+import { isLocalAddress } from './access.js'
 import { allWorks, getAsset, getWork, workAssets, favoriteIds, setFavorite, toWork, db } from './database.js'
 import { refreshSearch, searchWorks, suggestTags } from './search.js'
 import { scanLibrary, scanStatus, onScan, sourceOnline } from './scanner.js'
@@ -20,6 +21,12 @@ export async function createApp(logging = true) {
   await detectFFmpeg()
   app.addHook('onRequest', async (request, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff').header('Referrer-Policy', 'same-origin')
+    // 默认只服务局域网：公网地址、以及任何经过代理转发的请求（本机反向代理/隧道同样会看起来像 127.0.0.1）都拒绝，
+    // 除非显式设置 ALLOW_PUBLIC_ACCESS。
+    const forwarded = request.headers['x-forwarded-for'] || request.headers['x-real-ip'] || request.headers.forwarded
+    if (!allowPublicAccess && (forwarded || !isLocalAddress(request.ip))) {
+      return reply.code(403).send({ message: '当前只允许局域网直接访问。如需公网或经由代理访问，请设置环境变量 ALLOW_PUBLIC_ACCESS=1 后重启服务。' })
+    }
     // API access is same-origin. Reject browser cross-site writes to the LAN service.
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
       const origin = request.headers.origin
@@ -43,6 +50,7 @@ export async function createApp(logging = true) {
       sources: sources.map(s => ({ ...s, works: works.filter(w => w.sourceId === s.id).length, online: sourceOnline.get(s.id) ?? existsSync(s.path) })),
       scan: scanStatus, ffmpeg: ffmpegAvailable,
       addresses: Object.values(networkInterfaces()).flat().filter(i => i && i.family === 'IPv4' && !i.internal).map(i => `http://${i!.address}:${port}`),
+      publicAccess: allowPublicAccess,
     }
   })
   app.post('/api/scan', async (_request, reply) => {

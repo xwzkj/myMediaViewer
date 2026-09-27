@@ -5,6 +5,7 @@ import path from 'node:path'
 import os from 'node:os'
 import sharp from 'sharp'
 import { parseJsonMetadata, parseName, parseMetadata, decodeText } from '../server/parsers.js'
+import { isLocalAddress } from '../server/access.js'
 
 test('两种命名规则、数字页码、大小写和双点扩展名', () => {
   assert.deepEqual(parseName('20434537023-92408550_p10.jpg', 'pixiv'), { externalId: '92408550', page: 10, metadata: false, kind: 'image', extension: 'jpg', sequence: 20434537023 })
@@ -50,9 +51,18 @@ test('元数据保留多段描述、解码实体和不同文本编码', () => {
   assert.deepEqual(parseJsonMetadata(JSON.stringify({ idNum: 5, title: '仅标题' }), 'pixiv').description, '')
 })
 
+test('访问范围：只放行局域网与保留地址，公网地址被拒绝', () => {
+  for (const address of ['127.0.0.1', '10.1.2.3', '100.64.0.7', '169.254.10.1', '172.16.5.4', '172.31.255.254', '192.168.31.17', '198.18.0.1', '::1', 'fd00::1', 'fe80::1', '::ffff:192.168.1.5']) {
+    assert.equal(isLocalAddress(address), true, address)
+  }
+  for (const address of ['8.8.8.8', '1.1.1.1', '172.32.0.1', '192.169.0.1', '203.0.113.9', '2001:db8::1']) {
+    assert.equal(isLocalAddress(address), false, address)
+  }
+})
 test('媒体库端到端：目录管理、分组、搜索、收藏、媒体流及离线恢复', async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'media-garden-test-'))
   process.env.MEDIA_DATA_DIR = path.join(root, 'database')
+  delete process.env.ALLOW_PUBLIC_ACCESS
   const { createApp } = await import('../server/app.js')
   const { scanLibrary, scanStatus } = await import('../server/scanner.js')
   const { db } = await import('../server/database.js')
@@ -121,6 +131,20 @@ test('媒体库端到端：目录管理、分组、搜索、收藏、媒体流�
       const status = (await app.inject('/api/status')).json()
       assert.equal(status.works, 4)
       assert.equal(status.files, 6)
+    })
+    await t.test('默认只服务局域网，公网地址被拒绝', async () => {
+      const lan = await app.inject({ url: '/api/status', remoteAddress: '192.168.31.50' })
+      assert.equal(lan.statusCode, 200)
+      assert.equal(lan.json().publicAccess, false)
+      assert.equal((await app.inject({ url: '/api/works', remoteAddress: '10.0.0.5' })).statusCode, 200)
+      const wan = await app.inject({ url: '/api/status', remoteAddress: '203.0.113.7' })
+      assert.equal(wan.statusCode, 403)
+      assert.match(wan.json().message, /局域网/)
+      assert.equal((await app.inject({ url: '/api/works', remoteAddress: '8.8.8.8' })).statusCode, 403)
+      assert.equal((await app.inject({ url: '/api/assets/missing/file', remoteAddress: '8.8.8.8' })).statusCode, 403)
+      // 经代理转发的请求在只允许局域网的默认模式下同样拒绝，避免本机隧道绕过地址判断。
+      assert.equal((await app.inject({ url: '/api/status', headers: { 'x-forwarded-for': '192.168.31.50' } })).statusCode, 403)
+      assert.equal((await app.inject({ method: 'POST', url: '/api/scan', remoteAddress: '8.8.8.8' })).statusCode, 403)
     })
     await t.test('作品页码排序、重复导出合并和标题回退', async () => {
       const result = (await app.inject('/api/works?q=山间旅行')).json()

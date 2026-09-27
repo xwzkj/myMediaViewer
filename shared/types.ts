@@ -21,7 +21,7 @@ export interface ScanStatus {
 export interface LibraryStatus {
   works: number; files: number; favorites: number; images: number; videos: number; animations: number;
   sources: Array<Source & { works: number; online: boolean }>;
-  scan: ScanStatus; ffmpeg: boolean; addresses: string[]
+  scan: ScanStatus; ffmpeg: boolean; addresses: string[]; publicAccess: boolean
 }
 export interface WorksResponse { items: Work[]; total: number; page: number; pages: number; elapsed: number }
 export interface TagSuggestion { name: string; count: number }

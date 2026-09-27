@@ -9,6 +9,8 @@ mkdirSync(cacheDir, { recursive: true })
 export const port = Number(process.env.PORT || 3210)
 export const host = process.env.HOST || '0.0.0.0'
 export const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg'
+// 默认只允许局域网/保留地址访问；把 ALLOW_PUBLIC_ACCESS 设为 1/true/yes/on 才放行公网地址。
+export const allowPublicAccess = /^(1|true|yes|on)$/i.test((process.env.ALLOW_PUBLIC_ACCESS || '').trim())
 
 const configPath = path.join(dataDir, 'sources.json')
 if (!existsSync(configPath)) writeFileSync(configPath, '[]', 'utf8')
