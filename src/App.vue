@@ -9,14 +9,22 @@ import SettingsDialog from './components/SettingsDialog.vue'
 import ViewerDialog from './components/ViewerDialog.vue'
 
 const status = ref<LibraryStatus | null>(null)
-const view = ref<'library' | 'favorites'>('library')
-const source = ref('')
-const kind = ref('')
+// 记住上次看的是哪个来源、带哪些筛选、怎么排序，下次打开直接恢复。
+const savedState = ((): Record<string, unknown> => {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem('libraryState') || '{}')
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
+  } catch { return {} }
+})()
+const savedText = (value: unknown, allowed: string[], fallback: string) => typeof value === 'string' && allowed.includes(value) ? value : fallback
+const view = ref<'library' | 'favorites'>(savedState.view === 'favorites' ? 'favorites' : 'library')
+const source = ref(typeof savedState.source === 'string' ? savedState.source : '')
+const kind = ref(savedText(savedState.kind, ['', 'image', 'video'], ''))
 const query = ref('')
-const sort = ref('newest')
+const sort = ref(savedText(savedState.sort, ['newest', 'oldest', 'title'], 'newest'))
 // 排序依据：收藏时间（文件名开头的 bmk_id）或发布时间，默认按收藏顺序。
-const order = ref<'collected' | 'published'>(localStorage.getItem('orderBy') === 'published' ? 'published' : 'collected')
-const fuzzy = ref(false)
+const order = ref<'collected' | 'published'>(savedText(savedState.order, ['collected', 'published'], localStorage.getItem('orderBy') === 'published' ? 'published' : 'collected') as 'collected' | 'published')
+const fuzzy = ref(savedState.fuzzy === true)
 const result = ref<WorksResponse>({ items: [], total: 0, page: 1, pages: 1, elapsed: 0 })
 const loading = ref(true)
 // 滚动到底部时逐页追加，不再分页浏览。
@@ -217,7 +225,13 @@ function resetFilters() { query.value = ''; source.value = ''; kind.value = ''; 
 function retryLoadMore() { loadMore(true) }
 async function sourcesChanged() { await refreshStatus(); void loadWorks() }
 watch([view, source, kind, sort, fuzzy, order], () => void loadWorks())
-watch(order, value => localStorage.setItem('orderBy', value))
+// 搜索词不保存，其余的来源 / 筛选 / 排序都写进 localStorage。
+watch([view, source, kind, fuzzy, sort, order], () => {
+  localStorage.setItem('libraryState', JSON.stringify({
+    view: view.value, source: source.value, kind: kind.value, fuzzy: fuzzy.value,
+    sort: sort.value === 'relevance' ? 'newest' : sort.value, order: order.value,
+  }))
+})
 // 列表底部进入视野附近时自动追加下一页。
 watchEffect(onCleanup => {
   const element = sentinel.value
