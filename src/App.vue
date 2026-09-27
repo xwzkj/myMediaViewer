@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, watchEffect, nextTick } from 'vue'
 import type { LibraryStatus, TagSuggestion, TagSuggestionsResponse, Work, WorksResponse } from '../shared/types'
 import { activeSearchToken, replaceWithTag, tagQuery } from '../shared/search-query'
 import { api, formatNumber } from './api'
@@ -17,9 +17,12 @@ const sort = ref('newest')
 // 排序依据：收藏时间（文件名开头的 bmk_id）或发布时间，默认按收藏顺序。
 const order = ref<'collected' | 'published'>(localStorage.getItem('orderBy') === 'published' ? 'published' : 'collected')
 const fuzzy = ref(false)
-const page = ref(1)
 const result = ref<WorksResponse>({ items: [], total: 0, page: 1, pages: 1, elapsed: 0 })
 const loading = ref(true)
+// 滚动到底部时逐页追加，不再分页浏览。
+const loadingMore = ref(false)
+const moreFailed = ref(false)
+const sentinel = ref<HTMLElement>()
 const error = ref('')
 const settings = ref(false)
 const selected = ref<Work | null>(null)
@@ -50,16 +53,41 @@ const hasLibrary = computed(() => !!status.value?.sources.length)
 const filters = computed(() => [{ id: '', label: '全部', icon: 'gallery', count: status.value?.works || 0 }, { id: 'image', label: '图片', icon: 'image', count: status.value?.images || 0 }, { id: 'video', label: '视频', icon: 'video', count: status.value?.videos || 0 }, { id: 'animation', label: '动图', icon: 'animation', count: status.value?.animations || 0 }])
 
 watch(dark, value => { document.documentElement.dataset.theme = value ? 'dark' : 'light'; localStorage.setItem('theme', value ? 'dark' : 'light') }, { immediate: true })
-async function loadWorks() {
+// 后台刷新只替换第一页，其余已加载的作品按 id 合并保留，避免打断滚动位置。
+function mergeFirstPage(fresh: WorksResponse) {
+  const current = result.value
+  if (!current.items.length || current.page <= 1) { result.value = fresh; return }
+  const freshIds = new Set(fresh.items.map(work => work.id))
+  result.value = { ...fresh, page: current.page, items: [...fresh.items, ...current.items.filter(work => !freshIds.has(work.id))] }
+}
+async function loadPage(target: number, silent = false) {
   controller?.abort()
   const active = new AbortController()
-  controller = active; loading.value = true; error.value = ''
-  const params = new URLSearchParams({ q: query.value, source: source.value, kind: kind.value, favorites: String(view.value === 'favorites'), page: String(page.value), sort: sort.value, fuzzy: String(fuzzy.value), by: order.value })
+  controller = active
+  // 让被中断的请求不会把加载状态留在原地。
+  loadingMore.value = false
+  moreFailed.value = false
+  if (target <= 1) { if (!silent) loading.value = true; error.value = '' } else loadingMore.value = true
+  const params = new URLSearchParams({ q: query.value, source: source.value, kind: kind.value, favorites: String(view.value === 'favorites'), page: String(target), sort: sort.value, fuzzy: String(fuzzy.value), by: order.value })
   try {
     const response = await api<WorksResponse>(`/works?${params}`, { signal: active.signal })
-    if (controller === active) result.value = response
-  } catch (e) { if (!active.signal.aborted) error.value = (e as Error).message }
-  finally { if (controller === active) loading.value = false }
+    if (controller !== active) return
+    if (target <= 1) { if (silent) mergeFirstPage(response); else result.value = response }
+    else result.value = { ...response, items: [...result.value.items, ...response.items] }
+  } catch (e) {
+    if (active.signal.aborted) return
+    if (target <= 1) error.value = (e as Error).message
+    else { moreFailed.value = true; notice('加载更多失败，请稍后重试') }
+  } finally {
+    if (controller === active) { loading.value = false; loadingMore.value = false }
+  }
+}
+function loadWorks() { void loadPage(1) }
+function loadMore(force = false) {
+  if (force) moreFailed.value = false
+  if (loading.value || loadingMore.value || moreFailed.value) return
+  if (result.value.page >= result.value.pages) return
+  void loadPage(result.value.page + 1)
 }
 async function refreshStatus() {
   if (refreshInProgress) return
@@ -70,7 +98,7 @@ async function refreshStatus() {
     if (destroyed) return
     status.value = next
     if (source.value && !next.sources.some(s => s.id === source.value)) source.value = ''
-    if (previous !== undefined && previous !== next.scan.finishedAt) void loadWorks()
+    if (previous !== undefined && previous !== next.scan.finishedAt) void loadPage(1, true)
   } catch (e) { if (!status.value) error.value = (e as Error).message }
   finally { refreshInProgress = false }
 }
@@ -141,19 +169,26 @@ function commitSuggestion(position = suggestionIndex.value) {
 function clearSearch() { query.value = ''; caret = 0; closeSuggestions(); searchInput.value?.focus() }
 function searchByTag(tag: string) {
   query.value = tagQuery(tag)
-  view.value = 'library'; source.value = ''; kind.value = ''; fuzzy.value = false; page.value = 1
+  view.value = 'library'; source.value = ''; kind.value = ''; fuzzy.value = false
   selected.value = null
   closeSuggestions()
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 function navigate(next: 'library' | 'favorites', sourceId = '') { view.value = next; source.value = sourceId; query.value = ''; kind.value = '' }
 function resetFilters() { query.value = ''; source.value = ''; kind.value = ''; fuzzy.value = false }
-function goPage(next: number) { page.value = next; window.scrollTo({ top: 0, behavior: 'smooth' }) }
+function retryLoadMore() { loadMore(true) }
 async function sourcesChanged() { await refreshStatus(); void loadWorks() }
-watch([view, source, kind, sort, fuzzy, order], () => { page.value = 1; void loadWorks() })
+watch([view, source, kind, sort, fuzzy, order], () => void loadWorks())
 watch(order, value => localStorage.setItem('orderBy', value))
-watch(query, () => { clearTimeout(debounce); debounce = setTimeout(() => { page.value = 1; if (query.value.trim()) sort.value = 'relevance'; else if (sort.value === 'relevance') sort.value = 'newest'; void loadWorks() }, 220) })
-watch(page, () => void loadWorks())
+// 列表底部进入视野附近时自动追加下一页。
+watchEffect(onCleanup => {
+  const element = sentinel.value
+  if (!element || !('IntersectionObserver' in window)) return
+  const observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting)) loadMore() }, { rootMargin: '600px 0px' })
+  observer.observe(element)
+  onCleanup(() => observer.disconnect())
+})
+watch(query, () => { clearTimeout(debounce); debounce = setTimeout(() => { if (query.value.trim()) sort.value = 'relevance'; else if (sort.value === 'relevance') sort.value = 'newest'; void loadWorks() }, 220) })
 onMounted(() => { void refreshStatus(); void loadWorks(); poll = setInterval(refreshStatus, 2000) })
 onUnmounted(() => { destroyed = true; clearInterval(poll); clearTimeout(debounce); clearTimeout(toastTimer); clearTimeout(suggestionTimer); clearTimeout(blurTimer); controller?.abort(); suggestionController?.abort() })
 </script>
@@ -184,7 +219,11 @@ onUnmounted(() => { destroyed = true; clearInterval(poll); clearTimeout(debounce
         <div v-else-if="!hasLibrary" class="empty-state welcome-state"><div class="empty-art"><Icon name="folder-plus" :size="54" /><span>✦</span></div><span class="eyebrow">YOUR COLLECTION STARTS HERE</span><h3>给你的喜欢，一个家。</h3><p>添加存放图片和视频的文件夹，<br />拾光会自动将同组作品整理在一起。</p><button class="button filled" @click="settings = true"><Icon name="plus" :size="20" />添加第一个媒体目录</button><div class="welcome-features"><span><Icon name="images" :size="17" />自动分组</span><span><Icon name="search" :size="17" />描述搜索</span><span><Icon name="heart" :size="17" />跨设备收藏</span></div></div>
         <div v-else-if="!result.items.length" class="empty-state"><span class="empty-symbol"><Icon :name="query ? 'search' : view === 'favorites' ? 'heart' : 'images'" :size="40" /></span><h3>{{ status?.scan.running ? '正在整理你的第一批作品' : query ? '还没有找到相关作品' : view === 'favorites' ? '留一点位置，给心动的作品' : '这里还没有作品' }}</h3><p>{{ status?.scan.running ? '扫描完成后，作品会自动出现在这里。' : query ? '试试更短的关键词，或开启模糊匹配。' : view === 'favorites' ? '点击作品卡片上的爱心，就能在这里找到它。' : '检查分组规则，或调整筛选条件再看看。' }}</p><button v-if="query || kind || source" class="button tonal" @click="resetFilters">清除筛选</button><button v-else-if="!status?.scan.running && view !== 'favorites'" class="button tonal" @click="settings = true">检查媒体目录</button></div>
         <div v-else class="work-grid" :class="{ refreshing: loading }"><WorkCard v-for="work in result.items" :key="work.id" :work="work" @open="selected = $event" @favorite="toggleFavorite" /></div>
-        <div v-if="result.pages > 1" class="pagination"><span>第 {{ result.page }} / {{ result.pages }} 页 · 每页 48 组</span><div><button class="button outlined small" :disabled="result.page <= 1 || loading" @click="goPage(result.page - 1)"><Icon name="left" :size="20" />上一页</button><button class="button tonal small" :disabled="result.page >= result.pages || loading" @click="goPage(result.page + 1)">下一页<Icon name="right" :size="20" /></button></div></div>
+        <div v-if="result.items.length" class="load-more">
+          <button v-if="result.page < result.pages" class="button text small" :disabled="loadingMore" @click="retryLoadMore"><Icon name="refresh" :class="{ spinning: loadingMore }" :size="18" />{{ loadingMore ? '正在加载更多…' : moreFailed ? '加载失败，点击重试' : '继续向下滚动，自动加载更多' }}</button>
+          <span v-else class="load-status">已加载全部 {{ formatNumber(result.total) }} 组作品</span>
+          <div ref="sentinel" class="scroll-sentinel" aria-hidden="true"></div>
+        </div>
       </section>
       <footer class="page-footer"><span>拾光 MEDIA GARDEN</span><span>为每一份喜欢，留一处安放。</span></footer>
     </main>
