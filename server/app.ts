@@ -125,7 +125,7 @@ export async function createApp(logging = true) {
     return suggestTags(request.query.q || '')
   })
 
-  app.get<{ Querystring: { q?: string; source?: string; kind?: string; favorites?: string; page?: string; sort?: string; fuzzy?: string; by?: string } }>('/api/works', async request => {
+  app.get<{ Querystring: { q?: string; source?: string; kind?: string; favorites?: string; page?: string; sort?: string; fuzzy?: string; by?: string; seed?: string } }>('/api/works', async request => {
     const started = performance.now()
     const query = request.query
     const favorites = favoriteIds()
@@ -140,7 +140,16 @@ export async function createApp(logging = true) {
       // 所以结果里涉及多个来源（混合显示）时忽略 by=collected，退回发布日期排序。
       const byCollected = query.by === 'collected' && new Set(results.map(({ work }) => work.sourceId)).size === 1
       const collected = (work: { collected?: number }) => work.collected ?? 0
-      const compare = query.sort === 'title' ? (a: typeof results[number], b: typeof results[number]) => a.work.title.localeCompare(b.work.title, 'zh-CN')
+      // 随机顺序：用查询串里的 seed 做可复现的乱序，翻页时顺序保持稳定，不会重复或漏掉作品。
+      const seed = query.seed || '0'
+      const shuffleKey = (work: { id: string }) => {
+        let hash = 2166136261
+        const text = seed + work.id
+        for (let i = 0; i < text.length; i++) { hash ^= text.charCodeAt(i); hash = Math.imul(hash, 16777619) }
+        return hash >>> 0
+      }
+      const compare = query.sort === 'random' ? (a: typeof results[number], b: typeof results[number]) => shuffleKey(a.work) - shuffleKey(b.work)
+        : query.sort === 'title' ? (a: typeof results[number], b: typeof results[number]) => a.work.title.localeCompare(b.work.title, 'zh-CN')
         : query.sort === 'oldest' ? (a: typeof results[number], b: typeof results[number]) => byCollected
           ? collected(a.work) - collected(b.work) || a.work.updated - b.work.updated
           : a.work.date.localeCompare(b.work.date)

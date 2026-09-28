@@ -21,7 +21,9 @@ const view = ref<'library' | 'favorites'>(savedState.view === 'favorites' ? 'fav
 const source = ref(typeof savedState.source === 'string' ? savedState.source : '')
 const kind = ref(savedText(savedState.kind, ['', 'image', 'video'], ''))
 const query = ref('')
-const sort = ref(savedText(savedState.sort, ['newest', 'oldest', 'title'], 'newest'))
+const sort = ref(savedText(savedState.sort, ['newest', 'oldest', 'title', 'random'], 'newest'))
+// 随机顺序用 seed 固定这一次的乱序结果，翻页不会重复或漏作品；换一批就换一个 seed。
+const seed = ref(typeof savedState.seed === 'string' ? savedState.seed : String(Date.now()))
 // 排序依据：收藏时间（文件名开头的 bmk_id）或发布时间，默认按收藏顺序。
 const order = ref<'collected' | 'published'>(savedText(savedState.order, ['collected', 'published'], localStorage.getItem('orderBy') === 'published' ? 'published' : 'collected') as 'collected' | 'published')
 const fuzzy = ref(savedState.fuzzy === true)
@@ -72,7 +74,7 @@ function closeMenu(event: PointerEvent | KeyboardEvent) {
 // 收藏编号只在单个媒体目录内部可比：混合显示时开关停用，自动按发布时间排序。
 const mixedSources = computed(() => !source.value && (status.value?.sources.length || 0) > 1)
 const effectiveOrder = computed(() => mixedSources.value ? 'published' : order.value)
-const timeSortDisabled = computed(() => mixedSources.value || sort.value === 'title' || sort.value === 'relevance')
+const timeSortDisabled = computed(() => mixedSources.value || sort.value === 'title' || sort.value === 'relevance' || sort.value === 'random')
 const title = computed(() => query.value.trim() ? '发现你心中的那一张' : view.value === 'favorites' ? '把喜欢，留在身边。' : currentSource.value ? currentSource.value.name : '每一份喜欢，都值得珍藏。')
 const caption = computed(() => query.value.trim() ? `正在整个描述、标题、作者与标签中寻找「${query.value.trim()}」` : view.value === 'favorites' ? '那些让你停下来的瞬间，都在这里。' : '让散落在文件夹里的灵感，在这里重新相遇。')
 const hasLibrary = computed(() => !!status.value?.sources.length)
@@ -95,7 +97,7 @@ async function loadPage(target: number, silent = false) {
   loadingMore.value = false
   moreFailed.value = false
   if (target <= 1) { if (!silent) loading.value = true; error.value = '' } else loadingMore.value = true
-  const params = new URLSearchParams({ q: query.value, source: source.value, kind: kind.value === 'video' ? 'video,animation' : kind.value, favorites: String(view.value === 'favorites'), page: String(target), sort: sort.value, fuzzy: String(fuzzy.value), by: effectiveOrder.value })
+  const params = new URLSearchParams({ q: query.value, source: source.value, kind: kind.value === 'video' ? 'video,animation' : kind.value, favorites: String(view.value === 'favorites'), page: String(target), sort: sort.value, fuzzy: String(fuzzy.value), by: effectiveOrder.value, seed: seed.value })
   try {
     const response = await api<WorksResponse>(`/works?${params}`, { signal: active.signal })
     if (controller !== active) return
@@ -226,16 +228,18 @@ function navigate(next: 'library' | 'favorites', sourceId?: string) {
   if (sourceId !== undefined) source.value = sourceId
   query.value = ''
 }
+// 换一批：换一个随机种子，重新打乱这一批作品的顺序。
+function reshuffle() { seed.value = String(Date.now()) }
 function resetFilters() { query.value = ''; source.value = ''; kind.value = ''; fuzzy.value = false }
 function retryLoadMore() { loadMore(true) }
 async function sourcesChanged() { await refreshStatus(); void loadWorks() }
-watch([view, source, kind, sort, fuzzy, order], () => void loadWorks())
+watch([view, source, kind, sort, fuzzy, order, seed], () => void loadWorks())
 // 搜索词不保存，其余的来源 / 筛选 / 排序都写进 localStorage。
 // 搜索期间会临时切到相关度排序，这里记下用户原本选过的排序，清空搜索后还原。
 let preSearchSort = sort.value
-watch([view, source, kind, fuzzy, sort, order], () => {
+watch([view, source, kind, fuzzy, sort, order, seed], () => {
   localStorage.setItem('libraryState', JSON.stringify({
-    view: view.value, source: source.value, kind: kind.value, fuzzy: fuzzy.value, order: order.value,
+    view: view.value, source: source.value, kind: kind.value, fuzzy: fuzzy.value, order: order.value, seed: seed.value,
     sort: sort.value === 'relevance' ? preSearchSort : sort.value,
   }))
 })
@@ -271,7 +275,7 @@ onUnmounted(() => { destroyed = true; window.removeEventListener('scroll', track
     <main class="main-content">
       <div class="library-toolbar" :class="{ stuck: scrolled }">
         <div class="search-row"><div class="search-field"><Icon name="search" :size="23" /><input ref="searchInput" v-model="query" type="text" aria-label="搜索作品" placeholder="搜索标题、描述、作者或标签…" maxlength="500" role="combobox" aria-autocomplete="list" aria-controls="tag-suggestions" :aria-expanded="suggestionsVisible" :aria-activedescendant="suggestionIndex >= 0 ? 'tag-suggestion-' + suggestionIndex : undefined" @focus="focusSearch" @input="updateCaret" @click="updateCaret" @keyup="searchKeyup" @keydown.down.prevent="moveSuggestion(1)" @keydown.up.prevent="moveSuggestion(-1)" @keydown.enter.prevent="commitSuggestion()" @keydown.esc="closeSuggestions" @blur="blurSuggestions" /><button v-if="query" class="icon-button small-icon" aria-label="清空搜索" @click="clearSearch"><Icon name="close" :size="19" /></button><span v-else class="search-hint">多个关键词用空格分隔</span><div v-if="suggestionsVisible" id="tag-suggestions" class="tag-suggestions" role="listbox" aria-label="标签搜索建议"><div class="suggestion-heading"><Icon name="tag" :size="15" /><span>按标签搜索</span><b v-if="suggestionTotal > suggestions.length">还有 {{ formatNumber(suggestionTotal - suggestions.length) }} 个匹配标签</b></div><button v-for="(item, i) in suggestions" :id="'tag-suggestion-' + i" :key="item.name" type="button" class="tag-suggestion" :class="{ active: i === suggestionIndex }" role="option" :aria-selected="i === suggestionIndex" @mousedown.prevent="commitSuggestion(i)" @mouseenter="suggestionIndex = i"><span>#{{ item.name }}</span><small>{{ formatNumber(item.count) }} 组</small></button></div></div><button ref="menuButton" class="icon-button menu-button" :class="{ active: filtersActive }" :aria-expanded="menuOpen" aria-haspopup="true" :title="filtersActive ? '筛选与排序（已应用筛选）' : '筛选与排序'" @click="menuOpen = !menuOpen"><Icon name="tune" :size="21" /><span v-if="filtersActive" class="menu-dot" /></button><button class="button outlined scan-button" @click="scan" :disabled="status?.scan.running || !hasLibrary"><Icon name="refresh" :class="{ spinning: status?.scan.running }" :size="20" /><span>{{ status?.scan.running ? '正在扫描' : '刷新媒体库' }}</span></button><button class="icon-button theme-button" :aria-label="dark ? '切换浅色模式' : '切换深色模式'" :title="dark ? '切换浅色模式' : '切换深色模式'" @click="dark = !dark"><Icon :name="dark ? 'sun' : 'moon'" :size="21" /></button></div>
-        <Transition name="menu-pop"><div v-if="menuOpen" ref="menu" class="filter-menu" role="dialog" aria-label="筛选与排序"><label v-if="status && status.sources.length > 1" class="menu-row"><span>媒体来源</span><span class="menu-select"><select v-model="source" aria-label="筛选媒体来源"><option value="">全部来源</option><option v-for="item in status.sources" :key="item.id" :value="item.id">{{ item.name }}</option></select><Icon name="down" :size="16" /></span></label><div class="menu-row"><span>媒体类型</span><div class="menu-chips"><button v-for="filter in filters" :key="filter.id" class="filter-chip" :class="{ active: kind === filter.id }" :aria-pressed="kind === filter.id" @click="kind = filter.id"><Icon :name="kind === filter.id ? 'check' : filter.icon" :size="18" />{{ filter.label }}</button></div></div><label class="menu-row"><span>模糊匹配</span><span class="fuzzy-toggle"><input v-model="fuzzy" type="checkbox" /><span class="mini-switch" /><span>{{ fuzzy ? '已开启' : '已关闭' }}</span></span></label><label class="menu-row"><span>排序方式</span><span class="sort-select"><Icon name="sort" :size="18" /><select v-model="sort" aria-label="排序方式"><option v-if="query" value="relevance">相关度优先</option><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="title">标题排序</option></select><Icon name="down" :size="16" /></span></label><label class="menu-row" :class="{ dim: timeSortDisabled }"><span>时间依据</span><span class="fuzzy-toggle order-toggle"><input v-model="order" type="checkbox" true-value="collected" false-value="published" :disabled="timeSortDisabled" /><span class="mini-switch" /><span>{{ effectiveOrder === 'collected' ? '收藏时间' : '发布时间' }}</span></span></label></div></Transition>
+        <Transition name="menu-pop"><div v-if="menuOpen" ref="menu" class="filter-menu" role="dialog" aria-label="筛选与排序"><label v-if="status && status.sources.length > 1" class="menu-row"><span>媒体来源</span><span class="menu-select"><select v-model="source" aria-label="筛选媒体来源"><option value="">全部来源</option><option v-for="item in status.sources" :key="item.id" :value="item.id">{{ item.name }}</option></select><Icon name="down" :size="16" /></span></label><div class="menu-row"><span>媒体类型</span><div class="menu-chips"><button v-for="filter in filters" :key="filter.id" class="filter-chip" :class="{ active: kind === filter.id }" :aria-pressed="kind === filter.id" @click="kind = filter.id"><Icon :name="kind === filter.id ? 'check' : filter.icon" :size="18" />{{ filter.label }}</button></div></div><label class="menu-row"><span>模糊匹配</span><span class="fuzzy-toggle"><input v-model="fuzzy" type="checkbox" /><span class="mini-switch" /><span>{{ fuzzy ? '已开启' : '已关闭' }}</span></span></label><label class="menu-row"><span>排序方式</span><span class="sort-select"><Icon name="sort" :size="18" /><select v-model="sort" aria-label="排序方式"><option v-if="query" value="relevance">相关度优先</option><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="title">标题排序</option><option value="random">随机顺序</option></select><Icon name="down" :size="16" /></span></label><label v-if="sort === 'random'" class="menu-row"><span>换一批</span><button class="button tonal small" type="button" @click="reshuffle"><Icon name="refresh" :size="17" />重新打乱</button></label><label class="menu-row" :class="{ dim: timeSortDisabled }"><span>时间依据</span><span class="fuzzy-toggle order-toggle"><input v-model="order" type="checkbox" true-value="collected" false-value="published" :disabled="timeSortDisabled" /><span class="mini-switch" /><span>{{ effectiveOrder === 'collected' ? '收藏时间' : '发布时间' }}</span></span></label></div></Transition>
       </div>
       <section class="hero"><div class="hero-copy"><span class="eyebrow"><span class="short-line" />{{ view === 'favorites' ? 'YOUR FAVORITE MOMENTS' : 'A HOME FOR YOUR INSPIRATION' }}</span><h1>{{ title }}</h1><p>{{ caption }}</p><div class="hero-meta"><span><strong>{{ formatNumber(view === 'favorites' ? status?.favorites || 0 : currentSource?.works || status?.works || 0) }}</strong> 组作品</span><span class="dot-separator">·</span><span>{{ status?.sources.length || 0 }} 个媒体目录</span><span v-if="hasLibrary" class="hero-status"><Icon :name="status?.scan.running ? 'refresh' : 'check'" :class="{ spinning: status?.scan.running }" :size="15" />{{ status?.scan.running ? '正在整理' : '收藏随时可见' }}</span></div></div><div class="hero-illustration" aria-hidden="true"><div class="orbit orbit-one" /><div class="orbit orbit-two" /><div class="illustration-card back"><Icon name="video" :size="30" /></div><div class="illustration-card middle"><Icon name="leaf" :size="40" /></div><div class="illustration-card front"><div class="little-sun" /><div class="little-hill hill-one" /><div class="little-hill hill-two" /></div><span class="illustration-sparkle">✦</span><span class="illustration-dot" /></div></section>
       <section class="library-content" aria-label="作品列表">
