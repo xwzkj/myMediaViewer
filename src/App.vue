@@ -207,7 +207,7 @@ function commitSuggestion(position = suggestionIndex.value) {
 function clearSearch() { query.value = ''; caret = 0; closeSuggestions(); searchInput.value?.focus() }
 function searchByTag(tag: string) {
   query.value = tagQuery(tag)
-  view.value = 'library'; source.value = ''; kind.value = ''; fuzzy.value = false
+  view.value = 'library'
   selected.value = null
   closeSuggestions()
   window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -215,21 +215,28 @@ function searchByTag(tag: string) {
 // 点击作者名直接按这个作者搜索。
 function searchByAuthor(author: string) {
   query.value = author
-  view.value = 'library'; source.value = ''; kind.value = ''; fuzzy.value = false
+  view.value = 'library'
   selected.value = null
   closeSuggestions()
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
-function navigate(next: 'library' | 'favorites', sourceId = '') { view.value = next; source.value = sourceId; query.value = ''; kind.value = '' }
+// 切换视图时保留筛选选项；只有显式传入来源才改动来源（传空字符串代表全部来源）。
+function navigate(next: 'library' | 'favorites', sourceId?: string) {
+  view.value = next
+  if (sourceId !== undefined) source.value = sourceId
+  query.value = ''
+}
 function resetFilters() { query.value = ''; source.value = ''; kind.value = ''; fuzzy.value = false }
 function retryLoadMore() { loadMore(true) }
 async function sourcesChanged() { await refreshStatus(); void loadWorks() }
 watch([view, source, kind, sort, fuzzy, order], () => void loadWorks())
 // 搜索词不保存，其余的来源 / 筛选 / 排序都写进 localStorage。
+// 搜索期间会临时切到相关度排序，这里记下用户原本选过的排序，清空搜索后还原。
+let preSearchSort = sort.value
 watch([view, source, kind, fuzzy, sort, order], () => {
   localStorage.setItem('libraryState', JSON.stringify({
-    view: view.value, source: source.value, kind: kind.value, fuzzy: fuzzy.value,
-    sort: sort.value === 'relevance' ? 'newest' : sort.value, order: order.value,
+    view: view.value, source: source.value, kind: kind.value, fuzzy: fuzzy.value, order: order.value,
+    sort: sort.value === 'relevance' ? preSearchSort : sort.value,
   }))
 })
 // 列表底部进入视野附近时自动追加下一页。
@@ -240,7 +247,12 @@ watchEffect(onCleanup => {
   observer.observe(element)
   onCleanup(() => observer.disconnect())
 })
-watch(query, () => { clearTimeout(debounce); debounce = setTimeout(() => { if (query.value.trim()) sort.value = 'relevance'; else if (sort.value === 'relevance') sort.value = 'newest'; void loadWorks() }, 220) })
+// 搜索时临时切到相关度排序，清空搜索后还原用户记住的排序方式。
+watch(query, () => { clearTimeout(debounce); debounce = setTimeout(() => {
+  if (query.value.trim()) { if (sort.value !== 'relevance') { preSearchSort = sort.value; sort.value = 'relevance' } }
+  else if (sort.value === 'relevance') sort.value = preSearchSort
+  void loadWorks()
+}, 220) })
 onMounted(() => { void refreshStatus(); void loadWorks(); poll = setInterval(refreshStatus, 2000); window.addEventListener('scroll', trackScroll, { passive: true }); trackScroll(); document.addEventListener('pointerdown', closeMenu); document.addEventListener('keydown', closeMenu) })
 onUnmounted(() => { destroyed = true; window.removeEventListener('scroll', trackScroll); document.removeEventListener('pointerdown', closeMenu); document.removeEventListener('keydown', closeMenu); clearInterval(poll); clearTimeout(debounce); clearTimeout(toastTimer); clearTimeout(suggestionTimer); clearTimeout(blurTimer); controller?.abort(); suggestionController?.abort() })
 </script>
@@ -251,7 +263,7 @@ onUnmounted(() => { destroyed = true; window.removeEventListener('scroll', track
       <a class="brand" href="#" @click.prevent="navigate('library')"><span class="brand-mark"><Icon name="gallery" :size="26" /></span><div><strong>拾光</strong><small>MEDIA GARDEN</small></div></a>
       <button class="button filled add-folder" aria-label="添加媒体目录" title="添加媒体目录" @click="settings = true"><Icon name="plus" :size="21" /><span>添加媒体目录</span></button>
       <span class="nav-label">我的空间</span>
-      <nav aria-label="主导航"><button class="nav-item" :class="{ active: view === 'library' && !source }" @click="navigate('library')"><Icon name="gallery" /><span>媒体库</span><span class="nav-count">{{ formatNumber(status?.works || 0) }}</span></button><button class="nav-item" :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /><span>我的收藏</span><span class="nav-count">{{ formatNumber(status?.favorites || 0) }}</span></button></nav>
+      <nav aria-label="主导航"><button class="nav-item" :class="{ active: view === 'library' && !source }" @click="navigate('library', '')"><Icon name="gallery" /><span>媒体库</span><span class="nav-count">{{ formatNumber(status?.works || 0) }}</span></button><button class="nav-item" :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /><span>我的收藏</span><span class="nav-count">{{ formatNumber(status?.favorites || 0) }}</span></button></nav>
       <div class="nav-label row-label"><span>媒体来源</span><button class="icon-button tiny" aria-label="管理媒体来源" @click="settings = true"><Icon name="plus" :size="17" /></button></div>
       <nav class="source-nav" aria-label="媒体来源"><button v-for="item in status?.sources" :key="item.id" class="nav-item source-nav-item" :class="{ active: source === item.id }" @click="navigate('library', item.id)"><span class="source-letter" :class="item.kind">{{ item.kind === 'pixiv' ? 'P' : 'T' }}</span><span class="ellipsis">{{ item.name }}</span><span v-if="!item.online" title="目录离线"><Icon name="offline" :size="17" /></span><span v-else class="nav-count">{{ item.works }}</span></button><p v-if="!status?.sources.length" class="nav-empty">添加文件夹后，会显示在这里。</p></nav>
       <div class="sidebar-bottom"><div class="local-note"><span class="online-dot" /><div><strong>你的私人收藏馆</strong><small>本地存储 · 局域网共享</small></div><Icon name="leaf" :size="25" /></div><button class="nav-item" @click="settings = true"><Icon name="settings" /><span>媒体库设置</span></button></div>
