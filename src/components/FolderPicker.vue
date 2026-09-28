@@ -39,8 +39,17 @@ function select() {
     dialog.value?.close()
   }
 }
-function backdrop(event: MouseEvent) {
-  if (event.target !== dialog.value || !dialog.value) return
+// 只有按下与松开都在背景遮罩上才视作点击遮罩关闭；
+// 如果是在编辑框内拖拽文本选中、不小心在遮罩处抬起鼠标，绝不误关闭。
+let backdropPressed = false
+function backdropDown(event: PointerEvent) {
+  if (!dialog.value) return
+  backdropPressed = event.target === dialog.value
+}
+function backdropUp(event: PointerEvent) {
+  if (!dialog.value || !backdropPressed) return
+  backdropPressed = false
+  if (event.target !== dialog.value) return
   const rect = dialog.value.getBoundingClientRect()
   if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.value.close()
 }
@@ -49,7 +58,7 @@ onUnmounted(() => controller?.abort())
 </script>
 
 <template>
-  <dialog ref="dialog" class="folder-picker" aria-labelledby="folder-picker-title" @close="emit('close')" @click="backdrop">
+  <dialog ref="dialog" class="folder-picker" aria-labelledby="folder-picker-title" @close="emit('close')" @pointerdown="backdropDown" @pointerup="backdropUp">
     <header class="picker-heading"><span class="picker-symbol"><Icon name="folder-open" :size="26" /></span><div><h2 id="folder-picker-title">选择媒体文件夹</h2><p>浏览运行服务的电脑，手机上也能直接选择。</p></div><button type="button" class="icon-button" aria-label="关闭文件夹选择器" @click="dialog?.close()"><Icon name="close" /></button></header>
     <div class="picker-navigation">
       <button type="button" class="icon-button" aria-label="返回上一级" :disabled="loading || (!listing.path && !error)" @click="browse(listing.parent || undefined)"><Icon name="arrow-left" :size="20" /></button>

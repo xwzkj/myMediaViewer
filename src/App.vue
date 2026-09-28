@@ -37,6 +37,15 @@ const error = ref('')
 const settings = ref(false)
 const selected = ref<Work | null>(null)
 const toast = ref('')
+// toast 可以带一个操作链接，例如缓存译文提供的“重新翻译”。
+const toastAction = ref<{ label: string; handler: () => void } | null>(null)
+// 原生 dialog 打开后会进入浏览器 top layer，普通 DOM 再高的 z-index 也会被它盖住，
+// 所以提示要挂到当前最上层的 dialog 里；没有弹窗时才挂在 body。
+const toastHost = ref<HTMLElement | null>(null)
+function topLayerHost() {
+  const dialogs = document.querySelectorAll<HTMLElement>('dialog[open]')
+  return dialogs.length ? dialogs[dialogs.length - 1] : null
+}
 const dark = ref(localStorage.getItem('theme') === 'dark')
 const busyFavorites = new Set<string>()
 const suggestions = ref<TagSuggestion[]>([])
@@ -142,7 +151,24 @@ async function refreshStatus() {
   } catch (e) { if (!status.value) error.value = (e as Error).message }
   finally { refreshInProgress = false }
 }
-function notice(message: string) { toast.value = message; clearTimeout(toastTimer); toastTimer = setTimeout(() => { toast.value = '' }, 4200) }
+function notice(message: string, action?: { label: string; handler: () => void }) {
+  toastHost.value = topLayerHost()
+  toast.value = message
+  toastAction.value = action || null
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(dismissToast, action ? 8000 : 4200)
+}
+function dismissToast() {
+  toast.value = ''
+  toastAction.value = null
+  clearTimeout(toastTimer)
+}
+// 点 toast 里的操作链接：先收起提示，再执行动作。
+function runToastAction() {
+  const action = toastAction.value
+  dismissToast()
+  action?.handler()
+}
 async function scan() {
   try { await api('/scan', { method: 'POST' }); await refreshStatus(); notice('正在检查目录中的新增和修改') }
   catch (e) { notice((e as Error).message) }
@@ -298,6 +324,6 @@ onUnmounted(() => { destroyed = true; window.removeEventListener('scroll', track
     <nav class="mobile-nav" aria-label="手机导航"><button :class="{ active: view === 'library' }" @click="navigate('library')"><span><Icon name="gallery" /></span>媒体库</button><button :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><span><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /></span>我的收藏</button><button @click="settings = true"><span><Icon name="settings" /></span>设置</button></nav>
     <SettingsDialog v-if="settings" :status="status" @close="settings = false" @changed="sourcesChanged" @notice="notice" />
     <ViewerDialog v-if="selected" :work="selected" @close="selected = null" @favorite="toggleFavorite" @notice="notice" @search-tag="searchByTag" @search-author="searchByAuthor" @navigate="navigateWork" />
-    <Transition name="toast"><div v-if="toast" class="snackbar" role="status"><Icon name="success" :size="20" /><span>{{ toast }}</span><button class="icon-button" aria-label="关闭提示" @click="toast = ''"><Icon name="close" :size="18" /></button></div></Transition>
+    <Teleport :to="toastHost || 'body'"><Transition name="toast"><div v-if="toast" class="snackbar" role="status"><Icon name="success" :size="20" /><span>{{ toast }}</span><button v-if="toastAction" class="toast-action" type="button" @click="runToastAction">{{ toastAction.label }}</button><button class="icon-button" aria-label="关闭提示" @click="dismissToast"><Icon name="close" :size="18" /></button></div></Transition></Teleport>
   </div>
 </template>

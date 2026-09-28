@@ -19,6 +19,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS assets_work ON assets(work_id);
   CREATE TABLE IF NOT EXISTS favorites (work_id TEXT PRIMARY KEY, created INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS metadata_cache (path TEXT PRIMARY KEY, stamp TEXT NOT NULL, data TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS translations (key TEXT PRIMARY KEY, data TEXT NOT NULL, created INTEGER NOT NULL);
 `)
 
 export function allWorks(): StoredWork[] {

@@ -11,8 +11,9 @@ import { allWorks, getAsset, getWork, workAssets, favoriteIds, setFavorite, toWo
 import { refreshSearch, searchWorks, suggestTags } from './search.js'
 import { scanLibrary, scanStatus, onScan, sourceOnline } from './scanner.js'
 import { accessibleAsset, sendMedia, thumbnail, detectFFmpeg, ffmpegAvailable, convert, conversionStatus, conversionPath } from './media.js'
-import type { Source, LibraryStatus } from '../shared/types.js'
+import type { Source, LibraryStatus, AiTranslateFields } from '../shared/types.js'
 import { listDirectories } from './directories.js'
+import { getAiSettings, saveAiSettings, testAiConnection, listAiModels, translateFields, clearTranslationCache } from './ai.js'
 
 export async function createApp(logging = true) {
   const app = Fastify({ logger: logging, bodyLimit: 16_384 })
@@ -35,9 +36,12 @@ export async function createApp(logging = true) {
       }
     }
   })
-  app.setErrorHandler((error: Error & { statusCode?: number }, request, reply) => {
+  app.setErrorHandler((error: Error & { statusCode?: number; expose?: boolean }, request, reply) => {
     request.log.error(error)
-    reply.code(error.statusCode || 500).send({ message: error.statusCode && error.statusCode < 500 ? error.message : '服务器处理失败，请检查运行日志' })
+    // expose 的错误（例如 AI 配置或上游返回问题）直接把原因告诉用户，其余保持笼统提示。
+    // 如果是 AI 相关的操作或错误明确带了 message，把具体的错误详情返回给前端；仅当未捕获异常且无消息时兜底
+    const message = error.message || '服务器处理失败，请检查运行日志'
+    reply.code(error.statusCode || 500).send({ message })
   })
 
   app.get('/api/status', async (): Promise<LibraryStatus> => {
@@ -203,6 +207,17 @@ export async function createApp(logging = true) {
     const asset = getAsset(request.params.id)
     if (!asset || !await accessibleAsset(asset) || conversionStatus(asset).state !== 'ready') return reply.code(404).send({ message: '兼容版本尚未就绪' })
     return sendMedia(request, reply, conversionPath(asset), 'mp4')
+  })
+
+  app.get('/api/ai/settings', async () => getAiSettings())
+  app.put<{ Body: Record<string, unknown> }>('/api/ai/settings', async request => saveAiSettings(request.body))
+  // 测试与模型列表允许带上设置页里还没保存的表单内容，避免必须“先保存才能测试”。
+  app.post<{ Body?: unknown }>('/api/ai/test', async request => testAiConnection(request.body))
+  app.post<{ Body?: unknown }>('/api/ai/models', async request => ({ items: await listAiModels(request.body) }))
+  app.delete('/api/ai/cache', async () => ({ removed: clearTranslationCache() }))
+  app.post<{ Body: { fields?: AiTranslateFields; targetLanguage?: string; force?: boolean } }>('/api/ai/translate', async request => {
+    const body = request.body || {}
+    return translateFields({ fields: body.fields || {}, targetLanguage: body.targetLanguage, force: body.force === true })
   })
 
   const webRoot = path.resolve('dist')

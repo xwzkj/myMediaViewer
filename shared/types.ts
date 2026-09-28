@@ -26,6 +26,20 @@ export interface LibraryStatus {
 export interface WorksResponse { items: Work[]; total: number; page: number; pages: number; elapsed: number }
 export interface TagSuggestion { name: string; count: number }
 export interface TagSuggestionsResponse { items: TagSuggestion[]; total: number }
+// AI 翻译：服务端保存的接口配置。
+export interface AiSettings {
+  baseUrl: string; apiKey: string; model: string; targetLanguage: string;
+  systemPrompt: string; params: Record<string, unknown>; timeoutMs: number
+}
+// 可供翻译的文字字段，键名与模型输出的 JSON 保持一致。
+export interface AiTranslateFields {
+  title?: string; author?: string; description?: string; tags?: string[]
+}
+export interface AiTranslateResult {
+  fields: AiTranslateFields; cached: boolean; model: string; createdAt: number; targetLanguage: string
+}
+export interface AiConnectionResult { reply: string; model: string; elapsed: number }
+
 export interface DirectoryEntry { name: string; path: string }
 export interface DirectoryListing {
   path: string | null; parent: string | null;

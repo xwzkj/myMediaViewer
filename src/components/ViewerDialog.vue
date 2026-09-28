@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import type { WorkDetail, Work } from '../../shared/types'
+import type { AiTranslateFields, AiTranslateResult, WorkDetail, Work } from '../../shared/types'
 import { Viewer } from 'v-viewer'
 import { api, formatSize, kindLabel } from '../api'
 import Icon from './Icon.vue'
 
 const props = defineProps<{ work: Work }>()
-const emit = defineEmits<{ close: []; favorite: [work: Work]; notice: [message: string]; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
+const emit = defineEmits<{ close: []; favorite: [work: Work]; notice: [message: string, action?: { label: string; handler: () => void }]; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
 const dialog = ref<HTMLDialogElement>()
 const stage = ref<HTMLElement>()
 const video = ref<HTMLVideoElement>()
@@ -19,6 +19,14 @@ const slideshow = ref(false)
 const converting = ref(false)
 const convertMessage = ref('')
 const compatible = ref(false)
+// 翻译：显示模式控制只显示原文、只显示译文，或两者对照。
+type TranslationDisplay = 'source' | 'translated' | 'both'
+const translation = ref<AiTranslateResult | null>(null)
+const translating = ref(false)
+const translationError = ref('')
+const translationDisplay = ref<TranslationDisplay>('both')
+const translationDisplayLabels: Record<TranslationDisplay, string> = { source: '仅原文', translated: '仅译文', both: '原文 + 译文' }
+const translationDisplayOrder: TranslationDisplay[] = ['both', 'translated', 'source']
 let timer: ReturnType<typeof setInterval> | undefined
 let conversionTimer: ReturnType<typeof setTimeout> | undefined
 let disposed = false
@@ -49,10 +57,37 @@ onMounted(async () => {
   timer = setInterval(() => { if (slideshow.value && !isVideo.value && !previewing.value) next(1, true) }, 4500)
 })
 // 滑动切换到别的作品后重新取详情，并回到第一张。
-watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; void load() })
+watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; translation.value = null; translationError.value = ''; translationDisplay.value = 'both'; void load() })
 onUnmounted(() => { disposed = true; destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); document.body.style.overflow = previousOverflow; document.body.style.paddingRight = previousPadding })
 watch(index, () => { destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; clearTimeout(conversionTimer) })
 watch(slideshow, value => { if (value && isVideo.value) void video.value?.play().catch(() => {}) })
+// 标题、作者、标签、描述一起交给 AI，保证同一组信息的译文风格一致。
+const translatable = computed<AiTranslateFields>(() => {
+  const tags = props.work.tags.filter(tag => tag.trim())
+  const fields: AiTranslateFields = {}
+  if (props.work.title.trim()) fields.title = props.work.title
+  if (props.work.author.trim()) fields.author = props.work.author
+  if (detail.value?.description.trim()) fields.description = detail.value.description
+  if (tags.length) fields.tags = tags
+  return fields
+})
+const hasTranslatable = computed(() => Object.keys(translatable.value).length > 0)
+// 原文与译文的可见性：仅原文 / 仅译文 / 两者都显示。
+const sourceVisible = computed(() => translationDisplay.value !== 'translated')
+const translatedVisible = computed(() => translationDisplay.value !== 'source' && Boolean(translation.value))
+const displayLabel = computed(() => translationDisplayLabels[translationDisplay.value])
+// 标签成对渲染：无论显示哪种语言，点击都用原文标签去搜索。
+// 译文标签按位置对应原文；模型少给或漏给时回退到原文，避免出现空标签。
+// 仅译文模式下没有译文的标签仍要显示原文，否则标签会渲染成空白。
+const tagRows = computed(() => props.work.tags.map((original, i) => {
+  const translated = translation.value?.fields.tags?.[i]?.trim() || original
+  const distinct = translated !== original
+  return {
+    original,
+    primary: !sourceVisible.value && translatedVisible.value && distinct ? translated : original,
+    secondary: sourceVisible.value && translatedVisible.value && distinct ? translated : null,
+  }
+}))
 // 分 P 到头后继续滑动就切换作品：往后进入下一组的第 1 页，往回停在上一组的最后一页。
 function goWork(direction: number, auto = false) {
   startAtLast = direction < 0
@@ -228,6 +263,35 @@ async function fullscreen() {
   try { if (document.fullscreenElement) await document.exitFullscreen(); else await stage.value?.requestFullscreen() }
   catch { emit('notice', '这个浏览器暂不支持全屏') }
 }
+// 翻译入口：force=true 时跳过缓存，重新调用 AI。
+async function translate(force = false) {
+  if (translating.value || !hasTranslatable.value) return
+  translating.value = true
+  translationError.value = ''
+  const workId = props.work.id
+  try {
+    const result = await api<AiTranslateResult>('/ai/translate', { method: 'POST', body: JSON.stringify({ fields: translatable.value, force }) })
+    // 翻译期间用户可能已经切到别的作品，丢弃过期的结果。
+    if (disposed || workId !== props.work.id) return
+    translation.value = result
+    if (translationDisplay.value === 'source') translationDisplay.value = 'both'
+    if (result.cached) {
+      emit('notice', `已显示缓存的译文（${result.model}）`, { label: '重新翻译', handler: () => void translate(true) })
+    } else {
+      emit('notice', `已使用 ${result.model} 完成翻译`)
+    }
+  } catch (e) {
+    if (disposed || workId !== props.work.id) return
+    translationError.value = (e as Error).message
+  } finally {
+    translating.value = false
+  }
+}
+// 点击按钮在“原文 + 译文 / 仅原文 / 仅译文”之间循环。
+function cycleTranslationDisplay() {
+  const at = translationDisplayOrder.indexOf(translationDisplay.value)
+  translationDisplay.value = translationDisplayOrder[(at + 1) % translationDisplayOrder.length]
+}
 async function makeCompatible() {
   if (!asset.value) return
   const id = asset.value.id
@@ -268,7 +332,50 @@ async function makeCompatible() {
         <div class="viewer-controls"><span>{{ asset ? `${kindLabel(asset.kind)} · ${formatSize(asset.size)}` : '' }}</span><div><button class="icon-button" :class="{ selected: work.favorite }" :aria-label="work.favorite ? '取消收藏' : '收藏作品'" :aria-pressed="work.favorite" @click="emit('favorite', work)"><Icon :name="work.favorite ? 'heart-filled' : 'heart'" :size="20" /></button><button class="icon-button" :aria-label="slideshow ? '停止自动翻页' : '自动翻页'" :aria-pressed="slideshow" @click="slideshow = !slideshow"><Icon :name="slideshow ? 'pause' : 'play'" :size="22" /></button><button class="icon-button" aria-label="全屏" @click="fullscreen"><Icon name="fullscreen" :size="22" /></button><button class="icon-button" aria-label="关闭查看器" @click="dialog?.close()"><Icon name="close" :size="22" /></button></div></div>
         <div v-if="(detail?.assets.length || 0) > 1" class="filmstrip"><button v-for="(item, i) in detail?.assets" :key="item.id" :class="{ active: index === i }" :aria-label="`第 ${i + 1} 项`" :aria-pressed="index === i" @click="selectPage(i)"><img :src="item.thumbnail" loading="lazy" alt="" /><span>{{ i + 1 }}</span></button></div>
       </div>
-      <aside class="work-info"><Transition name="info-fade" mode="out-in"><div :key="work.id"><span class="eyebrow">ABOUT THIS WORK</span><h2>{{ work.title }}</h2><p class="work-author"><button v-if="work.author" type="button" class="author-link" title="按这个作者搜索" @click="emit('searchAuthor', work.author)">{{ work.author }}</button><span v-else>{{ work.sourceName }}</span></p><dl><div><dt>来源</dt><dd>{{ work.sourceName }}</dd></div><div><dt>日期</dt><dd>{{ new Date(work.date).toLocaleDateString('zh-CN') }}</dd></div><div><dt>作品编号</dt><dd>{{ work.externalId }}</dd></div><div><dt>内容</dt><dd>{{ work.count }} 项媒体</dd></div></dl><div v-if="work.tags.length" class="tag-list" aria-label="作品标签"><button v-for="tag in work.tags" :key="tag" type="button" class="tag-chip" title="按这个标签搜索" @click="emit('searchTag', tag)">#{{ tag }}</button></div><h3>作品描述</h3><p class="description">{{ detail?.description || '这组作品暂时没有文字描述。' }}</p><a v-if="detail?.originalUrl" class="button outlined small" :href="detail.originalUrl" target="_blank" rel="noopener noreferrer">前往原作品<Icon name="external" :size="18" /></a><div v-if="isVideo" class="compatibility-panel"><p>遇到黑屏或只有声音？</p><button class="button tonal small" :disabled="converting || compatible" @click="makeCompatible"><Icon name="video" :size="18" />{{ compatible ? '已切换兼容版本' : converting ? '正在处理…' : '生成兼容版本' }}</button><span v-if="convertMessage" role="status">{{ convertMessage }}</span><small>生成的文件只保存在缓存中，原文件保持不变。</small></div></div></Transition></aside>
+            <aside class="work-info"><Transition name="info-fade" mode="out-in"><div :key="work.id">
+        <span class="eyebrow">ABOUT THIS WORK</span>
+        <div class="translated-block">
+          <div v-if="sourceVisible" class="text-line">
+            <span v-if="translatedVisible" class="line-tag">原文</span>
+            <h2>{{ work.title }}</h2>
+            <p class="work-author">
+              <button v-if="work.author" type="button" class="author-link" title="按这个作者搜索" @click="emit('searchAuthor', work.author)">{{ work.author }}</button>
+              <span v-else>{{ work.sourceName }}</span>
+            </p>
+          </div>
+          <div v-if="translatedVisible" class="text-line translated">
+            <span class="line-tag">译文</span>
+            <h2>{{ translation?.fields.title || work.title }}</h2>
+            <p class="work-author">
+              <button v-if="work.author" type="button" class="author-link" title="按原文作者搜索" @click="emit('searchAuthor', work.author)">{{ translation?.fields.author || work.author }}</button>
+              <span v-else>{{ work.sourceName }}</span>
+            </p>
+          </div>
+        </div>
+        <div class="translation-toolbar">
+          <button class="button tonal small translate-button" type="button" :disabled="translating || !hasTranslatable" :title="translation ? '重新翻译这组作品' : '翻译标题、作者、标签与描述'" @click="translate(Boolean(translation))">
+            <Icon :name="translating ? 'refresh' : 'sparkle'" :class="{ spinning: translating }" :size="17" />
+            {{ translating ? '翻译中…' : translation ? '重新翻译' : 'AI 翻译' }}
+          </button>
+          <button v-if="translation" class="button text small display-toggle" type="button" :title="`当前：${displayLabel}，点击切换`" @click="cycleTranslationDisplay">
+            <Icon :name="translationDisplay === 'translated' ? 'sparkle' : translationDisplay === 'source' ? 'info' : 'images'" :size="17" />
+            {{ displayLabel }}
+          </button>
+        </div>
+        <p v-if="translationError" class="inline-error translation-error-box" role="alert">
+          <Icon name="warning" :size="19" />
+          <span>{{ translationError }}</span>
+        </p>
+        <p v-if="translation?.cached" class="translation-meta" role="status">来自服务端缓存的译文 · {{ translation.model }}</p>
+        <p v-else-if="translation" class="translation-meta" role="status">由 {{ translation.model }} 翻译于 {{ new Date(translation.createdAt).toLocaleString('zh-CN') }}</p>
+        <dl><div><dt>来源</dt><dd>{{ work.sourceName }}</dd></div><div><dt>日期</dt><dd>{{ new Date(work.date).toLocaleDateString('zh-CN') }}</dd></div><div><dt>作品编号</dt><dd>{{ work.externalId }}</dd></div><div><dt>内容</dt><dd>{{ work.count }} 项媒体</dd></div></dl>
+        <div v-if="tagRows.length" class="tag-list" aria-label="作品标签"><template v-for="(tag, i) in tagRows" :key="i"><button type="button" class="tag-chip" title="按这个标签搜索" @click="emit('searchTag', tag.original)"><span>#{{ tag.primary }}</span><span v-if="tag.secondary" class="tag-divider">/</span><span v-if="tag.secondary">#{{ tag.secondary }}</span></button></template></div>
+        <h3>作品描述</h3>
+        <p v-if="sourceVisible" class="description">{{ detail?.description || '这组作品暂时没有文字描述。' }}</p>
+        <p v-if="translatedVisible && translation?.fields.description" class="description translated"><span v-if="sourceVisible" class="line-tag">译文</span>{{ translation.fields.description }}</p>
+        <a v-if="detail?.originalUrl" class="button outlined small" :href="detail.originalUrl" target="_blank" rel="noopener noreferrer">前往原作品<Icon name="external" :size="18" /></a>
+        <div v-if="isVideo" class="compatibility-panel"><p>遇到黑屏或只有声音？</p><button class="button tonal small" :disabled="converting || compatible" @click="makeCompatible"><Icon name="video" :size="18" />{{ compatible ? '已切换兼容版本' : converting ? '正在处理…' : '生成兼容版本' }}</button><span v-if="convertMessage" role="status">{{ convertMessage }}</span><small>生成的文件只保存在缓存中，原文件保持不变。</small></div>
+      </div></Transition></aside>
     </div>
   </dialog>
 </template>
