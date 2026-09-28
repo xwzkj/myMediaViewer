@@ -75,3 +75,62 @@ pnpm build
 测试使用临时生成的媒体文件，覆盖分组、元数据解析、搜索、目录增删改、收藏保留、离线恢复、缩略图以及视频 Range 读取，不操作实际媒体库。
 
 `pnpm test:search` 对 2,500 组生成的描述进行独立性能测试，输出索引建立和多关键词、拼音、错字搜索耗时。`pnpm test:fixtures` 可在 `.cache/preview` 生成界面验证用的风景图、GIF 和视频，不会将样例加入正式媒体库。
+
+## 项目结构
+
+```
+myMediaViewer/
+├── index.html                  前端入口 HTML
+├── package.json                依赖与脚本（dev / build / start / test）
+├── vite.config.ts              Vite 配置：Vue 插件、/api 代理到 3210、ES2022 构建目标
+├── tsconfig.json               前端与共享代码的 TypeScript 配置（noEmit）
+├── tsconfig.server.json        服务端编译配置，输出到 dist-server
+├── pnpm-workspace.yaml         pnpm 构建脚本许可（esbuild、sharp）
+├── start.bat                   Windows 一键启动（pnpm start）
+├── .gitignore                  忽略 node_modules、构建产物和 data 等
+├── public/
+│   └── favicon.svg             站点图标
+├── shared/                     前后端共享代码
+│   ├── types.ts                Source / Work / Asset 等公共类型
+│   └── search-query.ts         搜索词解析（空格分词、#"标签" 语法）
+├── server/                     Fastify 服务端
+│   ├── index.ts                入口：创建应用、监听端口、启动首次扫描
+│   ├── app.ts                  全部 /api 路由与前端静态资源托管
+│   ├── config.ts               环境变量、data 目录与 sources.json 读写
+│   ├── access.ts               局域网 / 保留地址校验，公网默认 403
+│   ├── database.ts             SQLite（node:sqlite）索引与收藏读写
+│   ├── scanner.ts              目录扫描：解析文件名和元文件并写入索引
+│   ├── parsers.ts              Pixiv / Telegram 命名规则与元数据解析
+│   ├── search.ts               搜索索引：简繁、全半角、拼音、模糊匹配
+│   ├── media.ts                媒体 Range 读取、缩略图与 FFmpeg 兼容转换
+│   ├── directories.ts          文件夹选择器的目录浏览接口
+│   ├── ai.ts                   AI 设置、连通性测试、模型列表与翻译缓存
+│   └── vendor.d.ts             opencc-js 的类型补充
+├── src/                        Vue 3 前端
+│   ├── main.ts                 挂载入口
+│   ├── App.vue                 主界面：搜索栏、筛选菜单、作品网格、无限滚动
+│   ├── api.ts                  fetch 封装与公共工具
+│   ├── style.css               全局样式与 Material Design 3 色彩变量
+│   └── components/
+│       ├── WorkCard.vue        作品卡片：封面、类型徽标、收藏按钮
+│       ├── ViewerDialog.vue    作品查看器：翻页、滑动、全屏、收藏、兼容版本
+│       ├── SettingsDialog.vue  媒体库设置：目录增删改、局域网地址
+│       ├── FolderPicker.vue    文件夹选择器：面包屑、上一级、名称筛选
+│       ├── AiSettingsPanel.vue AI 设置面板：接口、模型、参数与测试
+│       └── Icon.vue            MDI 图标组件
+├── tests/                      测试
+│   ├── library.test.ts         主测试：分组、解析、搜索、目录、收藏、离线恢复等
+│   ├── search-query.test.ts    搜索词解析单元测试
+│   ├── search-benchmark.ts     2,500 组描述的搜索性能基准
+│   └── preview-fixtures.ts     生成界面验证用样例媒体
+├── data/                       运行时数据，已忽略提交
+│   ├── sources.json            媒体目录配置
+│   ├── library.sqlite          作品索引与收藏
+│   ├── ai.json                 AI 配置
+│   └── cache/                  缩略图与兼容视频缓存
+├── dist/                       前端构建产物（pnpm build 生成）
+├── dist-server/                服务端构建产物（pnpm build 生成）
+└── .cache/                     开发用临时输出（如 test:fixtures 的预览样例）
+```
+
+构建产物、`data` 和 `.cache` 均不进入版本控制，可以随时删除后重新生成。
