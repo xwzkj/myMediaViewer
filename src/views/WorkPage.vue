@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import type { Work, WorkDetail } from '../../shared/types'
 import { tagQuery } from '../../shared/search-query'
 import { api } from '../api'
-import { adjacentWork, librarySession } from '../library-session'
+import { adjacentWork, getLibrarySession } from '../library-session'
 import { appEvents } from '../events'
 import { createSearchSessionId } from '../route-cache-key'
 import Icon from '../components/Icon.vue'
@@ -12,6 +12,7 @@ import ViewerDialog from '../components/ViewerDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
+const listKey = computed(() => typeof route.query.list === 'string' ? route.query.list : '')
 const work = ref<Work | null>(null)
 const loading = ref(true)
 const error = ref('')
@@ -68,10 +69,16 @@ function searchAuthor(author: string) {
 
 async function navigateWork(direction: number, auto = false) {
   if (!work.value) return
-  let target = adjacentWork(work.value.id, direction)
-  if (!target && direction > 0 && librarySession.page < librarySession.pages && librarySession.loadMore) {
-    await librarySession.loadMore()
-    target = adjacentWork(work.value.id, direction)
+  const key = listKey.value
+  if (!key) {
+    if (!auto) notice('当前作品没有可用的来源列表')
+    return
+  }
+  let target = adjacentWork(key, work.value.id, direction)
+  const session = getLibrarySession(key)
+  if (!target && direction > 0 && session && session.page < session.pages && session.loadMore) {
+    await session.loadMore()
+    target = adjacentWork(key, work.value.id, direction)
   }
   if (!target) {
     if (!auto) notice(direction > 0 ? '已经是最后一组作品' : '已经是第一组作品')

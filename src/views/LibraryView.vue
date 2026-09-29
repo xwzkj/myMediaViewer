@@ -6,7 +6,7 @@ import { activeSearchToken, replaceWithTag, tagQuery } from '../../shared/search
 import { api, formatNumber } from '../api'
 import { appEvents, type WorkReturnPayload } from '../events'
 import { createSearchSessionId, routeCacheKey } from '../route-cache-key'
-import { setLibraryLoader, syncLibrarySession, librarySession } from '../library-session'
+import { setLibraryContext, setLibraryLoader, syncLibrarySession } from '../library-session'
 import Icon from '../components/Icon.vue'
 import WorkCard from '../components/WorkCard.vue'
 
@@ -122,8 +122,8 @@ async function loadPage(target: number, silent = false) {
     if (controller !== active) return
     if (target <= 1) { if (silent) mergeFirstPage(response); else result.value = response }
     else result.value = { ...response, items: [...result.value.items, ...response.items] }
-    syncLibrarySession(target <= 1 ? result.value : response, target > 1)
-    librarySession.context = { source: source.value, kind: kind.value, fuzzy: fuzzy.value, sort: sort.value, order: order.value, seed: seed.value }
+    syncLibrarySession(pageKey, target <= 1 ? result.value : response, target > 1)
+    setLibraryContext(pageKey, { source: source.value, kind: kind.value, fuzzy: fuzzy.value, sort: sort.value, order: order.value, seed: seed.value })
   } catch (e) {
     if (active.signal.aborted) return
     if (target <= 1) error.value = (e as Error).message
@@ -241,7 +241,7 @@ function openSettings() {
   router.push({ name: 'settings', query: { from: route.fullPath } })
 }
 function openWork(work: Work) {
-  router.push({ name: 'work', params: { workId: work.id }, query: { from: route.fullPath } })
+  router.push({ name: 'work', params: { workId: work.id }, query: { from: route.fullPath, list: pageKey } })
 }
 function routeFilters(extra: Record<string, string> = {}) {
   const next: Record<string, string> = { ...extra }
@@ -397,7 +397,7 @@ function unbindGlobalListeners() {
 }
 onMounted(() => {
   appEvents.on('work:return', handleWorkReturn)
-  setLibraryLoader(() => loadMore())
+  setLibraryLoader(pageKey, () => loadMore())
   void refreshStatus()
   void loadWorks()
   startPolling()
@@ -417,6 +417,7 @@ onDeactivated(() => {
 })
 onUnmounted(() => {
   destroyed = true
+  setLibraryLoader(pageKey, null)
   appEvents.off('work:return', handleWorkReturn)
   unbindGlobalListeners()
   clearInterval(poll)

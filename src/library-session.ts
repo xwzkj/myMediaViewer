@@ -11,34 +11,63 @@ export interface LibraryContext {
   seed: string
 }
 
-export const librarySession: {
+export interface LibrarySession {
+  key: string
   items: Work[]
   total: number
   page: number
   pages: number
   context: LibraryContext
   loadMore: SessionLoader | null
-} = {
-  items: [],
-  total: 0,
-  page: 1,
-  pages: 1,
-  context: { source: '', kind: '', fuzzy: false, sort: 'newest', order: 'collected', seed: '' },
-  loadMore: null,
 }
 
-export function syncLibrarySession(response: WorksResponse, append = false) {
-  librarySession.items = append ? [...librarySession.items, ...response.items] : response.items
-  librarySession.total = response.total
-  librarySession.page = response.page
-  librarySession.pages = response.pages
+const sessions = new Map<string, LibrarySession>()
+
+function createSession(key: string): LibrarySession {
+  return {
+    key,
+    items: [],
+    total: 0,
+    page: 1,
+    pages: 1,
+    context: { source: '', kind: '', fuzzy: false, sort: 'newest', order: 'collected', seed: '' },
+    loadMore: null,
+  }
 }
 
-export function setLibraryLoader(loader: SessionLoader | null) {
-  librarySession.loadMore = loader
+export function getLibrarySession(key: string): LibrarySession | undefined {
+  return sessions.get(key)
 }
 
-export function adjacentWork(id: string, direction: number): Work | undefined {
-  const index = librarySession.items.findIndex(work => work.id === id)
-  return index < 0 ? undefined : librarySession.items[index + direction]
+export function ensureLibrarySession(key: string): LibrarySession {
+  let session = sessions.get(key)
+  if (!session) {
+    session = createSession(key)
+    sessions.set(key, session)
+  }
+  return session
+}
+
+export function syncLibrarySession(key: string, response: WorksResponse, append = false) {
+  const session = ensureLibrarySession(key)
+  session.items = append ? [...session.items, ...response.items] : response.items
+  session.total = response.total
+  session.page = response.page
+  session.pages = response.pages
+}
+
+export function setLibraryContext(key: string, context: LibraryContext) {
+  ensureLibrarySession(key).context = context
+}
+
+export function setLibraryLoader(key: string, loader: SessionLoader | null) {
+  const session = loader ? ensureLibrarySession(key) : sessions.get(key)
+  if (session) session.loadMore = loader
+}
+
+export function adjacentWork(key: string, id: string, direction: number): Work | undefined {
+  const items = getLibrarySession(key)?.items
+  if (!items) return undefined
+  const index = items.findIndex(work => work.id === id)
+  return index < 0 ? undefined : items[index + direction]
 }
