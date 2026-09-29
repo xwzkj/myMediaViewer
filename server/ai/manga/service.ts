@@ -11,6 +11,7 @@ import { ComicTextDetector } from './detector.js'
 import { eraseTranslatedRegions } from './erase.js'
 import { judgeRegion, mangaReadingOrder, trimTrailingNoise } from './pipeline.js'
 import { MangaOcrRecognizer } from './recognizer.js'
+import { formatDuration, logError, logInfo } from '../../log.js'
 import { boxToRect, type OcrRegion } from './types.js'
 
 const modelRoot = path.join(dataDir, 'models')
@@ -33,6 +34,8 @@ interface InternalJob extends MangaJob {
   prepared: Map<string, PreparedAsset>
 }
 const jobs = new Map<string, InternalJob>()
+/** 日志里用短编号指代任务，长 UUID 只会占地方。 */
+const jobLabel = (job: InternalJob) => `漫画翻译 #${job.id.slice(0, 6)}`
 // 只有真正需要模型的页面才占用这个队列。缓存查询不排队，也不会被 GPU 任务挡住。
 let inferenceQueue: Promise<void> = Promise.resolve()
 
@@ -104,6 +107,7 @@ export async function startMangaTranslation(input: StoredAsset | StoredAsset[], 
         job.progress = 100
         job.stage = '读取缓存结果'
         job.state = 'ready'
+        logInfo('任务', `${jobLabel(job)} 命中缓存，直接返回`)
         return publicJob(job)
       }
     } catch (error) {
@@ -111,10 +115,12 @@ export async function startMangaTranslation(input: StoredAsset | StoredAsset[], 
       job.stage = '读取缓存失败'
       job.progress = 100
       job.message = error instanceof Error ? error.message : '读取漫画缓存失败'
+      logError('任务', `${jobLabel(job)} 读取缓存失败：${job.message}`)
       return publicJob(job)
     }
   }
 
+  logInfo('任务', `${jobLabel(job)} 入队 · ${job.total} 张图片${force ? ' · 强制重译' : ''}`)
   void runJob(job, uniqueAssets, force)
   return publicJob(job)
 }
@@ -132,11 +138,14 @@ export function mangaBaseImagePath(key: string): string | undefined {
 
 async function runJob(job: InternalJob, assets: StoredAsset[], force: boolean): Promise<void> {
   job.state = 'processing'
+  const jobStarted = Date.now()
+  logInfo('任务', `${jobLabel(job)} 开始处理 · 共 ${assets.length} 张`)
   try {
     for (let i = 0; i < assets.length; i++) {
       const asset = assets[i]!
       const prefix = assets.length > 1 ? `第 ${i + 1}/${assets.length} 张 · ` : ''
       const setStage = (stage: string) => { job.stage = `${prefix}${stage}` }
+      const assetStarted = Date.now()
       job.currentAssetId = asset.id
       job.completed = i
       setStage('准备翻译')
@@ -145,10 +154,14 @@ async function runJob(job: InternalJob, assets: StoredAsset[], force: boolean): 
         if (!job.results) job.results = []
         job.results.push({ assetId: asset.id, result })
         if (assets.length === 1) job.result = result
+        const detail = result.cached ? '命中缓存' : `${result.regions.length} 处文本`
+        logInfo('任务', `${jobLabel(job)} ${prefix}完成 · ${detail} · 用时 ${formatDuration(Date.now() - assetStarted)}`)
       } catch (error) {
         if (!job.failed) job.failed = []
-        job.failed.push({ assetId: asset.id, message: error instanceof Error ? error.message : '漫画图片翻译失败' })
+        const message = error instanceof Error ? error.message : '漫画图片翻译失败'
+        job.failed.push({ assetId: asset.id, message })
         setStage('翻译失败，继续下一张')
+        logError('任务', `${jobLabel(job)} ${prefix}失败：${message}`)
       }
       job.completed = i + 1
       job.progress = Math.round(job.completed / assets.length * 100)
@@ -158,11 +171,14 @@ async function runJob(job: InternalJob, assets: StoredAsset[], force: boolean): 
       const first = job.failed?.[0]?.message || '漫画图片翻译失败'
       throw new Error(first)
     }
+    const elapsed = formatDuration(Date.now() - jobStarted)
     if (job.failed?.length) {
       job.stage = `完成，${job.failed.length}/${job.total} 张翻译失败`
       job.message = `有 ${job.failed.length} 张图片翻译失败`
+      logError('任务', `${jobLabel(job)} 结束 · 成功 ${job.results?.length || 0}/${job.total} 张，失败 ${job.failed.length} 张 · 用时 ${elapsed}`)
     } else {
       job.stage = assets.length > 1 ? '整部翻译完成' : '完成'
+      logInfo('任务', `${jobLabel(job)} 全部完成 · ${job.total} 张 · 用时 ${elapsed}`)
     }
     job.progress = 100
     job.state = 'ready'
@@ -171,6 +187,8 @@ async function runJob(job: InternalJob, assets: StoredAsset[], force: boolean): 
     job.stage = '翻译失败'
     job.progress = 100
     job.message = error instanceof Error ? error.message : '漫画图片翻译失败'
+    // 逐张失败已经单独记录过原因，这里只为任务级异常补一条。
+    if (!job.failed?.length) logError('任务', `${jobLabel(job)} 失败：${job.message}`)
   }
 }
 
@@ -305,6 +323,7 @@ async function ensureModels(): Promise<void> {
       detector.load(path.join(modelRoot, 'comic-text-detector', 'comictextdetector.pt.onnx'), { executionProviders: providers() }),
       recognizer.load(path.join(modelRoot, 'manga-ocr'), { encoderProviders: providers(), decoderProviders: ['cpu'] }),
     ]).then(() => undefined).finally(() => { loading = null })
+    logInfo('任务', '首次调用需要加载本地识别与 OCR 模型，耗时会长一些')
   }
   return loading
 }

@@ -6,6 +6,7 @@ import sharp from 'sharp'
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import { cacheDir, ffmpegPath, sources } from './config.js'
 import type { StoredAsset } from './database.js'
+import { formatDuration, logError, logInfo, logWarn, oneLine } from './log.js'
 
 const mimeTypes: Record<string, string> = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif',
@@ -29,6 +30,8 @@ export function runFFmpeg(args: string[], timeout = 60_000): Promise<void> {
 export let ffmpegAvailable = false
 export async function detectFFmpeg() {
   try { await runFFmpeg(['-version'], 5000); ffmpegAvailable = true } catch { ffmpegAvailable = false }
+  if (ffmpegAvailable) logInfo('转换', 'FFmpeg 可用，视频封面与兼容版本转码已就绪')
+  else logWarn('转换', '未找到 FFmpeg，视频封面与兼容版本转码不可用，可设置 FFMPEG_PATH')
 }
 
 export async function accessibleAsset(asset: StoredAsset): Promise<boolean> {
@@ -118,21 +121,29 @@ export function convert(asset: StoredAsset): ConversionJob {
   if (current.state !== 'failed') return current
   if (!ffmpegAvailable) return { state: 'failed', message: '未找到 FFmpeg，请在服务器安装或配置 FFMPEG_PATH' }
   const queued = [...conversionJobs.values()].filter(j => j.state === 'queued' || j.state === 'processing').length
-  if (queued >= 5) return { state: 'failed', message: '处理队列已满，请稍后重试' }
+  if (queued >= 5) {
+    logWarn('转换', `转码队列已满（${queued} 个任务），暂不接收「${asset.filename}」`)
+    return { state: 'failed', message: '处理队列已满，请稍后重试' }
+  }
+  const started = Date.now()
   const job: ConversionJob = { state: 'queued' }
   conversionJobs.set(asset.id, job)
+  logInfo('转换', `「${asset.filename}」进入转码队列${queued ? `（前面还有 ${queued} 个任务）` : ''}`)
   conversionChain = conversionChain.then(async () => {
     const output = conversionPath(asset)
     const temp = `${output}.partial.mp4`
     job.state = 'processing'
+    logInfo('转换', `开始转码「${asset.filename}」`)
     try {
       await runFFmpeg(['-v', 'error', '-nostdin', '-i', asset.path, '-map', '0:v:0', '-map', '0:a:0?',
         '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
         '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-threads', '2', '-y', temp], 7_200_000)
       await rename(temp, output)
       job.state = 'ready'
-    } catch {
+      logInfo('转换', `「${asset.filename}」转码完成 · 用时 ${formatDuration(Date.now() - started)}`)
+    } catch (error) {
       job.state = 'failed'; job.message = '兼容版本生成失败，请检查源文件、磁盘空间和 FFmpeg'
+      logError('转换', `「${asset.filename}」转码失败：${oneLine((error as Error).message, 200)}`)
     } finally { await unlink(temp).catch(() => {}) }
   })
   return job

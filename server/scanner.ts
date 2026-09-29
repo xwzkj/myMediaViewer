@@ -5,6 +5,7 @@ import { sources } from './config.js'
 import { db, saveSource, type StoredAsset, type StoredWork } from './database.js'
 import { emptyMetadata, parseMetadataFile, parseName, type Metadata, type ParsedName } from './parsers.js'
 import type { ScanStatus, Source } from '../shared/types.js'
+import { formatDuration, logError, logInfo, logWarn } from './log.js'
 
 // 解析器行为变化后要让旧缓存失效，所以缓存戳里带上版本号。
 const PARSE_VERSION = 2
@@ -31,11 +32,22 @@ async function metadata(file: string, stamp: string, source: Source): Promise<Me
   return value
 }
 
-export async function scanLibrary(): Promise<void> {
+export interface ScanOptions {
+  /** manual：用户手动刷新或启动时整理，逐目录汇报；auto：每 5 分钟的对账，只在发现变化或出错时说话。 */
+  reason?: 'manual' | 'auto'
+}
+
+export async function scanLibrary(options: ScanOptions = {}): Promise<void> {
   if (scanStatus.running) return
-  Object.assign(scanStatus, { running: true, phase: '正在读取目录', files: 0, works: 0, startedAt: Date.now(), errors: [] })
+  const manual = options.reason !== 'auto'
+  const started = Date.now()
+  const previous = { files: scanStatus.files, works: scanStatus.works }
+  Object.assign(scanStatus, { running: true, phase: '正在读取目录', files: 0, works: 0, startedAt: started, errors: [] })
+  if (manual) logInfo('扫描', `开始检查 ${sources.length} 个媒体目录`)
   try {
     for (const source of sources) {
+      const sourceStarted = Date.now()
+      const baseline = scanStatus.works
       scanStatus.phase = `正在整理 ${source.name}`
       try {
         type Entry = { path: string; filename: string; parsed: ParsedName; size: number; modified: number }
@@ -106,12 +118,25 @@ export async function scanLibrary(): Promise<void> {
         }
         saveSource(source, works, assets)
         sourceOnline.set(source.id, true)
+        if (manual) logInfo('扫描', `${source.name}：整理出 ${scanStatus.works - baseline} 组作品 · 用时 ${formatDuration(Date.now() - sourceStarted)}`)
       } catch (error) {
         sourceOnline.set(source.id, false)
-        scanStatus.errors.push(`${source.name} 扫描失败，保留已有索引：${(error as Error).message}`)
+        const detail = `${source.name} 扫描失败，保留已有索引：${(error as Error).message}`
+        scanStatus.errors.push(detail)
+        logError('扫描', detail, error)
       }
     }
     afterScan()
     scanStatus.phase = scanStatus.errors.length ? '扫描完成，部分文件需要检查' : '媒体库已更新'
-  } finally { scanStatus.running = false; scanStatus.finishedAt = Date.now() }
+  } finally {
+    scanStatus.running = false
+    scanStatus.finishedAt = Date.now()
+    // 定时对账大多数时候没有变化，静默处理；只有内容或文件数变了、或出错才留下记录。
+    const changed = scanStatus.files !== previous.files || scanStatus.works !== previous.works
+    if (manual || changed || scanStatus.errors.length) {
+      const summary = `完成 · ${scanStatus.works} 组作品 / ${scanStatus.files} 个文件 · 用时 ${formatDuration(Date.now() - started)}`
+      if (scanStatus.errors.length) logWarn('扫描', `${summary} · ${scanStatus.errors.length} 处需要检查`)
+      else logInfo('扫描', summary)
+    }
+  }
 }

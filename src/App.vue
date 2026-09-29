@@ -39,6 +39,7 @@ const selected = ref<Work | null>(null)
 const toast = ref('')
 // toast 可以带一个操作链接，例如缓存译文提供的“重新翻译”。
 const toastAction = ref<{ label: string; handler: () => void } | null>(null)
+const toastTone = ref<'info' | 'error'>('info')
 // 原生 dialog 打开后会进入浏览器 top layer，普通 DOM 再高的 z-index 也会被它盖住，
 // 所以提示要挂到当前最上层的 dialog 里；没有弹窗时才挂在 body。
 const toastHost = ref<HTMLElement | null>(null)
@@ -151,9 +152,10 @@ async function refreshStatus() {
   } catch (e) { if (!status.value) error.value = (e as Error).message }
   finally { refreshInProgress = false }
 }
-function notice(message: string, action?: { label: string; handler: () => void }) {
+function notice(message: string, action?: { label: string; handler: () => void }, tone: 'info' | 'error' = 'info') {
   toastHost.value = topLayerHost()
   toast.value = message
+  toastTone.value = tone
   toastAction.value = action || null
   clearTimeout(toastTimer)
   toastTimer = setTimeout(dismissToast, action ? 8000 : 4200)
@@ -324,6 +326,6 @@ onUnmounted(() => { destroyed = true; window.removeEventListener('scroll', track
     <nav class="mobile-nav" aria-label="手机导航"><button :class="{ active: view === 'library' }" @click="navigate('library')"><span><Icon name="gallery" /></span>媒体库</button><button :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><span><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /></span>我的收藏</button><button @click="settings = true"><span><Icon name="settings" /></span>设置</button></nav>
     <SettingsDialog v-if="settings" :status="status" @close="settings = false" @changed="sourcesChanged" @notice="notice" />
     <ViewerDialog v-if="selected" :work="selected" @close="selected = null" @favorite="toggleFavorite" @notice="notice" @search-tag="searchByTag" @search-author="searchByAuthor" @navigate="navigateWork" />
-    <Teleport :to="toastHost || 'body'"><Transition name="toast"><div v-if="toast" class="snackbar" role="status"><Icon name="success" :size="20" /><span>{{ toast }}</span><button v-if="toastAction" class="toast-action" type="button" @click="runToastAction">{{ toastAction.label }}</button><button class="icon-button" aria-label="关闭提示" @click="dismissToast"><Icon name="close" :size="18" /></button></div></Transition></Teleport>
+    <Teleport :to="toastHost || 'body'"><Transition name="toast"><div v-if="toast" class="snackbar" :class="{ error: toastTone === 'error' }" :role="toastTone === 'error' ? 'alert' : 'status'"><Icon :name="toastTone === 'error' ? 'warning' : 'success'" :size="20" /><span>{{ toast }}</span><button v-if="toastAction" class="toast-action" type="button" @click="runToastAction">{{ toastAction.label }}</button><button class="icon-button" aria-label="关闭提示" @click="dismissToast"><Icon name="close" :size="18" /></button></div></Transition></Teleport>
   </div>
 </template>

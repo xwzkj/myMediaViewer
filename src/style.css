@@ -58,6 +58,7 @@
 
 @layer components {
   .toast-action{background:transparent;border:0;color:var(--primary);font-size:11px;font-weight:600;padding:6px 8px;border-radius:8px;white-space:nowrap}
+  .snackbar.error{background:#5b2a24;color:#ffe8e3}
   .toast-action:hover{background:#ffffff1f}
   .ai-form{margin-top:4px}
   .ai-form .field textarea{width:100%;border:1px solid var(--outline);border-radius:10px;padding:11px 13px;margin-top:9px;background:var(--surface);color:var(--text);font:inherit;font-size:12px;line-height:1.7;resize:vertical;min-height:64px;display:block}
@@ -78,6 +79,9 @@
   .translation-toolbar{display:flex;align-items:center;gap:8px;margin-top:14px;margin-bottom:6px}
   .translation-toolbar .button{min-height:34px;padding:0 14px;font-size:12px;gap:6px}
   .translation-error-box{margin-top:10px;margin-bottom:8px;padding:8px 12px;background:var(--surface-high);border-radius:8px;border-left:3px solid var(--danger)}
+  .translation-error-box.failure-list{align-items:flex-start}
+  .translation-error-box.failure-list>div{display:flex;flex-direction:column;gap:4px;min-width:0}
+  .translation-error-box.failure-list p{overflow-wrap:anywhere}
   .display-toggle{color:var(--primary)}
   .translated-block{display:flex;flex-direction:column;gap:2px}
   .text-line{position:relative}

@@ -5,6 +5,7 @@ import { dataDir } from './config.js'
 import { db } from './database.js'
 import type { AiSettings, AiTranslateFields } from '../shared/types.js'
 import { DEFAULT_APPEND_PROMPT, DEFAULT_MANGA_PROMPT, DEFAULT_TRANSLATE_PROMPT, fillPrompt } from '../shared/prompts.js'
+import { logRaw, logUpstream } from './log.js'
 
 const settingsPath = path.join(dataDir, 'ai.json')
 
@@ -137,22 +138,36 @@ function describeHttp(status: number, text: string): string {
   return `接口返回 ${status}${hint}${detail ? `：${detail}` : ''}`
 }
 
-async function requestJson(url: string, init: RequestInit, timeoutMs: number): Promise<Record<string, unknown>> {
+/** 所有对外 AI 请求都从这里走，顺带记一条「用途 + 地址 + 状态 + 耗时」的调用日志。 */
+async function requestJson(url: string, init: RequestInit, timeoutMs: number, label: string): Promise<Record<string, unknown>> {
+  const method = (init.method || 'GET').toUpperCase()
+  const started = Date.now()
   let response: Response
   try {
     response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) })
   } catch (error) {
+    logUpstream(label, method, url, null, Date.now() - started)
     const name = (error as Error).name
     if (name === 'TimeoutError' || name === 'AbortError') throw new AiError(`请求超时（${Math.round(timeoutMs / 1000)} 秒），可在设置里调大超时时间`, 504)
-    throw new AiError(`无法连接到接口：${(error as Error).message}`, 502)
+    // fetch 只给一句「fetch failed」，真正的原因（拒绝连接、DNS 失败等）在 cause 里。
+    const cause = (error as Error & { cause?: { code?: string; message?: string } }).cause
+    const detail = cause?.code || cause?.message
+    throw new AiError(`无法连接到接口：${(error as Error).message}${detail ? `（${detail}）` : ''}`, 502)
   }
   const text = await response.text()
-  if (!response.ok) throw new AiError(describeHttp(response.status, text), response.status >= 500 ? 502 : 400)
+  logUpstream(label, method, url, response.status, Date.now() - started)
+  if (!response.ok) {
+    logRaw(`${label} · 接口返回 ${response.status}`, text)
+    throw new AiError(describeHttp(response.status, text), response.status >= 500 ? 502 : 400)
+  }
   try {
     const parsed = JSON.parse(text) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not object')
     return parsed as Record<string, unknown>
-  } catch { throw new AiError('接口返回的内容不是合法的 JSON 对象', 502) }
+  } catch {
+    logRaw(`${label} · 响应体不是 JSON 对象`, text)
+    throw new AiError('接口返回的内容不是合法的 JSON 对象', 502)
+  }
 }
 
 function bodyWithParams(params: Record<string, unknown>, base: Record<string, unknown>, keys: string[]): string {
@@ -173,15 +188,16 @@ export async function testAiConnection(override?: unknown): Promise<AiConnection
     messages: [{ role: 'user', content: 'hello' }],
     max_tokens: 64,
   }, ['model', 'messages'])
-  const data = await requestJson(chat, { method: 'POST', headers: headers(settings), body: payload }, settings.timeoutMs)
-  return { reply: extractContent(data).trim().slice(0, 200), model: asText(data.model, settings.model), elapsed: Date.now() - started }
+  const label = '测试连接'
+  const data = await requestJson(chat, { method: 'POST', headers: headers(settings), body: payload }, settings.timeoutMs, label)
+  return { reply: extractContent(data, label).trim().slice(0, 200), model: asText(data.model, settings.model), elapsed: Date.now() - started }
 }
 
 export async function listAiModels(override?: unknown): Promise<string[]> {
   // 获取模型列表只需要 baseUrl 和 apiKey，不需要提前选好模型名称
   const settings = configured(override, false)
   const { models } = endpoints(settings.baseUrl)
-  const data = await requestJson(models, { headers: headers(settings) }, settings.timeoutMs)
+  const data = await requestJson(models, { headers: headers(settings) }, settings.timeoutMs, '获取模型列表')
   const items = Array.isArray(data.data) ? data.data : Array.isArray(data.models) ? data.models : []
   const ids = items.map(item => {
     if (typeof item === 'string') return item
@@ -189,29 +205,38 @@ export async function listAiModels(override?: unknown): Promise<string[]> {
     return ''
   }).filter(Boolean)
   const unique = [...new Set(ids)].sort((a, b) => a.localeCompare(b))
-  if (!unique.length) throw new AiError('接口没有返回可用的模型列表', 502)
+  if (!unique.length) {
+    logRaw('获取模型列表 · 响应里没有模型', JSON.stringify(data))
+    throw new AiError('接口没有返回可用的模型列表', 502)
+  }
   return unique
 }
 
-function extractContent(data: Record<string, unknown>): string {
+function extractContent(data: Record<string, unknown>, label: string): string {
   const choices = data.choices
   if (!Array.isArray(choices) || !choices.length) {
     // 有些实现会把内容放在 message.content 或 output_text。
     const direct = asText(data.output_text)
     if (direct) return direct
+    logRaw(`${label} · 响应里没有内容字段`, JSON.stringify(data))
     throw new AiError('接口没有返回可用的内容', 502)
   }
   const first = choices[0] as { message?: { content?: unknown }; text?: unknown }
   const content = first?.message?.content
-  if (typeof content === 'string') return content
+  let result = ''
+  if (typeof content === 'string') result = content
   // 部分实现会把内容拆成 [{ type: 'text', text: '…' }]。
-  if (Array.isArray(content)) return content.map(part => typeof part === 'string' ? part : asText((part as { text?: unknown })?.text)).join('')
-  if (typeof first?.text === 'string') return first.text
-  throw new AiError('接口返回的内容为空', 502)
+  else if (Array.isArray(content)) result = content.map(part => typeof part === 'string' ? part : asText((part as { text?: unknown })?.text)).join('')
+  else if (typeof first?.text === 'string') result = first.text
+  if (!result.trim()) {
+    logRaw(`${label} · 响应里没有可用的内容`, JSON.stringify(data))
+    throw new AiError('接口返回的内容为空', 502)
+  }
+  return result
 }
 
 // 模型有时会裹上代码块或前后寒暄，这里尽量把 JSON 抠出来。
-function parseJsonValue(content: string): unknown {
+function parseJsonValue(content: string, label: string): unknown {
   const trimmed = content.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim()
   const candidates = [trimmed]
   const start = trimmed.indexOf('{')
@@ -225,12 +250,14 @@ function parseJsonValue(content: string): unknown {
       return JSON.parse(candidate) as unknown
     } catch { /* 换下一个候选串 */ }
   }
+  logRaw(`${label} · 模型返回`, content)
   throw new AiError('模型返回的内容无法解析为 JSON，可尝试换个模型或简化提示词', 502)
 }
 
-function parseJsonObject(content: string): Record<string, unknown> {
-  const parsed = parseJsonValue(content)
+function parseJsonObject(content: string, label: string): Record<string, unknown> {
+  const parsed = parseJsonValue(content, label)
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    logRaw(`${label} · 模型返回的不是 JSON 对象`, content)
     throw new AiError('模型返回的内容不是 JSON 对象，可尝试换个模型或简化提示词', 502)
   }
   return parsed as Record<string, unknown>
@@ -267,7 +294,7 @@ function cacheKey(parts: Record<string, unknown>): string {
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex')
 }
 
-function pickFields(parsed: Record<string, unknown>, source: AiTranslateFields): AiTranslateFields {
+function pickFields(parsed: Record<string, unknown>, source: AiTranslateFields, label: string): AiTranslateFields {
   const result: AiTranslateFields = {}
   let matched = 0
   for (const key of ['title', 'author', 'description'] as const) {
@@ -281,7 +308,10 @@ function pickFields(parsed: Record<string, unknown>, source: AiTranslateFields):
     const tags = Array.isArray(value) ? value.map(tag => asText(tag)).filter(Boolean) : []
     if (tags.length) { result.tags = tags; matched++ } else { result.tags = source.tags }
   }
-  if (!matched) throw new AiError('模型返回的 JSON 缺少预期字段，可尝试换个模型或调整自定义参数', 502)
+  if (!matched) {
+    logRaw(`${label} · 模型返回缺少预期字段`, JSON.stringify(parsed))
+    throw new AiError('模型返回的 JSON 缺少预期字段，可尝试换个模型或调整自定义参数', 502)
+  }
   return result
 }
 
@@ -311,8 +341,10 @@ export async function translateMangaTexts(input: { texts: string[]; targetLangua
     response_format: { type: 'json_object' },
     stream: false,
   }, ['model', 'messages', 'response_format', 'stream'])
-  const data = await requestJson(chat, { method: 'POST', headers: headers(settings), body: payload }, settings.timeoutMs)
-  const parsed = parseJsonValue(extractContent(data))
+  const label = `翻译漫画文本（${texts.length} 段${settings.model ? ` · ${settings.model}` : ''}）`
+  const data = await requestJson(chat, { method: 'POST', headers: headers(settings), body: payload }, settings.timeoutMs, label)
+  const content = extractContent(data, label)
+  const parsed = parseJsonValue(content, label)
   const values = Array.isArray(parsed)
     ? parsed
     : parsed && typeof parsed === 'object'
@@ -320,9 +352,13 @@ export async function translateMangaTexts(input: { texts: string[]; targetLangua
         ?? (parsed as Record<string, unknown>).translated_texts
         ?? (parsed as Record<string, unknown>).items
       : null
-  if (!Array.isArray(values)) throw new AiError('模型没有按数组返回漫画译文，可尝试换个模型', 502)
+  if (!Array.isArray(values)) {
+    logRaw(`${label} · 模型返回里没有译文数组`, content)
+    throw new AiError('模型没有按数组返回漫画译文，可尝试换个模型', 502)
+  }
   const translations = texts.map((source, index) => asText(values[index]) || source)
   if (translations.every((text, index) => text === texts[index])) {
+    logRaw(`${label} · 模型返回的译文与原文相同`, content)
     throw new AiError('模型没有返回可用的漫画译文，可尝试换个模型', 502)
   }
   return { translations, model: asText(data.model, settings.model), targetLanguage }
@@ -356,9 +392,11 @@ export async function translateFields(input: { fields: AiTranslateFields; target
     response_format: { type: 'json_object' },
     stream: false,
   }, ['model', 'messages', 'response_format', 'stream'])
-  const data = await requestJson(chat, { method: 'POST', headers: headers(settings), body: payload }, settings.timeoutMs)
+  const label = `翻译作品信息（${Object.keys(fields).length} 个字段${settings.model ? ` · ${settings.model}` : ''}）`
+  const data = await requestJson(chat, { method: 'POST', headers: headers(settings), body: payload }, settings.timeoutMs, label)
+  const content = extractContent(data, label)
   const result: AiTranslateResult = {
-    fields: pickFields(parseJsonObject(extractContent(data)), fields),
+    fields: pickFields(parseJsonObject(content, label), fields, label),
     cached: false,
     model: asText(data.model, settings.model),
     createdAt: Date.now(),

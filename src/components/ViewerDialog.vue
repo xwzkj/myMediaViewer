@@ -6,7 +6,7 @@ import { api, formatSize, kindLabel } from '../api'
 import Icon from './Icon.vue'
 
 const props = defineProps<{ work: Work }>()
-const emit = defineEmits<{ close: []; favorite: [work: Work]; notice: [message: string, action?: { label: string; handler: () => void }]; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
+const emit = defineEmits<{ close: []; favorite: [work: Work]; notice: [message: string, action?: { label: string; handler: () => void }, tone?: 'info' | 'error']; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
 const dialog = ref<HTMLDialogElement>()
 const stage = ref<HTMLElement>()
 const video = ref<HTMLVideoElement>()
@@ -45,6 +45,16 @@ const canTranslateManga = computed(() => asset.value?.kind === 'image' && asset.
 const mangaResult = computed(() => asset.value ? mangaResults.value[asset.value.id] || null : null)
 const mangaPageAssets = computed(() => (detail.value?.assets || []).filter(item => item.kind === 'image' && item.extension !== 'gif'))
 const mangaBusy = computed(() => mangaJob.value?.state === 'queued' || mangaJob.value?.state === 'processing')
+// 任务失败（整任务失败或部分页面失败）时，把失败页码和原因都列出来，而不是只报一句“有几张失败”。
+const mangaFailures = computed(() => {
+  const failed = mangaJob.value?.failed
+  if (!failed?.length) return []
+  const assets = detail.value?.assets || []
+  return failed.map(item => {
+    const at = assets.findIndex(asset => asset.id === item.assetId)
+    return { assetId: item.assetId, page: at >= 0 ? `第 ${at + 1} 张` : '图片', message: item.message }
+  })
+})
 const mediaUrl = computed(() => compatible.value ? `/api/assets/${asset.value?.id}/compatible` : asset.value?.url)
 
 async function load() {
@@ -328,6 +338,7 @@ async function translate(force = false) {
   } catch (e) {
     if (disposed || workId !== props.work.id) return
     translationError.value = (e as Error).message
+    emit('notice', `AI 翻译失败：${translationError.value}`, undefined, 'error')
   } finally {
     translating.value = false
   }
@@ -368,7 +379,7 @@ async function runMangaTranslation(scope: 'page' | 'work', force = false) {
       await nextTick()
       if (currentResult) void drawMangaResult()
       if (job.failed?.length) {
-        emit('notice', `已完成 ${job.results?.length || 0}/${job.total} 张漫画翻译，${job.failed.length} 张失败`)
+        emit('notice', `已完成 ${job.results?.length || 0}/${job.total} 张漫画翻译，${job.failed.length} 张失败：${job.failed[0].message}`, undefined, 'error')
       } else if (scope === 'work') {
         emit('notice', `整部漫画翻译完成，共 ${job.results?.length || 0} 张`)
       } else {
@@ -380,6 +391,8 @@ async function runMangaTranslation(scope: 'page' | 'work', force = false) {
     }
     if (job.state === 'failed') {
       mangaError.value = job.message || job.stage || '漫画图片翻译失败'
+      // 详情区会列出逐张失败的原因，这里再弹一条提示，保证离开详情区也能看到失败。
+      emit('notice', `图片翻译失败：${mangaError.value}`, undefined, 'error')
       return
     }
     const delay = firstPoll ? 50 : job.state === 'queued' ? 1200 : 800
@@ -578,16 +591,23 @@ async function makeCompatible() {
         <p v-if="mangaBusy && mangaJob?.stage" class="manga-progress" role="status">
           <span class="spinner" />当前进度：{{ mangaJob.stage }}
         </p>
-        <p v-if="mangaError" class="inline-error translation-error-box" role="alert">
+        <div v-if="mangaFailures.length" class="inline-error translation-error-box failure-list" role="alert">
           <Icon name="warning" :size="19" />
-          <span>{{ mangaError }}</span>
+          <div>
+            <p>有 {{ mangaFailures.length }} 张图片翻译失败：</p>
+            <p v-for="item in mangaFailures" :key="item.assetId">{{ item.page }} · {{ item.message }}</p>
+          </div>
+        </div>
+        <p v-else-if="mangaError" class="inline-error translation-error-box" role="alert">
+          <Icon name="warning" :size="19" />
+          <span>图片翻译失败：{{ mangaError }}</span>
         </p>
         <p v-if="mangaResult && mangaMode === 'translated'" class="translation-meta" role="status">
           本页识别 {{ mangaResult.regions.length }} 处 · {{ mangaResult.model }} · {{ mangaResult.cached ? '来自缓存' : '刚刚生成' }}
         </p>
         <p v-if="translationError" class="inline-error translation-error-box" role="alert">
           <Icon name="warning" :size="19" />
-          <span>{{ translationError }}</span>
+          <span>AI 翻译失败：{{ translationError }}</span>
         </p>
         <p v-if="translation?.cached" class="translation-meta" role="status">来自服务端缓存的译文 · {{ translation.model }}</p>
         <p v-else-if="translation" class="translation-meta" role="status">由 {{ translation.model }} 翻译于 {{ new Date(translation.createdAt).toLocaleString('zh-CN') }}</p>
