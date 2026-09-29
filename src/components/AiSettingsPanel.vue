@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import type { AiConnectionResult, AiSettings } from '../../shared/types'
+import { DEFAULT_APPEND_PROMPT } from '../../shared/prompts'
 import Icon from './Icon.vue'
 import { api } from '../api'
 
@@ -42,6 +43,11 @@ function parseParams(): Record<string, unknown> {
   const parsed: unknown = JSON.parse(text)
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('需要是 JSON 对象')
   return parsed as Record<string, unknown>
+}
+
+// 内置系统提示词不可编辑；用户只能改要追加的那段，按钮用于还原默认追加内容。
+function restoreAppendPrompt() {
+  if (settings.value) settings.value.appendPrompt = DEFAULT_APPEND_PROMPT
 }
 
 function buildPayload() {
@@ -120,7 +126,7 @@ function pickModel(model: string) {
 
 <template>
   <section class="settings-section">
-    <div class="section-heading"><div><h3>AI 翻译</h3><p>连接 OpenAI 兼容接口，翻译标题、作者、标签与描述。</p></div><Icon name="sparkle" /></div>
+    <div class="section-heading"><div><h3>AI 翻译</h3><p>连接 OpenAI 兼容接口，翻译标题、作者、标签、描述与漫画气泡。</p></div><Icon name="sparkle" /></div>
     <p v-if="loading" class="helper"><Icon name="refresh" class="spinning" :size="16" />正在读取设置…</p>
     <form v-else-if="settings" class="ai-form" @submit.prevent="save">
       <label class="field">接口地址<input v-model="settings.baseUrl" required placeholder="https://api.openai.com/v1" spellcheck="false" autocomplete="off" /><span>可填到 /v1 或完整的 /chat/completions 地址。</span></label>
@@ -128,7 +134,7 @@ function pickModel(model: string) {
       <div class="field">模型名称<div class="model-field"><input v-model="settings.model" required placeholder="例如 gpt-4o-mini" spellcheck="false" autocomplete="off" /><button type="button" class="button outlined small" :disabled="loadingModels" @click="loadModels"><Icon name="refresh" :class="{ spinning: loadingModels }" :size="17" />{{ loadingModels ? '正在获取…' : '获取模型列表' }}</button></div><div v-if="modelsOpen" class="model-list"><p v-if="loadingModels">正在向接口请求模型列表…</p><template v-else><button v-for="model in models" :key="model" type="button" class="model-option" :class="{ active: model === settings.model }" @click="pickModel(model)">{{ model }}</button><p v-if="!models.length">没有获取到模型，可手动填写名称。</p></template></div></div>
       <label class="field">目标语言<input v-model="settings.targetLanguage" maxlength="40" placeholder="简体中文" /></label>
       <label class="field">自定义参数<textarea v-model="paramsText" rows="6" spellcheck="false" :placeholder="paramsExample" /><span>JSON 对象，会原样合并进请求体。可用来关闭思考、设置思考等级或思考预算，例如 reasoning_effort、thinking、thinking_budget。</span></label>
-      <label class="field">自定义系统提示词<textarea v-model="settings.systemPrompt" rows="3" placeholder="留空则使用内置翻译提示词，可用 {targetLanguage} 占位目标语言。" /></label>
+      <div class="field prompt-field"><div class="prompt-head"><span>追加系统提示词</span><button type="button" class="button text small" @click="restoreAppendPrompt">恢复默认</button></div><textarea v-model="settings.appendPrompt" rows="4" spellcheck="false" placeholder="现在开始工作" /><span>内置翻译提示词不可编辑，这段内容会追加在它之后，中间空两行（标题/标签/描述与漫画翻译都生效）。留空表示不追加。</span></div>
       <label class="field">超时时间（秒）<input v-model.number="timeoutSeconds" type="number" min="5" max="600" step="5" /><span>默认 120 秒，范围 5 - 600 秒。</span></label>
       <div class="ai-actions">
         <button type="button" class="button tonal" :disabled="testing || saving" @click="test"><Icon name="sparkle" :size="18" />{{ testing ? '正在测试…' : '测试连接' }}</button>

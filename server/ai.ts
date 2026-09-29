@@ -4,6 +4,7 @@ import path from 'node:path'
 import { dataDir } from './config.js'
 import { db } from './database.js'
 import type { AiSettings, AiTranslateFields } from '../shared/types.js'
+import { DEFAULT_APPEND_PROMPT, DEFAULT_MANGA_PROMPT, DEFAULT_TRANSLATE_PROMPT, fillPrompt } from '../shared/prompts.js'
 
 const settingsPath = path.join(dataDir, 'ai.json')
 
@@ -20,7 +21,7 @@ const defaults: AiSettings = {
   apiKey: '',
   model: '',
   targetLanguage: '简体中文',
-  systemPrompt: '',
+  appendPrompt: DEFAULT_APPEND_PROMPT,
   // 直接合并进请求体的自定义参数，例如关闭思考、思考等级、思考预算、温度等。
   params: {},
   timeoutMs: 120000,
@@ -43,6 +44,12 @@ function asParams(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
+// 追加提示词的默认值。旧配置的 systemPrompt 是"替换内置提示词"语义，和现在这个字段不是一回事，
+// 因此直接忽略：旧值不再生效，用户可在设置页里重新填写。
+function asAppendPrompt(raw: Record<string, unknown>): string {
+  return typeof raw.appendPrompt === 'string' ? raw.appendPrompt : DEFAULT_APPEND_PROMPT
+}
+
 function normalize(input: unknown): AiSettings {
   const raw = (input && typeof input === 'object' && !Array.isArray(input) ? input : {}) as Record<string, unknown>
   return {
@@ -50,7 +57,7 @@ function normalize(input: unknown): AiSettings {
     apiKey: typeof raw.apiKey === 'string' ? raw.apiKey.trim() : '',
     model: asText(raw.model),
     targetLanguage: asText(raw.targetLanguage, defaults.targetLanguage) || defaults.targetLanguage,
-    systemPrompt: typeof raw.systemPrompt === 'string' ? raw.systemPrompt : '',
+    appendPrompt: asAppendPrompt(raw),
     params: asParams(raw.params),
     timeoutMs: clampTimeout(raw.timeoutMs, defaults.timeoutMs),
   }
@@ -89,7 +96,7 @@ export function mergeAiSettings(input: unknown): AiSettings {
     apiKey: typeof raw.apiKey === 'string' ? raw.apiKey.trim() : current.apiKey,
     model: typeof raw.model === 'string' ? raw.model.trim() : current.model,
     targetLanguage: typeof raw.targetLanguage === 'string' ? raw.targetLanguage.trim() : current.targetLanguage,
-    systemPrompt: typeof raw.systemPrompt === 'string' ? raw.systemPrompt : current.systemPrompt,
+    appendPrompt: typeof raw.appendPrompt === 'string' ? raw.appendPrompt : current.appendPrompt,
     params: 'params' in raw ? asParams(raw.params) : { ...current.params },
     timeoutMs: 'timeoutMs' in raw ? clampTimeout(raw.timeoutMs, current.timeoutMs) : current.timeoutMs,
   }
@@ -241,14 +248,19 @@ function cleanFields(input: AiTranslateFields): AiTranslateFields {
   return fields
 }
 
-function systemPrompt(target: string, custom: string): string {
-  if (custom.trim()) return custom.replaceAll('{targetLanguage}', target)
-  return [
-    `你是专业的翻译助手。请把用户给出的 JSON 中每个字段翻译成${target}。`,
-    '只输出 JSON，不要输出解释、不要使用代码块。',
-    '输出的键名必须与输入完全一致，值的结构也要保持一致：字符串输出字符串，字符串数组逐个翻译后输出数组。',
-    '作品编号、URL、邮箱、用户名等不需要翻译的内容原样保留。',
-  ].join('')
+// 内置提示词只读不可编辑：用户只能追加一段文本，拼在内置提示词之后，中间空两行。
+function withAppendedPrompt(builtin: string, target: string, append: string): string {
+  const base = fillPrompt(builtin, target)
+  const extra = (append || '').trim()
+  return extra ? `${base}\n\n${extra}` : base
+}
+
+function systemPrompt(target: string, append: string): string {
+  return withAppendedPrompt(DEFAULT_TRANSLATE_PROMPT, target, append)
+}
+
+function mangaSystemPrompt(target: string, append: string): string {
+  return withAppendedPrompt(DEFAULT_MANGA_PROMPT, target, append)
 }
 
 function cacheKey(parts: Record<string, unknown>): string {
@@ -292,11 +304,7 @@ export async function translateMangaTexts(input: { texts: string[]; targetLangua
     messages: [
       {
         role: 'system',
-        content: [
-          `你是漫画翻译助手。输入是按阅读顺序排列的一页漫画 OCR 文本，请逐条翻译成${targetLanguage}。`,
-          '保持数组长度和顺序完全一致，不要合并或拆分条目。只输出 JSON：{"translations":["...","..."]}。',
-          '译文要简短自然，符合角色口吻和气泡语境；拟声词尽量保留声音感。不要解释，不要输出原文。',
-        ].join(''),
+        content: mangaSystemPrompt(targetLanguage, settings.appendPrompt),
       },
       { role: 'user', content: JSON.stringify(texts) },
     ],
@@ -341,7 +349,7 @@ export async function translateFields(input: { fields: AiTranslateFields; target
   const payload = bodyWithParams(settings.params, {
     model: settings.model,
     messages: [
-      { role: 'system', content: systemPrompt(targetLanguage, settings.systemPrompt) },
+      { role: 'system', content: systemPrompt(targetLanguage, settings.appendPrompt) },
       { role: 'user', content: JSON.stringify(fields, null, 2) },
     ],
     // 结构化输出：内容必须是 JSON 对象，便于直接解析。

@@ -29,7 +29,8 @@ export interface TagSuggestionsResponse { items: TagSuggestion[]; total: number 
 // AI 翻译：服务端保存的接口配置。
 export interface AiSettings {
   baseUrl: string; apiKey: string; model: string; targetLanguage: string;
-  systemPrompt: string; params: Record<string, unknown>; timeoutMs: number
+  // 用户可编辑的追加提示词，会拼在内置系统提示词之后。
+  appendPrompt: string; params: Record<string, unknown>; timeoutMs: number
 }
 // 可供翻译的文字字段，键名与模型输出的 JSON 保持一致。
 export interface AiTranslateFields {
