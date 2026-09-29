@@ -204,19 +204,29 @@ function extractContent(data: Record<string, unknown>): string {
 }
 
 // 模型有时会裹上代码块或前后寒暄，这里尽量把 JSON 抠出来。
-function parseJsonObject(content: string): Record<string, unknown> {
+function parseJsonValue(content: string): unknown {
   const trimmed = content.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim()
   const candidates = [trimmed]
   const start = trimmed.indexOf('{')
   const end = trimmed.lastIndexOf('}')
   if (start >= 0 && end > start) candidates.push(trimmed.slice(start, end + 1))
+  const arrayStart = trimmed.indexOf('[')
+  const arrayEnd = trimmed.lastIndexOf(']')
+  if (arrayStart >= 0 && arrayEnd > arrayStart) candidates.push(trimmed.slice(arrayStart, arrayEnd + 1))
   for (const candidate of candidates) {
     try {
-      const parsed = JSON.parse(candidate) as unknown
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+      return JSON.parse(candidate) as unknown
     } catch { /* 换下一个候选串 */ }
   }
   throw new AiError('模型返回的内容无法解析为 JSON，可尝试换个模型或简化提示词', 502)
+}
+
+function parseJsonObject(content: string): Record<string, unknown> {
+  const parsed = parseJsonValue(content)
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new AiError('模型返回的内容不是 JSON 对象，可尝试换个模型或简化提示词', 502)
+  }
+  return parsed as Record<string, unknown>
 }
 
 function cleanFields(input: AiTranslateFields): AiTranslateFields {
@@ -264,6 +274,51 @@ function pickFields(parsed: Record<string, unknown>, source: AiTranslateFields):
 }
 
 export interface AiTranslateResult { fields: AiTranslateFields; cached: boolean; model: string; createdAt: number; targetLanguage: string }
+
+export interface MangaTextTranslateResult { translations: string[]; model: string; targetLanguage: string }
+
+/**
+ * 一页漫画里的文本按阅读顺序一次批量翻译。输入输出等长、顺序一致；
+ * 模型少返或漏返的项回退到原文，避免某个气泡被擦掉后却没有新文字。
+ */
+export async function translateMangaTexts(input: { texts: string[]; targetLanguage?: string }): Promise<MangaTextTranslateResult> {
+  const texts = Array.isArray(input?.texts) ? input.texts.map(text => asText(text)).filter(Boolean) : []
+  if (!texts.length) throw new AiError('这一页没有识别到可翻译的文字')
+  const settings = configured()
+  const targetLanguage = asText(input?.targetLanguage, '') || settings.targetLanguage
+  const { chat } = endpoints(settings.baseUrl)
+  const payload = bodyWithParams(settings.params, {
+    model: settings.model,
+    messages: [
+      {
+        role: 'system',
+        content: [
+          `你是漫画翻译助手。输入是按阅读顺序排列的一页漫画 OCR 文本，请逐条翻译成${targetLanguage}。`,
+          '保持数组长度和顺序完全一致，不要合并或拆分条目。只输出 JSON：{"translations":["...","..."]}。',
+          '译文要简短自然，符合角色口吻和气泡语境；拟声词尽量保留声音感。不要解释，不要输出原文。',
+        ].join(''),
+      },
+      { role: 'user', content: JSON.stringify(texts) },
+    ],
+    response_format: { type: 'json_object' },
+    stream: false,
+  }, ['model', 'messages', 'response_format', 'stream'])
+  const data = await requestJson(chat, { method: 'POST', headers: headers(settings), body: payload }, settings.timeoutMs)
+  const parsed = parseJsonValue(extractContent(data))
+  const values = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === 'object'
+      ? (parsed as Record<string, unknown>).translations
+        ?? (parsed as Record<string, unknown>).translated_texts
+        ?? (parsed as Record<string, unknown>).items
+      : null
+  if (!Array.isArray(values)) throw new AiError('模型没有按数组返回漫画译文，可尝试换个模型', 502)
+  const translations = texts.map((source, index) => asText(values[index]) || source)
+  if (translations.every((text, index) => text === texts[index])) {
+    throw new AiError('模型没有返回可用的漫画译文，可尝试换个模型', 502)
+  }
+  return { translations, model: asText(data.model, settings.model), targetLanguage }
+}
 
 export async function translateFields(input: { fields: AiTranslateFields; targetLanguage?: string; force?: boolean }): Promise<AiTranslateResult> {
   const settings = configured()

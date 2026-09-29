@@ -7,13 +7,14 @@ import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { sources, saveSources, port, allowPublicAccess } from './config.js'
 import { isLocalAddress } from './access.js'
-import { allWorks, getAsset, getWork, workAssets, favoriteIds, setFavorite, toWork, db } from './database.js'
+import { allWorks, getAsset, getWork, workAssets, favoriteIds, setFavorite, toWork, db, type StoredAsset } from './database.js'
 import { refreshSearch, searchWorks, suggestTags } from './search.js'
 import { scanLibrary, scanStatus, onScan, sourceOnline } from './scanner.js'
 import { accessibleAsset, sendMedia, thumbnail, detectFFmpeg, ffmpegAvailable, convert, conversionStatus, conversionPath } from './media.js'
 import type { Source, LibraryStatus, AiTranslateFields } from '../shared/types.js'
 import { listDirectories } from './directories.js'
 import { getAiSettings, saveAiSettings, testAiConnection, listAiModels, translateFields, clearTranslationCache } from './ai.js'
+import { getMangaJob, getMangaModelStatus, mangaBaseImagePath, startMangaTranslation } from './ai/manga/service.js'
 
 export async function createApp(logging = true) {
   const app = Fastify({ logger: logging, bodyLimit: 16_384 })
@@ -218,6 +219,30 @@ export async function createApp(logging = true) {
   app.post<{ Body: { fields?: AiTranslateFields; targetLanguage?: string; force?: boolean } }>('/api/ai/translate', async request => {
     const body = request.body || {}
     return translateFields({ fields: body.fields || {}, targetLanguage: body.targetLanguage, force: body.force === true })
+  })
+  app.get('/api/ai/manga/status', async () => getMangaModelStatus())
+  app.post<{ Body: { assetId?: string; assetIds?: string[]; force?: boolean } }>('/api/ai/manga/translate', async (request, reply) => {
+    const body = request.body || {}
+    const requested = Array.isArray(body.assetIds) ? body.assetIds : [body.assetId]
+    const assetIds = [...new Set(requested.filter((id): id is string => typeof id === 'string' && id.length > 0))]
+    if (!assetIds.length) return reply.code(400).send({ message: '没有选择要翻译的图片' })
+    const assets: StoredAsset[] = []
+    for (const assetId of assetIds) {
+      const asset = getAsset(assetId)
+      if (!asset || !await accessibleAsset(asset)) return reply.code(404).send({ message: '图片不存在或媒体目录离线' })
+      if (asset.kind !== 'image' || asset.extension === 'gif') return reply.code(400).send({ message: '只有静态图片支持漫画翻译' })
+      assets.push(asset)
+    }
+    return startMangaTranslation(assets, body.force === true)
+  })
+  app.get<{ Params: { id: string } }>('/api/ai/manga/jobs/:id', async (request, reply) => {
+    const job = getMangaJob(request.params.id)
+    return job || reply.code(404).send({ message: '翻译任务不存在或服务已重启' })
+  })
+  app.get<{ Params: { key: string } }>('/api/ai/manga/cache/:key/base.png', async (request, reply) => {
+    const image = mangaBaseImagePath(request.params.key)
+    if (!image) return reply.code(404).send({ message: '漫画翻译缓存不存在' })
+    return sendMedia(request, reply, image, 'png')
   })
 
   const webRoot = path.resolve('dist')

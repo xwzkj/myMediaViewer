@@ -40,6 +40,67 @@ export interface AiTranslateResult {
 }
 export interface AiConnectionResult { reply: string; model: string; elapsed: number }
 
+// 漫画图片翻译：坐标统一使用原图像素。前端 Canvas 直接按这些坐标绘制。
+export interface MangaRegion {
+  id: number
+  x: number; y: number; width: number; height: number
+  source: string; translation: string
+  /** CTD 检测置信度。 */
+  detection: number
+  /** manga-ocr 的每 token 几何平均置信度。 */
+  confidence: number
+  /** 服务端擦字时估出的气泡底色，供 Canvas 兜底。 */
+  background: string
+  /** 根据底色亮度选出的文字颜色。 */
+  textColor: string
+}
+
+export interface MangaPageResult {
+  key: string
+  width: number; height: number
+  /** 已擦除有译文区域的底图；若本页没有可翻译文本则回退到原图 URL。 */
+  baseUrl: string
+  regions: MangaRegion[]
+  cached: boolean
+  model: string
+  targetLanguage: string
+  createdAt: number
+}
+
+export interface MangaJobResult {
+  assetId: string
+  result: MangaPageResult
+}
+
+export interface MangaJobFailure {
+  assetId: string
+  message: string
+}
+
+export interface MangaJob {
+  id: string
+  state: 'queued' | 'processing' | 'ready' | 'failed'
+  /** 面向用户展示的阶段文本，不再依赖百分比表达进度。 */
+  stage: string
+  progress: number
+  /** 本次任务包含的图片总数与已完成数量。 */
+  total: number
+  completed: number
+  currentAssetId?: string
+  message?: string
+  result?: MangaPageResult
+  /** 翻译整部时，逐张返回已经完成的结果。 */
+  results?: MangaJobResult[]
+  failed?: MangaJobFailure[]
+}
+
+export interface MangaModelStatus {
+  ready: boolean
+  device: string
+  models: Array<{ name: string; ready: boolean; files: string[]; missing: string[] }>
+  message?: string
+}
+
 export interface DirectoryEntry { name: string; path: string }
 export interface DirectoryListing {
   path: string | null; parent: string | null;

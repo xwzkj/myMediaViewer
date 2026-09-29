@@ -87,3 +87,20 @@
   .translation-meta{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:10px;color:var(--muted);margin-bottom:16px;line-height:1.7}
     .work-info .ai-note{padding:20px;border-radius:12px;background:var(--surface-high);color:var(--muted);font-size:11px}
 }
+
+@layer components {
+  .media-frame>.manga-canvas{width:auto;height:auto;max-width:100%;max-height:100%;object-fit:contain;cursor:zoom-in;background:#fff}
+  .manga-toolbar{margin-top:0;margin-bottom:12px}
+  .manga-translate-actions{display:flex;align-items:center}
+  .manga-scope-menu{display:flex;flex-wrap:wrap;gap:7px;margin:-4px 0 12px;padding:8px;border:1px solid var(--outline);border-radius:11px;background:var(--surface-low)}
+  .manga-scope-menu button{border:1px solid var(--outline);border-radius:8px;background:var(--surface);color:var(--text);padding:8px 11px;text-align:left;font-size:11px;font-weight:600;white-space:nowrap;cursor:pointer}
+  .manga-scope-menu button:hover{background:var(--surface-high);color:var(--primary)}
+  .manga-progress{display:flex;align-items:center;gap:7px;margin:0 0 12px;padding:9px 11px;border-radius:9px;background:var(--primary-container);color:var(--on-container);font-size:11px;line-height:1.7}
+  .manga-progress .spinner{width:12px;height:12px;border-width:1.5px;flex-shrink:0}
+  .manga-lines{margin:22px 0;padding-top:18px;border-top:1px solid var(--outline)}
+  .manga-lines h3{font-size:13px;font-weight:600;margin-bottom:12px}
+  .manga-lines ol{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:9px}
+  .manga-lines li{display:flex;flex-direction:column;gap:5px;padding:10px 11px;border-radius:9px;background:var(--surface-high);font-size:11px;line-height:1.7}
+  .manga-lines li span{color:var(--muted)}
+  .manga-lines li strong{color:var(--primary);font-weight:600;overflow-wrap:anywhere}
+}

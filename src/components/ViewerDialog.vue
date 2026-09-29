@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import type { AiTranslateFields, AiTranslateResult, WorkDetail, Work } from '../../shared/types'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import type { AiTranslateFields, AiTranslateResult, MangaJob, MangaPageResult, WorkDetail, Work } from '../../shared/types'
 import { Viewer } from 'v-viewer'
 import { api, formatSize, kindLabel } from '../api'
 import Icon from './Icon.vue'
@@ -19,6 +19,15 @@ const slideshow = ref(false)
 const converting = ref(false)
 const convertMessage = ref('')
 const compatible = ref(false)
+// 图片翻译：保留原图 / 已擦字译图两种显示方式；OCR 与译文都从服务端任务返回。
+const mangaResults = ref<Record<string, MangaPageResult>>({})
+const mangaJob = ref<MangaJob | null>(null)
+const mangaMode = ref<'source' | 'translated'>('source')
+const mangaError = ref('')
+const mangaScopeOpen = ref(false)
+const mangaCanvas = ref<HTMLCanvasElement>()
+let mangaTimer: ReturnType<typeof setTimeout> | undefined
+let mangaToken = 0
 // 翻译：显示模式控制只显示原文、只显示译文，或两者对照。
 type TranslationDisplay = 'source' | 'translated' | 'both'
 const translation = ref<AiTranslateResult | null>(null)
@@ -32,6 +41,10 @@ let conversionTimer: ReturnType<typeof setTimeout> | undefined
 let disposed = false
 const asset = computed(() => detail.value?.assets[index.value])
 const isVideo = computed(() => asset.value && (asset.value.kind === 'video' || asset.value.extension === 'webm'))
+const canTranslateManga = computed(() => asset.value?.kind === 'image' && asset.value.extension !== 'gif')
+const mangaResult = computed(() => asset.value ? mangaResults.value[asset.value.id] || null : null)
+const mangaPageAssets = computed(() => (detail.value?.assets || []).filter(item => item.kind === 'image' && item.extension !== 'gif'))
+const mangaBusy = computed(() => mangaJob.value?.state === 'queued' || mangaJob.value?.state === 'processing')
 const mediaUrl = computed(() => compatible.value ? `/api/assets/${asset.value?.id}/compatible` : asset.value?.url)
 
 async function load() {
@@ -42,6 +55,17 @@ async function load() {
     if (startAtLast) index.value = Math.max(0, (detail.value?.assets.length || 1) - 1)
   } catch (e) { error.value = (e as Error).message }
   startAtLast = false
+}
+// 切换分 P / 作品时丢弃旧图翻译状态，后台任务即使稍后完成也不会覆盖当前页面。
+function resetManga() {
+  mangaToken++
+  clearTimeout(mangaTimer)
+  mangaTimer = undefined
+  mangaJob.value = null
+  mangaResults.value = {}
+  mangaMode.value = 'source'
+  mangaError.value = ''
+  mangaScopeOpen.value = false
 }
 // 打开查看器时锁住底层页面滚动，避免穿透到作品列表。
 let previousOverflow = ''
@@ -57,9 +81,27 @@ onMounted(async () => {
   timer = setInterval(() => { if (slideshow.value && !isVideo.value && !previewing.value) next(1, true) }, 4500)
 })
 // 滑动切换到别的作品后重新取详情，并回到第一张。
-watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; translation.value = null; translationError.value = ''; translationDisplay.value = 'both'; void load() })
-onUnmounted(() => { disposed = true; destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); document.body.style.overflow = previousOverflow; document.body.style.paddingRight = previousPadding })
-watch(index, () => { destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; clearTimeout(conversionTimer) })
+watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; translation.value = null; translationError.value = ''; translationDisplay.value = 'both'; resetManga(); void load() })
+onUnmounted(() => { disposed = true; destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); clearTimeout(mangaTimer); document.body.style.overflow = previousOverflow; document.body.style.paddingRight = previousPadding })
+watch(index, async () => {
+  destroyPreview()
+  mediaError.value = false
+  compatible.value = false
+  converting.value = false
+  convertMessage.value = ''
+  clearTimeout(conversionTimer)
+  mangaError.value = ''
+  mangaScopeOpen.value = false
+  await nextTick()
+  mangaMode.value = mangaResult.value ? 'translated' : 'source'
+  if (mangaResult.value) void drawMangaResult()
+})
+// v-if 切换会让 canvas 重新挂载；只要译图、显示模式或 canvas 实例变化，就重新绘制一次。
+watch([mangaMode, () => mangaResult.value?.key, () => mangaCanvas.value], async ([mode, key, canvas]) => {
+  if (mode !== 'translated' || !key || !canvas) return
+  await nextTick()
+  void drawMangaResult()
+})
 watch(slideshow, value => { if (value && isVideo.value) void video.value?.play().catch(() => {}) })
 // 标题、作者、标签、描述一起交给 AI，保证同一组信息的译文风格一致。
 const translatable = computed<AiTranslateFields>(() => {
@@ -186,7 +228,10 @@ function openPreview() {
   const token = document.createElement('div')
   token.style.display = 'none'
   const image = document.createElement('img')
-  image.src = asset.value.url
+  // 译图以 Canvas 叠加呈现，预览时把同一份结果编码进去，避免看到未回填的原图。
+  image.src = mangaResult.value && mangaMode.value === 'translated' && mangaCanvas.value
+    ? mangaCanvas.value.toDataURL('image/png')
+    : asset.value.url
   image.alt = props.work.title
   token.appendChild(image)
   // 浮层必须挂在 dialog 内部，否则会被顶层对话框盖住。
@@ -287,6 +332,157 @@ async function translate(force = false) {
     translating.value = false
   }
 }
+// 点击翻译入口：只有一张可翻译图片时直接开始，多张时展开“本页 / 整部”选择。
+function chooseMangaTranslation() {
+  if (!asset.value || !canTranslateManga.value || mangaBusy.value) return
+  if (mangaPageAssets.value.length <= 1) {
+    void runMangaTranslation('page', Boolean(mangaResult.value))
+    return
+  }
+  mangaScopeOpen.value = !mangaScopeOpen.value
+}
+
+// 图片翻译：服务端任务式处理 OCR、擦字和批量翻译，这里只负责轮询、保存各页结果与 Canvas 排版。
+async function runMangaTranslation(scope: 'page' | 'work', force = false) {
+  if (!asset.value || !canTranslateManga.value || mangaBusy.value) return
+  const pageIds = scope === 'work'
+    ? mangaPageAssets.value.map(item => item.id)
+    : [asset.value.id]
+  if (!pageIds.length) return
+
+  mangaScopeOpen.value = false
+  const token = ++mangaToken
+  let firstPoll = true
+  mangaError.value = ''
+  clearTimeout(mangaTimer)
+  async function handle(job: MangaJob) {
+    if (disposed || token !== mangaToken) return
+    mangaJob.value = job
+
+    const incoming = job.results || (job.result && job.currentAssetId ? [{ assetId: job.currentAssetId, result: job.result }] : [])
+    for (const item of incoming) mangaResults.value[item.assetId] = item.result
+
+    const currentResult = asset.value ? mangaResults.value[asset.value.id] : undefined
+    if (currentResult) mangaMode.value = 'translated'
+    if (job.state === 'ready') {
+      await nextTick()
+      if (currentResult) void drawMangaResult()
+      if (job.failed?.length) {
+        emit('notice', `已完成 ${job.results?.length || 0}/${job.total} 张漫画翻译，${job.failed.length} 张失败`)
+      } else if (scope === 'work') {
+        emit('notice', `整部漫画翻译完成，共 ${job.results?.length || 0} 张`)
+      } else {
+        emit('notice', currentResult?.cached
+          ? `已显示缓存的漫画译图（${currentResult.model || '本地 OCR'}）`
+          : `漫画图片翻译完成（${currentResult?.model || '本地 OCR'}）`)
+      }
+      return
+    }
+    if (job.state === 'failed') {
+      mangaError.value = job.message || job.stage || '漫画图片翻译失败'
+      return
+    }
+    const delay = firstPoll ? 50 : job.state === 'queued' ? 1200 : 800
+    firstPoll = false
+    mangaTimer = setTimeout(async () => {
+      try { await handle(await api<MangaJob>(`/ai/manga/jobs/${job.id}`)) }
+      catch (e) {
+        if (token === mangaToken) mangaError.value = (e as Error).message
+      }
+    }, delay)
+  }
+  try {
+    await handle(await api<MangaJob>('/ai/manga/translate', {
+      method: 'POST',
+      body: JSON.stringify({ assetIds: pageIds, force }),
+    }))
+  } catch (e) {
+    if (token === mangaToken) mangaError.value = (e as Error).message
+  }
+}
+
+async function drawMangaResult() {
+  const result = mangaResult.value
+  const canvas = mangaCanvas.value
+  if (!result || !canvas || !result.width || !result.height) return
+  const image = new Image()
+  image.decoding = 'async'
+  image.src = result.baseUrl
+  try {
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve()
+      image.onerror = () => reject(new Error('译图底图加载失败'))
+    })
+  } catch (e) {
+    mangaError.value = (e as Error).message
+    return
+  }
+  canvas.width = result.width
+  canvas.height = result.height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
+  ctx.drawImage(image, 0, 0, result.width, result.height)
+  for (const region of result.regions) drawMangaRegion(ctx, region)
+}
+
+function drawMangaRegion(ctx: CanvasRenderingContext2D, region: MangaPageResult['regions'][number]) {
+  const translation = region.translation.trim()
+  if (!translation) return
+  const padding = Math.max(2, Math.round(Math.min(region.width, region.height) * 0.06))
+  const maxWidth = Math.max(4, region.width - padding * 2)
+  const maxHeight = Math.max(4, region.height - padding * 2)
+  const fontFamily = '"Noto Sans SC","Microsoft YaHei","PingFang SC",sans-serif'
+  const maxSize = Math.max(8, Math.floor(Math.min(maxWidth, maxHeight)))
+  let chosenSize = 7
+  let chosenLines = wrapCanvasText(ctx, translation, 7, fontFamily, maxWidth)
+  for (let size = maxSize; size >= 7; size--) {
+    const lines = wrapCanvasText(ctx, translation, size, fontFamily, maxWidth)
+    if (lines.every(line => ctx.measureText(line).width <= maxWidth) && lines.length * size * 1.14 <= maxHeight) {
+      chosenSize = size
+      chosenLines = lines
+      break
+    }
+  }
+  ctx.save()
+  ctx.beginPath()
+  ctx.rect(region.x + 1, region.y + 1, Math.max(1, region.width - 2), Math.max(1, region.height - 2))
+  ctx.clip()
+  ctx.fillStyle = region.textColor || '#111111'
+  ctx.font = `600 ${chosenSize}px ${fontFamily}`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  const lineHeight = chosenSize * 1.14
+  const startY = region.y + (region.height - chosenLines.length * lineHeight) / 2 + lineHeight / 2
+  const centerX = region.x + region.width / 2
+  chosenLines.forEach((line, index) => ctx.fillText(line, centerX, startY + index * lineHeight))
+  ctx.restore()
+}
+
+function wrapCanvasText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  size: number,
+  family: string,
+  maxWidth: number,
+): string[] {
+  ctx.font = `600 ${size}px ${family}`
+  const lines: string[] = []
+  for (const paragraph of text.split(/\r?\n/)) {
+    let line = ''
+    for (const char of paragraph) {
+      const next = line + char
+      if (line && ctx.measureText(next).width > maxWidth) {
+        lines.push(line)
+        line = char
+      } else {
+        line = next
+      }
+    }
+    lines.push(line)
+  }
+  return lines.length ? lines : [text]
+}
 // 点击按钮在“原文 + 译文 / 仅原文 / 仅译文”之间循环。
 function cycleTranslationDisplay() {
   const at = translationDisplayOrder.indexOf(translationDisplay.value)
@@ -322,6 +518,7 @@ async function makeCompatible() {
               <p v-if="error" class="inline-error">{{ error }}</p><div v-else-if="!asset" class="loading-state"><span class="spinner" />正在打开作品…</div>
               <template v-else>
                 <video v-if="isVideo" ref="video" :key="mediaUrl" :src="mediaUrl" :poster="asset.thumbnail" controls playsinline preload="metadata" :autoplay="slideshow || asset.kind === 'animation'" :muted="asset.kind === 'animation'" :loop="asset.kind === 'animation' && !slideshow" @error="mediaError = true" @ended="slideshow && next(1, true)" />
+                <canvas v-else-if="mangaResult && mangaMode === 'translated' && mangaResult.regions.length" :key="mangaResult.key" ref="mangaCanvas" class="manga-canvas" :width="mangaResult.width" :height="mangaResult.height" :aria-label="`${work.title}，第 ${index + 1} 张的漫画译图`" @click="openPreview" />
                 <img v-else :key="asset.id" :src="asset.url" draggable="false" :alt="`${work.title}，第 ${index + 1} 张`" @click="openPreview" @error="mediaError = true" />
                 <div v-if="mediaError" class="media-error"><Icon name="warning" :size="32" /><p>{{ isVideo ? '浏览器无法播放这个视频' : '无法读取这张图片' }}</p><button v-if="isVideo" class="button tonal" :disabled="converting" @click="makeCompatible">{{ converting ? '正在处理…' : '生成兼容版本' }}</button></div>
               </template>
@@ -362,6 +559,32 @@ async function makeCompatible() {
             {{ displayLabel }}
           </button>
         </div>
+        <div v-if="canTranslateManga" class="translation-toolbar manga-toolbar">
+          <div class="manga-translate-actions">
+            <button class="button tonal small" type="button" :disabled="mangaBusy" :title="mangaResult ? '重新识别并翻译图片' : '识别图中日文并回填中文'" @click="chooseMangaTranslation">
+              <Icon :name="mangaBusy ? 'refresh' : 'translate'" :class="{ spinning: mangaBusy }" :size="17" />
+              {{ mangaBusy ? '图片翻译中…' : mangaResult ? '重新翻译' : '翻译图片' }}
+            </button>
+          </div>
+          <button v-if="mangaResult" class="button text small display-toggle" type="button" @click="mangaMode = mangaMode === 'translated' ? 'source' : 'translated'">
+            <Icon :name="mangaMode === 'translated' ? 'image' : 'translate'" :size="17" />
+            {{ mangaMode === 'translated' ? '查看原图' : '查看译图' }}
+          </button>
+        </div>
+        <div v-if="mangaScopeOpen && !mangaBusy" class="manga-scope-menu" role="menu" aria-label="选择漫画翻译范围">
+          <button type="button" role="menuitem" @click="runMangaTranslation('page', Boolean(mangaResult))">翻译本页</button>
+          <button type="button" role="menuitem" @click="runMangaTranslation('work')">翻译整部 · {{ mangaPageAssets.length }} 张</button>
+        </div>
+        <p v-if="mangaBusy && mangaJob?.stage" class="manga-progress" role="status">
+          <span class="spinner" />当前进度：{{ mangaJob.stage }}
+        </p>
+        <p v-if="mangaError" class="inline-error translation-error-box" role="alert">
+          <Icon name="warning" :size="19" />
+          <span>{{ mangaError }}</span>
+        </p>
+        <p v-if="mangaResult && mangaMode === 'translated'" class="translation-meta" role="status">
+          本页识别 {{ mangaResult.regions.length }} 处 · {{ mangaResult.model }} · {{ mangaResult.cached ? '来自缓存' : '刚刚生成' }}
+        </p>
         <p v-if="translationError" class="inline-error translation-error-box" role="alert">
           <Icon name="warning" :size="19" />
           <span>{{ translationError }}</span>
@@ -373,6 +596,15 @@ async function makeCompatible() {
         <h3>作品描述</h3>
         <p v-if="sourceVisible" class="description">{{ detail?.description || '这组作品暂时没有文字描述。' }}</p>
         <p v-if="translatedVisible && translation?.fields.description" class="description translated"><span v-if="sourceVisible" class="line-tag">译文</span>{{ translation.fields.description }}</p>
+        <section v-if="mangaResult?.regions.length" class="manga-lines" aria-label="图片翻译对照">
+          <h3>图片译文对照</h3>
+          <ol>
+            <li v-for="region in mangaResult.regions" :key="region.id">
+              <span>{{ region.source }}</span>
+              <strong>{{ region.translation }}</strong>
+            </li>
+          </ol>
+        </section>
         <a v-if="detail?.originalUrl" class="button outlined small" :href="detail.originalUrl" target="_blank" rel="noopener noreferrer">前往原作品<Icon name="external" :size="18" /></a>
         <div v-if="isVideo" class="compatibility-panel"><p>遇到黑屏或只有声音？</p><button class="button tonal small" :disabled="converting || compatible" @click="makeCompatible"><Icon name="video" :size="18" />{{ compatible ? '已切换兼容版本' : converting ? '正在处理…' : '生成兼容版本' }}</button><span v-if="convertMessage" role="status">{{ convertMessage }}</span><small>生成的文件只保存在缓存中，原文件保持不变。</small></div>
       </div></Transition></aside>
