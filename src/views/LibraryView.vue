@@ -234,6 +234,7 @@ function openSettings() {
   router.push({ name: 'settings', query: { from: route.fullPath } })
 }
 function openWork(work: Work) {
+  librarySession.activeWorkId = work.id
   router.push({ name: 'work', params: { workId: work.id }, query: { from: route.fullPath } })
 }
 function routeFilters(extra: Record<string, string> = {}) {
@@ -329,6 +330,20 @@ watch(query, value => {
     void loadWorks()
   }, 220)
 })
+// 从作品页回到列表时，把对应卡片滚回视口中央；KeepAlive 保留了原来的列表 DOM。
+function scrollToActiveWork() {
+  const id = librarySession.activeWorkId
+  if (!id) return
+  void nextTick(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const target = Array.from(document.querySelectorAll<HTMLElement>('.work-card[data-work-id]'))
+          .find(card => card.dataset.workId === id)
+        target?.scrollIntoView({ block: 'center', behavior: 'auto' })
+      })
+    })
+  })
+}
 function startPolling() {
   clearInterval(poll)
   poll = setInterval(refreshStatus, 2000)
@@ -355,6 +370,7 @@ onMounted(() => {
 onActivated(() => {
   bindGlobalListeners()
   startPolling()
+  scrollToActiveWork()
   void refreshStatus()
 })
 onDeactivated(() => {

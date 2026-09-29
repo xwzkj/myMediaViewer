@@ -9,7 +9,7 @@ const failed = ref(false)
 </script>
 
 <template>
-  <article class="work-card">
+  <article class="work-card" :data-work-id="work.id">
     <button class="card-open" @click="$emit('open', work)" :aria-label="`查看 ${work.title}`">
       <div class="card-art">
         <img v-if="!failed" :src="work.cover" :alt="work.title" loading="lazy" decoding="async" @error="failed = true" />

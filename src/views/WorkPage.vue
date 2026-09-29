@@ -21,6 +21,7 @@ async function load() {
   error.value = ''
   try {
     work.value = await api<WorkDetail>(`/works/${encodeURIComponent(String(route.params.workId))}`)
+    librarySession.activeWorkId = work.value.id
   } catch (e) {
     work.value = null
     error.value = (e as Error).message
@@ -71,7 +72,8 @@ async function navigateWork(direction: number, auto = false) {
     if (!auto) notice(direction > 0 ? '已经是最后一组作品' : '已经是第一组作品')
     return
   }
-  router.push({ name: 'work', params: { workId: target.id }, query: route.query })
+  // 作品页内部翻页只替换当前记录，浏览器返回应回到来源列表而不是上一部作品。
+  router.replace({ name: 'work', params: { workId: target.id }, query: route.query })
 }
 
 watch(() => route.params.workId, load, { immediate: true })
