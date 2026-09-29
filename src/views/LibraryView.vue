@@ -4,6 +4,8 @@ import { useRoute, useRouter } from 'vue-router'
 import type { LibraryStatus, TagSuggestion, TagSuggestionsResponse, Work, WorksResponse } from '../../shared/types'
 import { activeSearchToken, replaceWithTag, tagQuery } from '../../shared/search-query'
 import { api, formatNumber } from '../api'
+import { appEvents, type WorkReturnPayload } from '../events'
+import { createSearchSessionId, routeCacheKey } from '../route-cache-key'
 import { setLibraryLoader, syncLibrarySession, librarySession } from '../library-session'
 import Icon from '../components/Icon.vue'
 import WorkCard from '../components/WorkCard.vue'
@@ -12,6 +14,11 @@ defineOptions({ name: 'LibraryView' })
 
 const route = useRoute()
 const router = useRouter()
+// 每个列表路由由独立的 KeepAlive 实例负责，搜索页按关键词和筛选项分开缓存。
+const pageKey = routeCacheKey(route)
+const pagePath = ref(routeCacheKey(route) === pageKey ? route.fullPath : '')
+const pendingWorkId = ref('')
+let pendingScrollToken = 0
 const status = ref<LibraryStatus | null>(null)
 // 记住上次看的是哪个来源、带哪些筛选、怎么排序，下次打开直接恢复。
 const savedState = ((): Record<string, unknown> => {
@@ -234,7 +241,6 @@ function openSettings() {
   router.push({ name: 'settings', query: { from: route.fullPath } })
 }
 function openWork(work: Work) {
-  librarySession.activeWorkId = work.id
   router.push({ name: 'work', params: { workId: work.id }, query: { from: route.fullPath } })
 }
 function routeFilters(extra: Record<string, string> = {}) {
@@ -249,6 +255,8 @@ function routeFilters(extra: Record<string, string> = {}) {
 }
 function searchTarget(value: string) {
   const next = routeFilters({ q: value })
+  const currentSid = typeof route.query.sid === 'string' ? route.query.sid : ''
+  next.sid = route.name === 'search' && currentSid ? currentSid : createSearchSessionId()
   if (view.value === 'favorites') next.favorites = 'true'
   return { name: 'search' as const, query: next }
 }
@@ -259,8 +267,9 @@ function listTarget() {
 }
 // 路由是页面身份的唯一来源；筛选和排序仍可沿用本地记忆，搜索词由 URL 保存。
 function applyRoute() {
+  if (routeCacheKey(route) !== pageKey) return
   const name = String(route.name || '')
-  if (!['library', 'favorites', 'source', 'search'].includes(name)) return
+  pagePath.value = route.fullPath
   view.value = name === 'favorites' || (name === 'search' && route.query.favorites === 'true') ? 'favorites' : 'library'
   source.value = name === 'source'
     ? String(route.params.sourceId || '')
@@ -330,17 +339,45 @@ watch(query, value => {
     void loadWorks()
   }, 220)
 })
-// 从作品页回到列表时，把对应卡片滚回视口中央；KeepAlive 保留了原来的列表 DOM。
-function scrollToActiveWork() {
-  const id = librarySession.activeWorkId
-  if (!id) return
-  void nextTick(() => {
+// 作品页退出时发送待定位作品；列表页等目标进入结果并完成渲染后再滚动。
+function handleWorkReturn(payload: WorkReturnPayload) {
+  if (payload.returnPath !== pagePath.value) return
+  pendingWorkId.value = payload.workId
+  if (routeCacheKey(route) === pageKey && route.fullPath === pagePath.value) void restorePendingWork()
+}
+async function waitForLoading() {
+  while (loading.value || loadingMore.value) await new Promise(resolve => setTimeout(resolve, 30))
+}
+async function ensureWorkAvailable(id: string) {
+  await waitForLoading()
+  if (result.value.items.some(work => work.id === id)) return true
+  while (result.value.page < result.value.pages) {
+    const previousPage = result.value.page
+    await loadPage(previousPage + 1)
+    if (result.value.items.some(work => work.id === id)) return true
+    if (result.value.page <= previousPage) break
+  }
+  return false
+}
+async function restorePendingWork() {
+  const id = pendingWorkId.value
+  if (!id || routeCacheKey(route) !== pageKey || route.fullPath !== pagePath.value) return
+  const token = ++pendingScrollToken
+  const available = await ensureWorkAvailable(id)
+  if (token !== pendingScrollToken || pendingWorkId.value !== id) return
+  if (!available) {
+    pendingWorkId.value = ''
+    return
+  }
+  await nextTick()
+  requestAnimationFrame(() => {
     requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        const target = Array.from(document.querySelectorAll<HTMLElement>('.work-card[data-work-id]'))
-          .find(card => card.dataset.workId === id)
-        target?.scrollIntoView({ block: 'center', behavior: 'auto' })
-      })
+      if (token !== pendingScrollToken) return
+      const target = Array.from(document.querySelectorAll<HTMLElement>('.work-card[data-work-id]'))
+        .find(card => card.dataset.workId === id)
+      if (!target) return
+      target.scrollIntoView({ block: 'center', behavior: 'auto' })
+      pendingWorkId.value = ''
     })
   })
 }
@@ -359,6 +396,7 @@ function unbindGlobalListeners() {
   document.removeEventListener('keydown', closeMenu)
 }
 onMounted(() => {
+  appEvents.on('work:return', handleWorkReturn)
   setLibraryLoader(() => loadMore())
   void refreshStatus()
   void loadWorks()
@@ -370,7 +408,7 @@ onMounted(() => {
 onActivated(() => {
   bindGlobalListeners()
   startPolling()
-  scrollToActiveWork()
+  void restorePendingWork()
   void refreshStatus()
 })
 onDeactivated(() => {
@@ -379,6 +417,7 @@ onDeactivated(() => {
 })
 onUnmounted(() => {
   destroyed = true
+  appEvents.off('work:return', handleWorkReturn)
   unbindGlobalListeners()
   clearInterval(poll)
   clearTimeout(debounce)

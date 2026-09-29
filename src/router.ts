@@ -29,8 +29,9 @@ export const router = createRouter({
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
   scrollBehavior(to, from, savedPosition) {
+    // 从作品页回列表时由列表页收到返回作品消息后统一滚动，避免这里恢复旧位置覆盖。
+    if (from.name === 'work') return false
     if (savedPosition) return savedPosition
-    if (to.name === 'work' && from.name === 'work') return false
     return { top: 0 }
   },
 })

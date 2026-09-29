@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import type { Work, WorkDetail } from '../../shared/types'
 import { tagQuery } from '../../shared/search-query'
 import { api } from '../api'
 import { adjacentWork, librarySession } from '../library-session'
+import { appEvents } from '../events'
+import { createSearchSessionId } from '../route-cache-key'
 import Icon from '../components/Icon.vue'
 import ViewerDialog from '../components/ViewerDialog.vue'
 
@@ -21,7 +23,6 @@ async function load() {
   error.value = ''
   try {
     work.value = await api<WorkDetail>(`/works/${encodeURIComponent(String(route.params.workId))}`)
-    librarySession.activeWorkId = work.value.id
   } catch (e) {
     work.value = null
     error.value = (e as Error).message
@@ -53,12 +54,16 @@ async function toggleFavorite(target: Work) {
   }
 }
 
+function openSearch(query: string) {
+  router.push({ name: 'search', query: { q: query, from: route.fullPath, sid: createSearchSessionId() } })
+}
+
 function searchTag(tag: string) {
-  router.push({ name: 'search', query: { q: tagQuery(tag), from: route.fullPath } })
+  openSearch(tagQuery(tag))
 }
 
 function searchAuthor(author: string) {
-  router.push({ name: 'search', query: { q: author, from: route.fullPath } })
+  openSearch(author)
 }
 
 async function navigateWork(direction: number, auto = false) {
@@ -77,6 +82,12 @@ async function navigateWork(direction: number, auto = false) {
 }
 
 watch(() => route.params.workId, load, { immediate: true })
+
+onBeforeRouteLeave(to => {
+  if (to.name === 'work' || !work.value) return
+  const returnPath = typeof route.query.from === 'string' ? route.query.from : ''
+  if (returnPath) appEvents.emit('work:return', { workId: work.value.id, returnPath })
+})
 </script>
 
 <template>

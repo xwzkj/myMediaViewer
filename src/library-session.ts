@@ -16,7 +16,6 @@ export const librarySession: {
   total: number
   page: number
   pages: number
-  activeWorkId: string
   context: LibraryContext
   loadMore: SessionLoader | null
 } = {
@@ -24,7 +23,6 @@ export const librarySession: {
   total: 0,
   page: 1,
   pages: 1,
-  activeWorkId: '',
   context: { source: '', kind: '', fuzzy: false, sort: 'newest', order: 'collected', seed: '' },
   loadMore: null,
 }
