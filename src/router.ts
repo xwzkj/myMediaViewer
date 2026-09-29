@@ -1,4 +1,4 @@
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHistory, START_LOCATION } from 'vue-router'
 
 const LibraryView = () => import('./views/LibraryView.vue')
 const SettingsPage = () => import('./views/SettingsPage.vue')
@@ -29,6 +29,8 @@ export const router = createRouter({
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
   scrollBehavior(to, from, savedPosition) {
+    // 刷新或首次进入时回到顶部，避免恢复旧坐标时被第一页高度截断。
+    if (from === START_LOCATION) return { top: 0 }
     // 从作品页回列表时由列表页收到返回作品消息后统一滚动，避免这里恢复旧位置覆盖。
     if (from.name === 'work') return false
     if (savedPosition) return savedPosition
