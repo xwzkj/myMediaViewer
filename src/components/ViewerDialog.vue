@@ -5,9 +5,9 @@ import { Viewer } from 'v-viewer'
 import { api, formatSize, kindLabel } from '../api'
 import Icon from './Icon.vue'
 
-const props = defineProps<{ work: Work }>()
+const props = defineProps<{ work: Work; page?: boolean }>()
 const emit = defineEmits<{ close: []; favorite: [work: Work]; notice: [message: string, action?: { label: string; handler: () => void }, tone?: 'info' | 'error']; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
-const dialog = ref<HTMLDialogElement>()
+const root = ref<HTMLDialogElement | HTMLElement>()
 const stage = ref<HTMLElement>()
 const video = ref<HTMLVideoElement>()
 const detail = ref<WorkDetail | null>(null)
@@ -81,18 +81,20 @@ function resetManga() {
 let previousOverflow = ''
 let previousPadding = ''
 onMounted(async () => {
-  dialog.value?.showModal()
-  previousOverflow = document.body.style.overflow
-  previousPadding = document.body.style.paddingRight
-  const gap = window.innerWidth - document.documentElement.clientWidth
-  document.body.style.overflow = 'hidden'
-  if (gap > 0) document.body.style.paddingRight = `${gap}px`
+  if (!props.page && root.value instanceof HTMLDialogElement) root.value.showModal()
+  if (!props.page) {
+    previousOverflow = document.body.style.overflow
+    previousPadding = document.body.style.paddingRight
+    const gap = window.innerWidth - document.documentElement.clientWidth
+    document.body.style.overflow = 'hidden'
+    if (gap > 0) document.body.style.paddingRight = `${gap}px`
+  }
   await load()
   timer = setInterval(() => { if (slideshow.value && !isVideo.value && !previewing.value) next(1, true) }, 4500)
 })
 // 滑动切换到别的作品后重新取详情，并回到第一张。
 watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; translation.value = null; translationError.value = ''; translationDisplay.value = 'both'; resetManga(); void load() })
-onUnmounted(() => { disposed = true; destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); clearTimeout(mangaTimer); document.body.style.overflow = previousOverflow; document.body.style.paddingRight = previousPadding })
+onUnmounted(() => { disposed = true; destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); clearTimeout(mangaTimer); if (!props.page) { document.body.style.overflow = previousOverflow; document.body.style.paddingRight = previousPadding } })
 watch(index, async () => {
   destroyPreview()
   mediaError.value = false
@@ -232,7 +234,7 @@ function touchCancel() { gesture = null; dragX.value = 0 }
 // 点按图片交给 viewer.js 打开浮层，缩放、拖动、双击、捏合都由它负责。
 function openPreview() {
   if (suppressClick || !asset.value) return
-  const host = dialog.value
+  const host = root.value
   if (!host) return
   destroyPreview()
   const token = document.createElement('div')
@@ -244,7 +246,7 @@ function openPreview() {
     : asset.value.url
   image.alt = props.work.title
   token.appendChild(image)
-  // 浮层必须挂在 dialog 内部，否则会被顶层对话框盖住。
+  // 浮层挂在查看器根节点内，弹窗模式不会被顶层对话框盖住，页面模式也不会越界。
   host.appendChild(token)
   previewToken = token
   previewing.value = true
@@ -519,10 +521,14 @@ async function makeCompatible() {
   try { await handle(await api(`/assets/${id}/convert`, { method: 'POST' })) }
   catch (e) { converting.value = false; convertMessage.value = (e as Error).message }
 }
+function closeRoot() {
+  if (props.page) emit('close')
+  else if (root.value instanceof HTMLDialogElement) root.value.close()
+}
 </script>
 
 <template>
-  <dialog ref="dialog" class="viewer-dialog" :aria-label="work.title" @close="emit('close')" @cancel="onCancel" @keydown="keyboard" @pointerdown="pointerDown" @pointermove="pointerMove" @pointerup="pointerUp" @pointercancel="pointerCancel" @touchstart.passive="touchStart" @touchmove.passive="touchMove" @touchend="touchEnd" @touchcancel="touchCancel">
+  <component :is="page ? 'main' : 'dialog'" ref="root" class="viewer-dialog" :class="{ 'viewer-page': page }" :aria-label="work.title" @close="emit('close')" @cancel="onCancel" @keydown="keyboard" @pointerdown="pointerDown" @pointermove="pointerMove" @pointerup="pointerUp" @pointercancel="pointerCancel" @touchstart.passive="touchStart" @touchmove.passive="touchMove" @touchend="touchEnd" @touchcancel="touchCancel">
     <div class="viewer-content">
       <div class="viewer-main">
         <div ref="stage" class="media-stage" :style="dragX ? { transform: `translateX(${dragX}px)`, transition: 'none' } : undefined">
@@ -539,7 +545,7 @@ async function makeCompatible() {
           </Transition>
           <button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow previous" aria-label="上一张" @click="next(-1)"><Icon name="left" :size="32" /></button><button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow next" aria-label="下一张" @click="next(1)"><Icon name="right" :size="32" /></button>
         </div>
-        <div class="viewer-controls"><span>{{ asset ? `${kindLabel(asset.kind)} · ${formatSize(asset.size)}` : '' }}</span><div><button class="icon-button" :class="{ selected: work.favorite }" :aria-label="work.favorite ? '取消收藏' : '收藏作品'" :aria-pressed="work.favorite" @click="emit('favorite', work)"><Icon :name="work.favorite ? 'heart-filled' : 'heart'" :size="20" /></button><button class="icon-button" :aria-label="slideshow ? '停止自动翻页' : '自动翻页'" :aria-pressed="slideshow" @click="slideshow = !slideshow"><Icon :name="slideshow ? 'pause' : 'play'" :size="22" /></button><button class="icon-button" aria-label="全屏" @click="fullscreen"><Icon name="fullscreen" :size="22" /></button><button class="icon-button" aria-label="关闭查看器" @click="dialog?.close()"><Icon name="close" :size="22" /></button></div></div>
+        <div class="viewer-controls"><span>{{ asset ? `${kindLabel(asset.kind)} · ${formatSize(asset.size)}` : '' }}</span><div><button class="icon-button" :class="{ selected: work.favorite }" :aria-label="work.favorite ? '取消收藏' : '收藏作品'" :aria-pressed="work.favorite" @click="emit('favorite', work)"><Icon :name="work.favorite ? 'heart-filled' : 'heart'" :size="20" /></button><button class="icon-button" :aria-label="slideshow ? '停止自动翻页' : '自动翻页'" :aria-pressed="slideshow" @click="slideshow = !slideshow"><Icon :name="slideshow ? 'pause' : 'play'" :size="22" /></button><button class="icon-button" aria-label="全屏" @click="fullscreen"><Icon name="fullscreen" :size="22" /></button><button class="icon-button" :aria-label="page ? '返回上一页' : '关闭查看器'" @click="closeRoot"><Icon :name="page ? 'left' : 'close'" :size="22" /></button></div></div>
         <div v-if="(detail?.assets.length || 0) > 1" class="filmstrip"><button v-for="(item, i) in detail?.assets" :key="item.id" :class="{ active: index === i }" :aria-label="`第 ${i + 1} 项`" :aria-pressed="index === i" @click="selectPage(i)"><img :src="item.thumbnail" loading="lazy" alt="" /><span>{{ i + 1 }}</span></button></div>
       </div>
             <aside class="work-info"><Transition name="info-fade" mode="out-in"><div :key="work.id">
@@ -629,5 +635,5 @@ async function makeCompatible() {
         <div v-if="isVideo" class="compatibility-panel"><p>遇到黑屏或只有声音？</p><button class="button tonal small" :disabled="converting || compatible" @click="makeCompatible"><Icon name="video" :size="18" />{{ compatible ? '已切换兼容版本' : converting ? '正在处理…' : '生成兼容版本' }}</button><span v-if="convertMessage" role="status">{{ convertMessage }}</span><small>生成的文件只保存在缓存中，原文件保持不变。</small></div>
       </div></Transition></aside>
     </div>
-  </dialog>
+  </component>
 </template>

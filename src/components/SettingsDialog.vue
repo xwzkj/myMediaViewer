@@ -6,9 +6,9 @@ import FolderPicker from './FolderPicker.vue'
 import AiSettingsPanel from './AiSettingsPanel.vue'
 import { api } from '../api'
 
-const props = defineProps<{ status: LibraryStatus | null }>()
+const props = defineProps<{ status: LibraryStatus | null; page?: boolean }>()
 const emit = defineEmits<{ close: []; changed: []; notice: [message: string] }>()
-const dialog = ref<HTMLDialogElement>()
+const root = ref<HTMLDialogElement | HTMLElement>()
 const editing = ref<string | null>(null)
 const formVisible = ref(false)
 const name = ref('')
@@ -20,7 +20,7 @@ const deleting = ref<string | null>(null)
 const pickerVisible = ref(false)
 const busy = computed(() => saving.value || props.status?.scan.running)
 const shortcuts = computed(() => props.status?.sources.map(source => ({ name: source.name, path: source.path })) || [])
-onMounted(() => dialog.value?.showModal())
+onMounted(() => { if (!props.page && root.value instanceof HTMLDialogElement) root.value.showModal() })
 function edit(source?: Source) {
   editing.value = source?.id || null
   name.value = source?.name || ''
@@ -38,15 +38,16 @@ function chooseFolder(directory: DirectoryEntry) {
 // 如果是在编辑框内拖拽文本选中、不小心在遮罩处抬起鼠标，绝不误关闭。
 let backdropPressed = false
 function backdropDown(event: PointerEvent) {
-  if (!dialog.value) return
-  backdropPressed = event.target === dialog.value
+  if (!(root.value instanceof HTMLDialogElement)) return
+  backdropPressed = event.target === root.value
 }
 function backdropUp(event: PointerEvent) {
-  if (!dialog.value || !backdropPressed) return
+  if (!(root.value instanceof HTMLDialogElement) || !backdropPressed) return
+  const dialog = root.value
   backdropPressed = false
-  if (event.target !== dialog.value) return
-  const rect = dialog.value.getBoundingClientRect()
-  if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.value.close()
+  if (event.target !== dialog) return
+  const rect = dialog.getBoundingClientRect()
+  if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close()
 }
 async function save() {
   if (!folder.value) { error.value = '请先选择一个媒体文件夹'; pickerVisible.value = true; return }
@@ -65,11 +66,15 @@ async function remove(id: string) {
   } catch (e) { error.value = (e as Error).message }
   finally { saving.value = false }
 }
+function closeRoot() {
+  if (props.page) emit('close')
+  else if (root.value instanceof HTMLDialogElement) root.value.close()
+}
 </script>
 
 <template>
-  <dialog ref="dialog" class="settings-dialog" aria-labelledby="settings-title" @close="emit('close')" @pointerdown="backdropDown" @pointerup="backdropUp">
-    <header class="dialog-heading"><div><span class="eyebrow">MAKE IT YOURS</span><h2 id="settings-title">媒体库设置</h2></div><button class="icon-button" aria-label="关闭设置" @click="dialog?.close()"><Icon name="close" /></button></header>
+  <component :is="page ? 'main' : 'dialog'" ref="root" class="settings-dialog" :class="{ 'settings-page': page }" aria-labelledby="settings-title" @close="emit('close')" @pointerdown="backdropDown" @pointerup="backdropUp">
+    <header class="dialog-heading"><div><span class="eyebrow">MAKE IT YOURS</span><h2 id="settings-title">媒体库设置</h2></div><button class="icon-button" :aria-label="page ? '返回上一页' : '关闭设置'" @click="closeRoot"><Icon :name="page ? 'left' : 'close'" /></button></header>
     <div class="settings-body">
       <section>
         <div class="section-heading"><div><h3>媒体目录</h3><p>连接文件夹，让散落的收藏井然有序。</p></div><button class="button tonal small" @click="edit()" :disabled="busy"><Icon name="plus" :size="18" />添加目录</button></div>
@@ -94,6 +99,6 @@ async function remove(id: string) {
       <section v-if="status?.scan.errors.length" class="settings-section"><h3>扫描提示</h3><ul class="scan-errors"><li v-for="item in status.scan.errors" :key="item">{{ item }}</li></ul></section>
       <footer class="settings-footer"><Icon name="leaf" :size="18" />拾光 · 让喜欢的，留在身边。<span>v0.1.0</span></footer>
     </div>
-  </dialog>
+  </component>
   <FolderPicker v-if="pickerVisible" :initial-path="folder" :shortcuts="shortcuts" @select="chooseFolder" @close="pickerVisible = false" />
 </template>
