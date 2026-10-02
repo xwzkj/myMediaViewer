@@ -124,6 +124,8 @@
   @media(max-width:700px){
     .settings-dialog.settings-page{width:100%;margin:0;border-radius:0;min-height:100dvh}
     .settings-page>.settings-body{padding-bottom:36px}
+    .viewer-dialog.viewer-page{height:auto;max-height:none;overflow:visible;overscroll-behavior:auto}
+    .viewer-page>.viewer-content{height:auto;min-height:100dvh;overflow:visible;overscroll-behavior:auto}
     .viewer-dialog.viewer-page .viewer-arrow.previous{left:8px}
     .viewer-dialog.viewer-page .viewer-arrow.next{right:8px}
   }
