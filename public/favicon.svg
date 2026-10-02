@@ -1,1 +1,26 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><rect width="48" height="48" rx="16" fill="#d9e9d1"/><path d="M13 31V18a5 5 0 0 1 5-5h13v13a5 5 0 0 1-5 5H13Z" fill="#43664a"/><path d="m19 26 5-7 7 12H13l6-5Z" fill="#d9e9d1"/><circle cx="30" cy="17" r="3" fill="#d9e9d1"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="拾光">
+  <defs>
+    <linearGradient id="bg" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#d6eacd"/>
+      <stop offset="1" stop-color="#9ac68e"/>
+    </linearGradient>
+    <linearGradient id="hill" x1="14" y1="24" x2="50" y2="47" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5d8559"/>
+      <stop offset="1" stop-color="#3b5f41"/>
+    </linearGradient>
+    <clipPath id="photo">
+      <rect x="14" y="17" width="36" height="30" rx="7"/>
+    </clipPath>
+  </defs>
+
+  <rect width="64" height="64" rx="18" fill="url(#bg)"/>
+
+  <rect x="14" y="17" width="36" height="30" rx="7" fill="#ffffff"/>
+  <g clip-path="url(#photo)">
+    <circle cx="40" cy="24.5" r="3.6" fill="#e3b94a"/>
+    <path d="M12 47V34.5l9-10 7 7.5 6.5-7L50 41.5V47z" fill="url(#hill)"/>
+  </g>
+  <rect x="14.9" y="17.9" width="34.2" height="28.2" rx="6.1" fill="none" stroke="#3f6244" stroke-width="1.8"/>
+
+  <path d="M52 8.5c.55 3.1 2.35 4.9 5.45 5.45-3.1.55-4.9 2.35-5.45 5.45-.55-3.1-2.35-4.9-5.45-5.45 3.1-.55 4.9-2.35 5.45-5.45z" fill="#ffffff"/>
+</svg>
