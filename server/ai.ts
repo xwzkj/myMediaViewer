@@ -18,13 +18,13 @@ export class AiError extends Error {
 }
 
 const defaults: AiSettings = {
-  baseUrl: 'https://api.openai.com/v1',
+  baseUrl: 'https://api.deepseek.com',
   apiKey: '',
-  model: '',
+  model: 'deepseek-flash',
   targetLanguage: '简体中文',
   appendPrompt: DEFAULT_APPEND_PROMPT,
   // 直接合并进请求体的自定义参数，例如关闭思考、思考等级、思考预算、温度等。
-  params: {},
+  params: { thinking: { type: 'disabled' } },
   timeoutMs: 120000,
   mangaPipelineMode: 'sequential',
   mangaConcurrency: 3,
@@ -73,10 +73,10 @@ function normalize(input: unknown): AiSettings {
   return {
     baseUrl: asText(raw.baseUrl, defaults.baseUrl) || defaults.baseUrl,
     apiKey: typeof raw.apiKey === 'string' ? raw.apiKey.trim() : '',
-    model: asText(raw.model),
+    model: asText(raw.model, defaults.model),
     targetLanguage: asText(raw.targetLanguage, defaults.targetLanguage) || defaults.targetLanguage,
     appendPrompt: asAppendPrompt(raw),
-    params: asParams(raw.params),
+    params: 'params' in raw ? asParams(raw.params) : structuredClone(defaults.params),
     timeoutMs: clampTimeout(raw.timeoutMs, defaults.timeoutMs),
     mangaPipelineMode: asPipelineMode(raw.mangaPipelineMode, defaults.mangaPipelineMode),
     mangaConcurrency: clampConcurrency(raw.mangaConcurrency, defaults.mangaConcurrency),

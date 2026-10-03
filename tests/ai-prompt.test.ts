@@ -10,6 +10,21 @@ process.env.MEDIA_DATA_DIR = mkdtempSync(path.join(os.tmpdir(), 'media-ai-'))
 const { saveAiSettings, getAiSettings, translateFields, translateMangaTexts } = await import('../server/ai.js')
 const { DEFAULT_APPEND_PROMPT, DEFAULT_MANGA_PROMPT, DEFAULT_TRANSLATE_PROMPT, fillPrompt } = await import('../shared/prompts.js')
 
+test('首次使用默认 DeepSeek 配置，显式自定义设置可覆盖默认值', () => {
+  const initial = getAiSettings()
+  assert.equal(initial.baseUrl, 'https://api.deepseek.com')
+  assert.equal(initial.model, 'deepseek-flash')
+  assert.equal(initial.apiKey, '')
+  assert.deepEqual(initial.params, { thinking: { type: 'disabled' } })
+  const custom = saveAiSettings({ baseUrl: 'https://example.com/v1', model: 'custom', params: {} })
+  assert.equal(custom.baseUrl, 'https://example.com/v1')
+  assert.equal(custom.model, 'custom')
+  assert.deepEqual(custom.params, {})
+  const fallback = saveAiSettings({})
+  assert.equal(fallback.model, initial.model)
+  assert.deepEqual(fallback.params, initial.params)
+})
+
 type ChatBody = { messages: Array<{ role: string; content: string }> }
 
 const calls: ChatBody[] = []
