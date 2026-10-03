@@ -146,19 +146,25 @@ function pickModel(model: string) {
         <span>漫画翻译流水线</span>
         <div class="pipeline-options">
           <label class="pipeline-option" :class="{ active: pipelineMode === 'sequential' }">
-            <input v-model="pipelineMode" type="radio" value="sequential" />
-            <span class="pipeline-name">逐页处理</span>
-            <span class="pipeline-desc">一页走完识别与翻译再处理下一页。内存占用最低，适合单页翻译。</span>
+            <input v-model="pipelineMode" name="manga-pipeline" type="radio" value="sequential" />
+            <span class="pipeline-copy">
+              <span class="pipeline-name">逐页处理</span>
+              <span class="pipeline-desc">一页走完识别与翻译再处理下一页。内存占用最低，适合单页翻译。</span>
+            </span>
           </label>
           <label class="pipeline-option" :class="{ active: pipelineMode === 'merged' }">
-            <input v-model="pipelineMode" type="radio" value="merged" />
-            <span class="pipeline-name">先批量识别，再合并翻译</span>
-            <span class="pipeline-desc">整部先做本地检测与 OCR，再把所有文本合并成尽量少的几次请求。请求数最少，但失败会牵连整批。</span>
+            <input v-model="pipelineMode" name="manga-pipeline" type="radio" value="merged" />
+            <span class="pipeline-copy">
+              <span class="pipeline-name">先批量识别，再合并翻译</span>
+              <span class="pipeline-desc">整部先做本地检测与 OCR，再把所有文本合并成尽量少的几次请求。请求数最少，但失败会牵连整批。</span>
+            </span>
           </label>
           <label class="pipeline-option" :class="{ active: pipelineMode === 'parallel' }">
-            <input v-model="pipelineMode" type="radio" value="parallel" />
-            <span class="pipeline-name">先批量识别，再并发翻译</span>
-            <span class="pipeline-desc">识别阶段同上，之后每页各发一个请求并按并发数同时进行。速度最快，失败只影响单页。</span>
+            <input v-model="pipelineMode" name="manga-pipeline" type="radio" value="parallel" />
+            <span class="pipeline-copy">
+              <span class="pipeline-name">先批量识别，再并发翻译</span>
+              <span class="pipeline-desc">识别阶段同上，之后每页各发一个请求并按并发数同时进行。速度最快，失败只影响单页。</span>
+            </span>
           </label>
         </div>
         <label v-if="pipelineMode === 'parallel'" class="concurrency-field">并发数<input v-model.number="concurrency" type="number" min="1" max="10" step="1" /><span>同时进行的翻译请求数，1 - 10，默认 3。接口限流时调小。</span></label>
