@@ -157,12 +157,12 @@ interface PreparedPage {
   eraseRegions: EraseRegion[]
   detectionMs: number
   ocrMs: number
-  /** 没有可翻译文本时直接落库的空结果。 */
+  /** 没有可翻译文本时直接返回的空结果。 */
   empty?: MangaPageResult
 }
 
 /**
- * 批量与异步流水线共用「本地识别」这一段：检测 + OCR + 筛选。
+ * 各流水线共用「本地识别」这一段：检测 + OCR + 筛选。
  * 不涉及大模型调用，也不写任何缓存。
  */
 async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void): Promise<PreparedPage> {
@@ -209,6 +209,7 @@ async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: 
   const shortEdge = Math.min(detection.pageWidth, detection.pageHeight)
   const kept = mangaReadingOrder(candidates.filter(region => judgeRegion(region, shortEdge).keep)).slice(0, MAX_REGIONS)
   const eraseRegions = kept.map(region => boxToRect({ ...region, classId: 0 }, detection.pageWidth, detection.pageHeight))
+  if (!kept.length) setStage('没有可翻译的气泡文本')
 
   return {
     asset, key: info.key, targetLanguage: info.targetLanguage,
@@ -219,12 +220,16 @@ async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: 
 }
 
 /** 把一页的译文写进缓存并返回最终结果（擦字 + 生成译图底图）。 */
-async function finalizePage(page: PreparedPage, translations: string[], model: string): Promise<MangaPageResult> {
+async function finalizePage(
+  page: PreparedPage, translations: string[], model: string, setStage?: (stage: string) => void,
+): Promise<MangaPageResult> {
   if (page.empty) return page.empty
+  setStage?.('擦除原文')
   const erased = await eraseTranslatedRegions(page.asset.path, page.pageWidth, page.pageHeight, page.textMask, page.eraseRegions)
   await mkdir(mangaCacheDir, { recursive: true })
   const imagePath = path.join(mangaCacheDir, `${page.key}.png`)
   const temp = `${imagePath}.tmp.png`
+  setStage?.('生成译图文件')
   try {
     await sharp(erased.data, { raw: { width: erased.width, height: erased.height, channels: 3 } })
       .png({ compressionLevel: 7, adaptiveFiltering: true })
@@ -260,6 +265,7 @@ async function finalizePage(page: PreparedPage, translations: string[], model: s
   }
   db.prepare('INSERT OR REPLACE INTO manga_translations (key, data, image_path, created) VALUES (?, ?, ?, ?)')
     .run(page.key, JSON.stringify(result), imagePath, result.createdAt)
+  setStage?.('完成')
   return result
 }
 
@@ -594,98 +600,16 @@ async function processAsset(
   }
 
   setStage('等待本地识别资源')
-  return runInference(() => processUncachedAsset(asset, info.key, info.targetLanguage, setStage))
-}
-
-async function processUncachedAsset(
-  asset: StoredAsset,
-  key: string,
-  targetLanguage: string,
-  setStage: (stage: string) => void,
-): Promise<MangaPageResult> {
-  setStage('准备本地识别模型')
-  await ensureModels(setStage)
-
-  setStage('识别气泡区域')
-  const detection = await detector.detect(asset.path)
-  if (!detection.boxes.length) {
-    setStage('没有检测到气泡文字')
-    return emptyResult(asset, key, targetLanguage)
-  }
-
-  setStage(`准备提取 ${detection.boxes.length} 处气泡文本`)
-  const pageRaw = await sharp(asset.path, { limitInputPixels: 500_000_000 })
-    .removeAlpha().toColourspace('srgb').raw().toBuffer()
-  const crops = detection.boxes.map(box => paddedRect(boxToRect(box, detection.pageWidth, detection.pageHeight), detection.pageWidth, detection.pageHeight))
-  setStage(`提取气泡文本 0/${crops.length}`)
-  const ocrResults = await recognizer.recognizeBatch(
-    pageRaw,
-    detection.pageWidth,
-    detection.pageHeight,
-    crops,
-    (completed, total) => setStage(`提取气泡文本 ${completed}/${total}`),
-  )
-
-  setStage('筛选气泡文本')
-  const candidates: OcrRegion[] = detection.boxes.map((box, index) => ({
-    text: trimTrailingNoise(ocrResults[index]?.text || ''),
-    cx: box.cx, cy: box.cy, width: box.width, height: box.height,
-    prob: box.confidence,
-    confidence: ocrResults[index]?.confidence || 0,
-  }))
-  const shortEdge = Math.min(detection.pageWidth, detection.pageHeight)
-  const kept = mangaReadingOrder(candidates.filter(region => judgeRegion(region, shortEdge).keep)).slice(0, MAX_REGIONS)
-  if (!kept.length) {
-    setStage('没有可翻译的气泡文本')
-    return emptyResult(asset, key, targetLanguage)
-  }
-
-  setStage(`AI 翻译 ${kept.length} 处文字`)
-  const translated = await translateMangaTexts({ texts: kept.map(region => region.text), targetLanguage })
-  setStage('擦除原文')
-  const eraseRegions = kept.map(region => boxToRect({ ...region, classId: 0 }, detection.pageWidth, detection.pageHeight))
-  const erased = await eraseTranslatedRegions(asset.path, detection.pageWidth, detection.pageHeight, detection.textMask, eraseRegions)
-  await mkdir(mangaCacheDir, { recursive: true })
-  const imagePath = path.join(mangaCacheDir, `${key}.png`)
-  const temp = `${imagePath}.tmp.png`
-  setStage('生成译图文件')
-  try {
-    await sharp(erased.data, { raw: { width: erased.width, height: erased.height, channels: 3 } })
-      .png({ compressionLevel: 7, adaptiveFiltering: true })
-      .toFile(temp)
-    await rename(temp, imagePath)
-  } finally {
-    await unlink(temp).catch(() => {})
-  }
-
-  const regions: MangaRegion[] = kept.map((region, index) => {
-    const rect = eraseRegions[index]!
-    return {
-      id: index + 1,
-      x: rect.left, y: rect.top, width: rect.width, height: rect.height,
-      source: region.text,
-      translation: translated.translations[index] || region.text,
-      detection: region.prob,
-      confidence: region.confidence,
-      background: erased.colors[index]?.background || '#ffffff',
-      textColor: erased.colors[index]?.textColor || '#111111',
-    }
+  // 逐页模式仍在同一次排队中走完整页，完成回填后才处理下一页。
+  return runInference(async () => {
+    const page = await recognizePage(asset, info, setStage)
+    if (page.empty) return page.empty
+    setStage(`AI 翻译 ${page.kept.length} 处文字`)
+    const translated = await translateMangaTexts({
+      texts: page.kept.map(region => region.text), targetLanguage: page.targetLanguage,
+    })
+    return finalizePage(page, translated.translations, translated.model, setStage)
   })
-  const result: MangaPageResult = {
-    key,
-    width: detection.pageWidth,
-    height: detection.pageHeight,
-    baseUrl: `/api/ai/manga/cache/${key}/base.png`,
-    regions,
-    cached: false,
-    model: translated.model,
-    targetLanguage: translated.targetLanguage,
-    createdAt: Date.now(),
-  }
-  db.prepare('INSERT OR REPLACE INTO manga_translations (key, data, image_path, created) VALUES (?, ?, ?, ?)')
-    .run(key, JSON.stringify(result), imagePath, result.createdAt)
-  setStage('完成')
-  return result
 }
 
 async function prepareAsset(asset: StoredAsset, force: boolean): Promise<PreparedAsset> {
