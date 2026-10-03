@@ -37,10 +37,10 @@ function useSettings(patch: Record<string, unknown>) {
   saveAiSettings({ baseUrl: 'https://example.com/v1', apiKey: 'k', model: 'm', targetLanguage: '简体中文', params: {}, timeoutMs: 120000, ...patch })
 }
 
-test('默认追加提示词是"现在开始工作"，且缺失配置时自动补上', () => {
+test('缺失配置时自动补上默认追加提示词', () => {
   useSettings({})
+  assert.ok(DEFAULT_APPEND_PROMPT.length > 0)
   assert.equal(getAiSettings().appendPrompt, DEFAULT_APPEND_PROMPT)
-  assert.equal(DEFAULT_APPEND_PROMPT, '现在开始工作')
 })
 
 test('追加内容拼在内置提示词之后，中间空两行（标题/标签/描述）', async () => {

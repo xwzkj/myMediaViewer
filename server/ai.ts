@@ -26,6 +26,8 @@ const defaults: AiSettings = {
   // 直接合并进请求体的自定义参数，例如关闭思考、思考等级、思考预算、温度等。
   params: {},
   timeoutMs: 120000,
+  mangaPipelineMode: 'sequential',
+  mangaConcurrency: 3,
 }
 
 function asText(value: unknown, fallback = ''): string {
@@ -51,6 +53,21 @@ function asAppendPrompt(raw: Record<string, unknown>): string {
   return typeof raw.appendPrompt === 'string' ? raw.appendPrompt : DEFAULT_APPEND_PROMPT
 }
 
+const PIPELINE_MODES = ['sequential', 'merged', 'parallel'] as const
+function asPipelineMode(value: unknown, fallback: AiSettings['mangaPipelineMode']): AiSettings['mangaPipelineMode'] {
+  return typeof value === 'string' && (PIPELINE_MODES as readonly string[]).includes(value)
+    ? value as AiSettings['mangaPipelineMode']
+    : fallback
+}
+
+const MIN_CONCURRENCY = 1
+const MAX_CONCURRENCY = 10
+function clampConcurrency(value: unknown, fallback: number): number {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(MAX_CONCURRENCY, Math.max(MIN_CONCURRENCY, Math.round(n)))
+}
+
 function normalize(input: unknown): AiSettings {
   const raw = (input && typeof input === 'object' && !Array.isArray(input) ? input : {}) as Record<string, unknown>
   return {
@@ -61,6 +78,8 @@ function normalize(input: unknown): AiSettings {
     appendPrompt: asAppendPrompt(raw),
     params: asParams(raw.params),
     timeoutMs: clampTimeout(raw.timeoutMs, defaults.timeoutMs),
+    mangaPipelineMode: asPipelineMode(raw.mangaPipelineMode, defaults.mangaPipelineMode),
+    mangaConcurrency: clampConcurrency(raw.mangaConcurrency, defaults.mangaConcurrency),
   }
 }
 
@@ -100,6 +119,12 @@ export function mergeAiSettings(input: unknown): AiSettings {
     appendPrompt: typeof raw.appendPrompt === 'string' ? raw.appendPrompt : current.appendPrompt,
     params: 'params' in raw ? asParams(raw.params) : { ...current.params },
     timeoutMs: 'timeoutMs' in raw ? clampTimeout(raw.timeoutMs, current.timeoutMs) : current.timeoutMs,
+    mangaPipelineMode: 'mangaPipelineMode' in raw
+      ? asPipelineMode(raw.mangaPipelineMode, current.mangaPipelineMode)
+      : current.mangaPipelineMode,
+    mangaConcurrency: 'mangaConcurrency' in raw
+      ? clampConcurrency(raw.mangaConcurrency, current.mangaConcurrency)
+      : current.mangaConcurrency,
   }
   if (!/^https?:\/\//i.test(merged.baseUrl)) throw new AiError('接口地址需要以 http:// 或 https:// 开头')
   return merged

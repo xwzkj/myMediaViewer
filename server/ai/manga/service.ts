@@ -3,16 +3,16 @@ import { existsSync } from 'node:fs'
 import { mkdir, readFile, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import sharp from 'sharp'
-import type { MangaJob, MangaModelStatus, MangaPageResult, MangaRegion } from '../../../shared/types.js'
+import type { MangaJob, MangaModelStatus, MangaPageResult, MangaPipelineMode, MangaRegion } from '../../../shared/types.js'
 import { getAiSettings, translateMangaTexts } from '../../ai.js'
 import { cacheDir, dataDir } from '../../config.js'
 import { db, type StoredAsset } from '../../database.js'
 import { ComicTextDetector } from './detector.js'
-import { eraseTranslatedRegions } from './erase.js'
+import { eraseTranslatedRegions, type EraseRegion } from './erase.js'
 import { judgeRegion, mangaReadingOrder, trimTrailingNoise } from './pipeline.js'
 import { MangaOcrRecognizer } from './recognizer.js'
 import { formatDuration, logError, logInfo } from '../../log.js'
-import { boxToRect, type OcrRegion } from './types.js'
+import { boxToRect, type OcrRegion, type TextMask } from './types.js'
 
 const modelRoot = path.join(dataDir, 'models')
 const mangaCacheDir = path.join(cacheDir, 'manga')
@@ -136,52 +136,204 @@ export function mangaBaseImagePath(key: string): string | undefined {
   return row?.image_path && existsSync(row.image_path) ? row.image_path : undefined
 }
 
+/**
+ * 单页的本地识别结果（检测 + OCR + 筛选后的待翻译文本）。
+ * 批量模式下先收集这些结果，再统一进入翻译阶段。
+ */
+interface PreparedPage {
+  asset: StoredAsset
+  key: string
+  targetLanguage: string
+  pageWidth: number
+  pageHeight: number
+  textMask: TextMask | null
+  kept: OcrRegion[]
+  eraseRegions: EraseRegion[]
+  detectionMs: number
+  ocrMs: number
+  /** 没有可翻译文本时直接落库的空结果。 */
+  empty?: MangaPageResult
+}
+
+/**
+ * 三种流水线模式共用「本地识别」这一段：检测 + OCR + 筛选。
+ * 不涉及大模型调用，也不写任何缓存。
+ */
+async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void): Promise<PreparedPage> {
+  const status = getMangaModelStatus()
+  if (!status.ready) throw new Error(status.message || '本地漫画 OCR 模型未就绪')
+  setStage('加载本地识别模型')
+  await ensureModels()
+
+  setStage('识别气泡区域')
+  const detectStarted = Date.now()
+  const detection = await detector.detect(asset.path)
+  const detectionMs = Date.now() - detectStarted
+  if (!detection.boxes.length) {
+    setStage('没有检测到气泡文字')
+    return {
+      asset, key: info.key, targetLanguage: info.targetLanguage,
+      pageWidth: detection.pageWidth, pageHeight: detection.pageHeight,
+      textMask: detection.textMask, kept: [], eraseRegions: [],
+      detectionMs, ocrMs: 0,
+      empty: emptyResult(asset, info.key, info.targetLanguage),
+    }
+  }
+
+  setStage(`准备提取 ${detection.boxes.length} 处气泡文本`)
+  const pageRaw = await sharp(asset.path, { limitInputPixels: 500_000_000 })
+    .removeAlpha().toColourspace('srgb').raw().toBuffer()
+  const crops = detection.boxes.map(box => paddedRect(boxToRect(box, detection.pageWidth, detection.pageHeight), detection.pageWidth, detection.pageHeight))
+  setStage(`提取气泡文本 0/${crops.length}`)
+  const ocrStarted = Date.now()
+  const ocrResults = await recognizer.recognizeBatch(
+    pageRaw,
+    detection.pageWidth,
+    detection.pageHeight,
+    crops,
+    (completed, total) => setStage(`提取气泡文本 ${completed}/${total}`),
+  )
+  const ocrMs = Date.now() - ocrStarted
+
+  setStage('筛选气泡文本')
+  const candidates: OcrRegion[] = detection.boxes.map((box, index) => ({
+    text: trimTrailingNoise(ocrResults[index]?.text || ''),
+    cx: box.cx, cy: box.cy, width: box.width, height: box.height,
+    prob: box.confidence,
+    confidence: ocrResults[index]?.confidence || 0,
+  }))
+  const shortEdge = Math.min(detection.pageWidth, detection.pageHeight)
+  const kept = mangaReadingOrder(candidates.filter(region => judgeRegion(region, shortEdge).keep)).slice(0, MAX_REGIONS)
+  const eraseRegions = kept.map(region => boxToRect({ ...region, classId: 0 }, detection.pageWidth, detection.pageHeight))
+
+  return {
+    asset, key: info.key, targetLanguage: info.targetLanguage,
+    pageWidth: detection.pageWidth, pageHeight: detection.pageHeight,
+    textMask: detection.textMask, kept, eraseRegions, detectionMs, ocrMs,
+    empty: kept.length ? undefined : emptyResult(asset, info.key, info.targetLanguage),
+  }
+}
+
+/** 把一页的译文写进缓存并返回最终结果（擦字 + 生成译图底图）。 */
+async function finalizePage(page: PreparedPage, translations: string[], model: string): Promise<MangaPageResult> {
+  if (page.empty) return page.empty
+  const erased = await eraseTranslatedRegions(page.asset.path, page.pageWidth, page.pageHeight, page.textMask, page.eraseRegions)
+  await mkdir(mangaCacheDir, { recursive: true })
+  const imagePath = path.join(mangaCacheDir, `${page.key}.png`)
+  const temp = `${imagePath}.tmp.png`
+  try {
+    await sharp(erased.data, { raw: { width: erased.width, height: erased.height, channels: 3 } })
+      .png({ compressionLevel: 7, adaptiveFiltering: true })
+      .toFile(temp)
+    await rename(temp, imagePath)
+  } finally {
+    await unlink(temp).catch(() => {})
+  }
+
+  const regions: MangaRegion[] = page.kept.map((region, index) => {
+    const rect = page.eraseRegions[index]!
+    return {
+      id: index + 1,
+      x: rect.left, y: rect.top, width: rect.width, height: rect.height,
+      source: region.text,
+      translation: translations[index] || region.text,
+      detection: region.prob,
+      confidence: region.confidence,
+      background: erased.colors[index]?.background || '#ffffff',
+      textColor: erased.colors[index]?.textColor || '#111111',
+    }
+  })
+  const result: MangaPageResult = {
+    key: page.key,
+    width: page.pageWidth,
+    height: page.pageHeight,
+    baseUrl: `/api/ai/manga/cache/${page.key}/base.png`,
+    regions,
+    cached: false,
+    model,
+    targetLanguage: page.targetLanguage,
+    createdAt: Date.now(),
+  }
+  db.prepare('INSERT OR REPLACE INTO manga_translations (key, data, image_path, created) VALUES (?, ?, ?, ?)')
+    .run(page.key, JSON.stringify(result), imagePath, result.createdAt)
+  return result
+}
+
+/**
+ * merged 模式：所有页共用一次大模型调用（超过单次上限时分块）。
+ * 把每页文本拍平成一个数组，模型只回一个等长数组，再按各页长度切回去。
+ */
+async function translateMerged(pages: PreparedPage[], setStage: (stage: string) => void): Promise<{ translations: string[]; model: string }> {
+  const pending = pages.filter(page => !page.empty)
+  if (!pending.length) return { translations: [], model: '' }
+  const targetLanguage = pending[0]!.targetLanguage
+  const texts: string[] = []
+  for (const page of pending) texts.push(...page.kept.map(region => region.text))
+
+  // 单次请求的文本量上限：太长容易被模型的输出长度或超时截断，按批切开。
+  const CHUNK = 200
+  const translations: string[] = []
+  const chunks = Math.ceil(texts.length / CHUNK)
+  let model = ''
+  for (let i = 0; i < texts.length; i += CHUNK) {
+    const part = texts.slice(i, i + CHUNK)
+    setStage(chunks > 1
+      ? `AI 合并翻译 ${texts.length} 处文字（第 ${Math.floor(i / CHUNK) + 1}/${chunks} 批）`
+      : `AI 合并翻译 ${texts.length} 处文字`)
+    const translated = await translateMangaTexts({ texts: part, targetLanguage })
+    translations.push(...translated.translations)
+    model = translated.model
+  }
+  return { translations, model }
+}
+
+/**
+ * parallel 模式：每页各发一个请求，用信号量把并发数限制在设置值内。
+ * 结果按页写回，顺序与输入一致。
+ */
+async function translateParallel(
+  pages: PreparedPage[],
+  concurrency: number,
+  setStage: (stage: string) => void,
+  onPageDone: (done: number, total: number) => void,
+): Promise<Array<{ translations: string[]; model: string } | { error: string }>> {
+  const results = new Array<{ translations: string[]; model: string } | { error: string }>(pages.length)
+  let next = 0
+  let done = 0
+  const total = pages.filter(page => !page.empty).length
+  const workers = Array.from({ length: Math.min(concurrency, Math.max(1, total)) }, async () => {
+    while (true) {
+      const index = next++
+      if (index >= pages.length) return
+      const page = pages[index]!
+      if (page.empty) { results[index] = { translations: [], model: '' }; continue }
+      try {
+        const translated = await translateMangaTexts({
+          texts: page.kept.map(region => region.text),
+          targetLanguage: page.targetLanguage,
+        })
+        results[index] = { translations: translated.translations, model: translated.model }
+      } catch (error) {
+        // 单页失败不打断其他页：记录原因，继续处理后面的图片。
+        results[index] = { error: error instanceof Error ? error.message : '翻译失败' }
+      }
+      done++
+      onPageDone(done, total)
+    }
+  })
+  setStage(`AI 并发翻译 ${total} 张图片（并发 ${concurrency}）`)
+  await Promise.all(workers)
+  return results
+}
 async function runJob(job: InternalJob, assets: StoredAsset[], force: boolean): Promise<void> {
   job.state = 'processing'
   const jobStarted = Date.now()
-  logInfo('任务', `${jobLabel(job)} 开始处理 · 共 ${assets.length} 张`)
+  const mode = getAiSettings().mangaPipelineMode
+  logInfo('任务', `${jobLabel(job)} 开始处理 · 共 ${assets.length} 张 · 模式 ${modeLabel(mode)}`)
   try {
-    for (let i = 0; i < assets.length; i++) {
-      const asset = assets[i]!
-      const prefix = assets.length > 1 ? `第 ${i + 1}/${assets.length} 张 · ` : ''
-      const setStage = (stage: string) => { job.stage = `${prefix}${stage}` }
-      const assetStarted = Date.now()
-      job.currentAssetId = asset.id
-      job.completed = i
-      setStage('准备翻译')
-      try {
-        const result = await processAsset(asset, force, setStage, job.prepared.get(asset.id))
-        if (!job.results) job.results = []
-        job.results.push({ assetId: asset.id, result })
-        if (assets.length === 1) job.result = result
-        const detail = result.cached ? '命中缓存' : `${result.regions.length} 处文本`
-        logInfo('任务', `${jobLabel(job)} ${prefix}完成 · ${detail} · 用时 ${formatDuration(Date.now() - assetStarted)}`)
-      } catch (error) {
-        if (!job.failed) job.failed = []
-        const message = error instanceof Error ? error.message : '漫画图片翻译失败'
-        job.failed.push({ assetId: asset.id, message })
-        setStage('翻译失败，继续下一张')
-        logError('任务', `${jobLabel(job)} ${prefix}失败：${message}`)
-      }
-      job.completed = i + 1
-      job.progress = Math.round(job.completed / assets.length * 100)
-    }
-
-    if (!job.results?.length) {
-      const first = job.failed?.[0]?.message || '漫画图片翻译失败'
-      throw new Error(first)
-    }
-    const elapsed = formatDuration(Date.now() - jobStarted)
-    if (job.failed?.length) {
-      job.stage = `完成，${job.failed.length}/${job.total} 张翻译失败`
-      job.message = `有 ${job.failed.length} 张图片翻译失败`
-      logError('任务', `${jobLabel(job)} 结束 · 成功 ${job.results?.length || 0}/${job.total} 张，失败 ${job.failed.length} 张 · 用时 ${elapsed}`)
-    } else {
-      job.stage = assets.length > 1 ? '整部翻译完成' : '完成'
-      logInfo('任务', `${jobLabel(job)} 全部完成 · ${job.total} 张 · 用时 ${elapsed}`)
-    }
-    job.progress = 100
-    job.state = 'ready'
+    if (mode === 'sequential') await runSequential(job, assets, force)
+    else await runBatched(job, assets, force, mode)
+    finishJob(job, assets.length, jobStarted)
   } catch (error) {
     job.state = 'failed'
     job.stage = '翻译失败'
@@ -192,6 +344,170 @@ async function runJob(job: InternalJob, assets: StoredAsset[], force: boolean): 
   }
 }
 
+function modeLabel(mode: MangaPipelineMode): string {
+  return mode === 'merged' ? '先批量识别再合并翻译'
+    : mode === 'parallel' ? '先批量识别再并发翻译'
+    : '逐页处理'
+}
+
+/** 任务收尾：汇总成功 / 失败，写入最终状态。 */
+function finishJob(job: InternalJob, total: number, startedAt: number): void {
+  if (!job.results?.length) {
+    const first = job.failed?.[0]?.message || '漫画图片翻译失败'
+    throw new Error(first)
+  }
+  const elapsed = formatDuration(Date.now() - startedAt)
+  if (job.failed?.length) {
+    job.stage = `完成，${job.failed.length}/${job.total} 张翻译失败`
+    job.message = `有 ${job.failed.length} 张图片翻译失败`
+    logError('任务', `${jobLabel(job)} 结束 · 成功 ${job.results?.length || 0}/${job.total} 张，失败 ${job.failed.length} 张 · 用时 ${elapsed}`)
+  } else {
+    job.stage = total > 1 ? '整部翻译完成' : '完成'
+    logInfo('任务', `${jobLabel(job)} 全部完成 · ${job.total} 张 · 用时 ${elapsed}`)
+  }
+  job.progress = 100
+  job.state = 'ready'
+}
+
+/** 原逻辑：一页走完「检测 → OCR → 翻译 → 回填」再处理下一页。 */
+async function runSequential(job: InternalJob, assets: StoredAsset[], force: boolean): Promise<void> {
+  for (let i = 0; i < assets.length; i++) {
+    const asset = assets[i]!
+    const prefix = assets.length > 1 ? `第 ${i + 1}/${assets.length} 张 · ` : ''
+    const setStage = (stage: string) => { job.stage = `${prefix}${stage}` }
+    const assetStarted = Date.now()
+    job.currentAssetId = asset.id
+    job.completed = i
+    setStage('准备翻译')
+    try {
+      const result = await processAsset(asset, force, setStage, job.prepared.get(asset.id))
+      if (!job.results) job.results = []
+      job.results.push({ assetId: asset.id, result })
+      if (assets.length === 1) job.result = result
+      const detail = result.cached ? '命中缓存' : `${result.regions.length} 处文本`
+      logInfo('任务', `${jobLabel(job)} ${prefix}完成 · ${detail} · 用时 ${formatDuration(Date.now() - assetStarted)}`)
+    } catch (error) {
+      recordFailure(job, asset, error, setStage, prefix)
+    }
+    job.completed = i + 1
+    job.progress = Math.round(job.completed / assets.length * 100)
+  }
+}
+
+/**
+ * 批量模式：先把所有页的检测与 OCR 跑完，再进入翻译阶段。
+ * merged 把所有文本合并成尽量少的几次调用；parallel 按页并发、受并发数限制。
+ */
+async function runBatched(job: InternalJob, assets: StoredAsset[], force: boolean, mode: MangaPipelineMode): Promise<void> {
+  // ── 阶段一：本地识别（检测 + OCR）──
+  const prepared: PreparedPage[] = []
+  for (let i = 0; i < assets.length; i++) {
+    const asset = assets[i]!
+    const prefix = `第 ${i + 1}/${assets.length} 张 · `
+    job.currentAssetId = asset.id
+    job.stage = `${prefix}准备翻译`
+    try {
+      const info = job.prepared.get(asset.id) || await prepareAsset(asset, force)
+      if (info.cached) {
+        // 已缓存的页不需要重新识别，直接算完成。
+        prepared.push({
+          asset, key: info.key, targetLanguage: info.targetLanguage,
+          pageWidth: 0, pageHeight: 0, textMask: null, kept: [], eraseRegions: [],
+          detectionMs: 0, ocrMs: 0, empty: info.cached,
+        })
+        continue
+      }
+      job.stage = `${prefix}本地识别`
+      const page = await runInference(() => recognizePage(asset, info, stage => { job.stage = `${prefix}${stage}` }))
+      prepared.push(page)
+      logInfo('任务', `${jobLabel(job)} ${prefix}识别完成 · ${page.kept.length} 处文本 · 检测 ${formatDuration(page.detectionMs)} / OCR ${formatDuration(page.ocrMs)}`)
+    } catch (error) {
+      recordFailure(job, asset, error, stage => { job.stage = `${prefix}${stage}` }, prefix)
+    }
+  }
+
+  const translatable = prepared.filter(page => !page.empty)
+  if (!translatable.length) {
+    // 全部页要么命中缓存、要么没有文本、要么失败：不需要调用大模型。
+    for (const page of prepared) {
+      if (page.empty) pushResult(job, page.asset.id, page.empty, assets.length)
+    }
+    return
+  }
+
+  // ── 阶段二：翻译 ──
+  const settings = getAiSettings()
+  if (mode === 'merged') {
+    // 只有合并调用本身失败才整批失败；之后的擦字 / 落盘失败按单页记录，
+    // 否则会把已经成功的页重复标成失败。
+    let merged: { translations: string[]; model: string }
+    try {
+      merged = await translateMerged(translatable, stage => { job.stage = stage })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '合并翻译失败'
+      for (const page of prepared) {
+        if (page.empty) pushResult(job, page.asset.id, page.empty, assets.length)
+        else recordFailure(job, page.asset, new Error(message), () => {}, '')
+      }
+      return
+    }
+    let cursor = 0
+    for (const page of prepared) {
+      if (page.empty) { pushResult(job, page.asset.id, page.empty, assets.length); continue }
+      const slice = merged.translations.slice(cursor, cursor + page.kept.length)
+      cursor += page.kept.length
+      job.stage = `生成译图 ${job.completed + 1}/${assets.length}`
+      try {
+        const result = await finalizePage(page, slice, merged.model)
+        pushResult(job, page.asset.id, result, assets.length)
+      } catch (error) {
+        recordFailure(job, page.asset, error, () => {}, '')
+      }
+    }
+  } else {
+    const results = await translateParallel(
+      prepared,
+      settings.mangaConcurrency,
+      stage => { job.stage = stage },
+      (done, total) => { job.stage = `AI 并发翻译 ${done}/${total}`; job.progress = Math.round(done / total * 60) },
+    )
+    for (let i = 0; i < prepared.length; i++) {
+      const page = prepared[i]!
+      if (page.empty) { pushResult(job, page.asset.id, page.empty, assets.length); continue }
+      const translated = results[i]!
+      if ('error' in translated) {
+        recordFailure(job, page.asset, new Error(translated.error), () => {}, '')
+        continue
+      }
+      try {
+        job.stage = `生成译图 ${job.completed + 1}/${assets.length}`
+        const result = await finalizePage(page, translated.translations, translated.model)
+        pushResult(job, page.asset.id, result, assets.length)
+      } catch (error) {
+        recordFailure(job, page.asset, error, () => {}, '')
+      }
+    }
+  }
+
+  job.completed = assets.length
+  job.progress = 100
+}
+
+function pushResult(job: InternalJob, assetId: string, result: MangaPageResult, total: number): void {
+  if (!job.results) job.results = []
+  job.results.push({ assetId, result })
+  if (total === 1) job.result = result
+  job.completed = job.results.length + (job.failed?.length || 0)
+  job.progress = Math.round(job.completed / total * 100)
+}
+
+function recordFailure(job: InternalJob, asset: StoredAsset, error: unknown, setStage: (stage: string) => void, prefix: string): void {
+  if (!job.failed) job.failed = []
+  const message = error instanceof Error ? error.message : '漫画图片翻译失败'
+  job.failed.push({ assetId: asset.id, message })
+  setStage('翻译失败，继续下一张')
+  logError('任务', `${jobLabel(job)} ${prefix}失败：${message}`)
+}
 async function processAsset(
   asset: StoredAsset,
   force: boolean,

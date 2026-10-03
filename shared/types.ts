@@ -26,11 +26,24 @@ export interface LibraryStatus {
 export interface WorksResponse { items: Work[]; total: number; page: number; pages: number; elapsed: number }
 export interface TagSuggestion { name: string; count: number }
 export interface TagSuggestionsResponse { items: TagSuggestion[]; total: number }
+/**
+ * 漫画翻译的流水线模式。
+ *
+ * - sequential：逐页走完「检测 → OCR → 翻译 → 回填」再处理下一页（默认，内存占用最低）。
+ * - merged：先把所有页检测与 OCR 完，再把整部文本合并成尽量少的几次大模型调用。
+ * - parallel：同 merged 的本地识别阶段，但按页并发调用大模型，并发数可配置。
+ */
+export type MangaPipelineMode = 'sequential' | 'merged' | 'parallel'
+
 // AI 翻译：服务端保存的接口配置。
 export interface AiSettings {
   baseUrl: string; apiKey: string; model: string; targetLanguage: string;
   // 用户可编辑的追加提示词，会拼在内置系统提示词之后。
   appendPrompt: string; params: Record<string, unknown>; timeoutMs: number
+  // 漫画翻译流水线：默认逐页，可切到先批量识别再合并 / 并发翻译。
+  mangaPipelineMode: MangaPipelineMode
+  // parallel 模式下同时发出的翻译请求数上限。
+  mangaConcurrency: number
 }
 // 可供翻译的文字字段，键名与模型输出的 JSON 保持一致。
 export interface AiTranslateFields {

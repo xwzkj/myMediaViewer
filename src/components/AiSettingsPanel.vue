@@ -20,6 +20,8 @@ const paramsText = ref('{}')
 const showKey = ref(false)
 // 界面展示与编辑使用“秒”，保存与请求时换算为毫秒
 const timeoutSeconds = ref(120)
+const pipelineMode = ref<AiSettings['mangaPipelineMode']>('sequential')
+const concurrency = ref(3)
 
 const paramsExample = '{\n  "reasoning_effort": "low",\n  "thinking": { "type": "disabled" },\n  "thinking_budget": 1024,\n  "temperature": 0.3\n}'
 
@@ -35,6 +37,8 @@ function apply(data: AiSettings) {
   settings.value = data
   paramsText.value = JSON.stringify(data.params || {}, null, 2)
   timeoutSeconds.value = Math.max(5, Math.round((data.timeoutMs || 120000) / 1000))
+  pipelineMode.value = data.mangaPipelineMode || 'sequential'
+  concurrency.value = Math.min(10, Math.max(1, data.mangaConcurrency || 3))
 }
 
 function parseParams(): Record<string, unknown> {
@@ -60,6 +64,8 @@ function buildPayload() {
     ...current,
     params,
     timeoutMs,
+    mangaPipelineMode: pipelineMode.value,
+    mangaConcurrency: Math.min(10, Math.max(1, Math.round(Number(concurrency.value) || 3))),
   }
 }
 
@@ -136,6 +142,27 @@ function pickModel(model: string) {
       <label class="field">自定义参数<textarea v-model="paramsText" rows="6" spellcheck="false" :placeholder="paramsExample" /><span>JSON 对象，会原样合并进请求体。可用来关闭思考、设置思考等级或思考预算，例如 reasoning_effort、thinking、thinking_budget。</span></label>
       <div class="field prompt-field"><div class="prompt-head"><span>追加系统提示词</span><button type="button" class="button text small" @click="restoreAppendPrompt">恢复默认</button></div><textarea v-model="settings.appendPrompt" rows="4" spellcheck="false" placeholder="现在开始工作" /><span>内置翻译提示词不可编辑，这段内容会追加在它之后，中间空两行（标题/标签/描述与漫画翻译都生效）。留空表示不追加。</span></div>
       <label class="field">超时时间（秒）<input v-model.number="timeoutSeconds" type="number" min="5" max="600" step="5" /><span>默认 120 秒，范围 5 - 600 秒。</span></label>
+      <div class="field">
+        <span>漫画翻译流水线</span>
+        <div class="pipeline-options">
+          <label class="pipeline-option" :class="{ active: pipelineMode === 'sequential' }">
+            <input v-model="pipelineMode" type="radio" value="sequential" />
+            <span class="pipeline-name">逐页处理</span>
+            <span class="pipeline-desc">一页走完识别与翻译再处理下一页。内存占用最低，适合单页翻译。</span>
+          </label>
+          <label class="pipeline-option" :class="{ active: pipelineMode === 'merged' }">
+            <input v-model="pipelineMode" type="radio" value="merged" />
+            <span class="pipeline-name">先批量识别，再合并翻译</span>
+            <span class="pipeline-desc">整部先做本地检测与 OCR，再把所有文本合并成尽量少的几次请求。请求数最少，但失败会牵连整批。</span>
+          </label>
+          <label class="pipeline-option" :class="{ active: pipelineMode === 'parallel' }">
+            <input v-model="pipelineMode" type="radio" value="parallel" />
+            <span class="pipeline-name">先批量识别，再并发翻译</span>
+            <span class="pipeline-desc">识别阶段同上，之后每页各发一个请求并按并发数同时进行。速度最快，失败只影响单页。</span>
+          </label>
+        </div>
+        <label v-if="pipelineMode === 'parallel'" class="concurrency-field">并发数<input v-model.number="concurrency" type="number" min="1" max="10" step="1" /><span>同时进行的翻译请求数，1 - 10，默认 3。接口限流时调小。</span></label>
+      </div>
       <div class="ai-actions">
         <button type="button" class="button tonal" :disabled="testing || saving" @click="test"><Icon name="sparkle" :size="18" />{{ testing ? '正在测试…' : '测试连接' }}</button>
         <button class="button filled" :disabled="saving || testing"><Icon name="check" :size="18" />{{ saving ? '正在保存…' : '保存设置' }}</button>
