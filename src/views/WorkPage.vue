@@ -8,7 +8,7 @@ import { adjacentWork, getLibrarySession } from '../library-session'
 import { appEvents } from '../events'
 import { createSearchSessionId } from '../route-cache-key'
 import Icon from '../components/Icon.vue'
-import ViewerDialog from '../components/ViewerDialog.vue'
+import WorkViewer from '../components/WorkViewer.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -98,7 +98,7 @@ onBeforeRouteLeave(to => {
 </script>
 
 <template>
-  <ViewerDialog v-if="work" page :work="work" @close="close" @favorite="toggleFavorite" @notice="notice" @search-tag="searchTag" @search-author="searchAuthor" @navigate="navigateWork" />
+  <WorkViewer v-if="work" :work="work" @close="close" @favorite="toggleFavorite" @notice="notice" @search-tag="searchTag" @search-author="searchAuthor" @navigate="navigateWork" />
   <div v-else class="route-state"><span v-if="loading" class="spinner" />{{ loading ? '正在打开作品…' : error || '作品不存在' }}<button v-if="!loading" class="button tonal" @click="router.push('/')"><Icon name="left" :size="18" />返回媒体库</button></div>
   <Transition name="toast"><div v-if="toast" class="snackbar" role="status"><Icon name="success" :size="20" /><span>{{ toast }}</span></div></Transition>
 </template>

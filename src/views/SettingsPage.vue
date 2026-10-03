@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import type { LibraryStatus } from '../../shared/types'
 import { api } from '../api'
 import Icon from '../components/Icon.vue'
-import SettingsDialog from '../components/SettingsDialog.vue'
+import SettingsContent from '../components/SettingsContent.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -40,7 +40,7 @@ onMounted(refresh)
 </script>
 
 <template>
-  <SettingsDialog v-if="status" page :status="status" @close="close" @changed="refresh" @notice="notice" />
+  <SettingsContent v-if="status" :status="status" @close="close" @changed="refresh" @notice="notice" />
   <div v-else-if="loading" class="route-state"><span class="spinner" />正在读取媒体库设置…</div>
   <div v-else class="route-state error-state"><Icon name="warning" :size="30" /><p>{{ error }}</p><button class="button filled" @click="refresh">重试</button></div>
   <Transition name="toast"><div v-if="toast" class="snackbar" role="status"><Icon name="success" :size="20" /><span>{{ toast }}</span></div></Transition>
