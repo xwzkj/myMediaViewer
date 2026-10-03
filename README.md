@@ -1,10 +1,10 @@
 # 拾光 · Media Garden
 
-本地媒体查看器，使用 Vue 3、TypeScript、Vite、Fastify 和 SQLite。界面按 Material Design 3 的色彩角色、曲面、圆角、导航和状态设计，支持浅色 / 深色模式及手机布局。
+本地媒体查看器，使用 Vue 3、TypeScript、Vite、Fastify 和 SQLite。界面按 Material Design 3 的色彩角色、曲面、圆角、导航和状态设计，支持浅色 / 深色模式及手机布局。可选 AI 翻译支持作品信息与漫画图片，兼容 OpenAI 接口。
 
 ## 启动
 
-需要 Node.js 24 或更新版本、pnpm 11。FFmpeg 为可选依赖，用于视频封面和兼容版本。
+需要 Node.js 24 或更新版本、pnpm 11。FFmpeg 为可选依赖，用于视频封面和兼容版本；AI 翻译需要自行准备 OpenAI 兼容接口的地址与 Token，漫画图片翻译还需要手动放置本地 ONNX 模型（见「AI 翻译」）。
 
 ```powershell
 pnpm install
@@ -31,6 +31,52 @@ pnpm start
 - **播放**：原图、GIF、浏览器支持的视频直接播放。作品页支持数字页码切换、方向键、自动翻页、全屏和原文件链接；手机上左右滑动图片 / 视频区域切换分 P，滑到第一张 / 最后一张后继续滑动就切到上一组 / 下一组作品（往回切会停在上一组的最后一页，只有一张媒体时同样如此）；滑动信息区等其他位置直接切换作品；桌面端按住图片拖动、方向键和左右箭头按钮行为一致，都可以一路翻到底。对不支持的视频，点击「生成兼容版本」，通过 FFmpeg 生成 H.264 / AAC MP4 缓存。
 - **收藏**：整组收藏存入 SQLite，各设备共享；重新扫描和编辑同一个媒体目录的路径会保留收藏。移除目录会清理该目录索引和收藏记录，不删除原文件。
 - **更新**：启动时和每 5 分钟检查一次目录，也可以手动刷新。元文件的大小和修改时间都没变就复用解析缓存，解析逻辑升级时会自动重新解析；目录离线或扫描失败时保留已有索引。
+- **AI 翻译**：可选功能，作品页可翻译标题、作者、标签、简介，静态图片还能识别日文并回填译文；先在设置页「AI 翻译」配置兼容接口，漫画图片还需要本地 ONNX 模型（详见下文）。
+
+## AI 翻译
+
+AI 功能全部可选，未配置时不影响浏览、搜索和播放。设置页的「AI 翻译」面板连接 OpenAI 兼容接口，作品信息翻译与漫画图片翻译共用同一套配置，由服务端携带 Token 发起请求。作品信息和漫画文本会发送到该接口；图片不会上传，漫画在本地完成检测与识别，只有识别出的文字交给模型翻译。
+
+### 接口配置
+
+- **接口地址**：填到 `/v1` 或完整的 `/chat/completions` 地址都可以，程序会自动补全聊天与模型列表路径。
+- **API Token / 模型**：Token 明文保存在服务端 `data/ai.json`；可以点「获取模型列表」从接口拉取模型，也可以手动填写模型名。接口地址、Token、模型和参数都支持在保存前先「测试连接」。
+- **目标语言**：默认「简体中文」，作品信息与漫画译文都使用这个语言。
+- **自定义参数**：填写 JSON 对象后原样合并进请求体，可用来关闭思考或设置思考等级 / 预算，例如 `reasoning_effort`、`thinking`、`thinking_budget`、`temperature`；`model`、`messages` 等由程序控制的字段不允许覆盖。
+- **超时时间**：5 - 600 秒，默认 120 秒。
+- **提示词**：作品信息与漫画气泡各有一套内置系统提示词，只读不可编辑；可以追加一段自己的要求，两处都会生效，也可以一键恢复默认追加内容。
+
+### 作品信息翻译
+
+在作品页点「AI 翻译」，会把标题、作者、标签和简介一起发给模型，并要求按相同 JSON 结构返回译文；标签按位置一一对应，模型漏给时回退显示原文。译文支持「原文 + 译文」「仅译文」「仅原文」三种显示方式，再点「重新翻译」会绕过缓存强制请求。
+
+译文按「原文 + 目标语言」缓存在 SQLite 的 `translations` 表：换模型、改提示词或改自定义参数都不会让已有译文失效。超时、接口报错、模型返回不是 JSON 或缺少字段等原因会显示在作品页，终端也会打印原始返回。
+
+### 漫画图片翻译
+
+漫画翻译只处理静态图片（GIF 除外），按「本地识别 → AI 翻译 → 擦字回填」执行：
+
+1. **检测**：`comic-text-detector`（CTD）找出文字框和文字像素 mask，内部 letterbox 到 1024² 推理后再映射回原图坐标。
+2. **识别**：`manga-ocr` 按框裁剪并批量识别日文；过滤低置信度、过小、非日文的框，按日漫阅读顺序（从上到下、每行从右到左）排序，每页最多保留 80 处文本。
+3. **翻译**：把这一页的文本作为 JSON 数组一次性交给 AI，要求返回等长、同顺序的译文数组；少返或漏返的条目回退原文。
+4. **回填**：用 CTD 的 mask 膨胀 1px 擦除原文，按文字框边缘估算气泡底色并回填；前端 Canvas 根据气泡尺寸自动换行、缩放后画上译文。译图与原文可随时切换，详情区还会列出逐条对照。
+
+两个模型分别基于 [dmMaze/comic-text-detector](https://github.com/dmMaze/comic-text-detector) 与 [kha-white/manga-ocr-base](https://huggingface.co/kha-white/manga-ocr-base)，需要自行准备 ONNX（量化）版本。模型文件手动放进 `data/models`，仓库和安装过程都不会下载：
+
+```text
+data/models/
+├── manga-ocr/
+│   ├── config.json
+│   ├── encoder_model_quantized.onnx
+│   ├── decoder_model_quantized.onnx
+│   └── vocab.json
+└── comic-text-detector/
+    └── comictextdetector.pt.onnx
+```
+
+模型缺失时漫画任务会失败并提示路径，作品信息翻译不受影响。Windows 下 CTD 与 OCR encoder 优先使用 DirectML，失败自动回退 CPU；OCR decoder 固定在 CPU 上逐 token 解码。首次翻译需要加载模型，会明显慢一些。
+
+任务按「翻译本页」或「翻译整部」入队，前端轮询显示当前阶段；整部翻译逐张返回结果，单页失败不会中断其余页面，失败原因按页列出。译图按「文件内容哈希 + 目标语言 + 流水线版本」缓存：修改图片或切换目标语言会重新生成，其余情况直接复用 `data/cache/manga` 的译图底图和 SQLite 里的坐标、译文。
 
 ## 日志
 
@@ -80,7 +126,7 @@ $env:FFMPEG_PATH = 'D:\ffmpeg\ffmpeg.exe'
 pnpm start
 ```
 
-`data/sources.json` 保存目录配置，`data/library.sqlite` 保存作品索引和收藏，`data/cache` 保存缩略图及兼容视频。备份时停止服务后复制整个 `data` 目录。缓存可以在停止服务后单独清理，会按需重新生成。兼容视频暂不自动淘汰，请留意缓存占用。
+`data/sources.json` 保存目录配置，`data/library.sqlite` 保存作品索引、收藏和翻译缓存，`data/ai.json` 保存 AI 接口配置，`data/models` 保存漫画翻译的本地 ONNX 模型，`data/cache` 保存缩略图、兼容视频和漫画译图底图。备份时停止服务后复制整个 `data` 目录。缓存可以在停止服务后单独清理，会按需重新生成；模型不会自动下载，需要保留 `data/models`。兼容视频暂不自动淘汰，请留意缓存占用。
 
 FFmpeg 不可用时，图片、GIF 和浏览器可直接播放的视频仍然可用；视频封面显示占位图，兼容转换不可用。视频编码兼容性仍取决于设备浏览器，扩展名不能保证可播放。
 
@@ -92,46 +138,57 @@ pnpm test:search
 pnpm build
 ```
 
-测试使用临时生成的媒体文件，覆盖分组、元数据解析、搜索、目录增删改、收藏保留、离线恢复、缩略图以及视频 Range 读取，不操作实际媒体库。
+测试使用临时生成的媒体文件，覆盖分组、元数据解析、搜索、目录增删改、收藏保留、离线恢复、缩略图、视频 Range 读取以及 AI 提示词拼接，不操作实际媒体库。
 
 `pnpm test:search` 对 2,500 组生成的描述进行独立性能测试，输出索引建立和多关键词、拼音、错字搜索耗时。`pnpm test:fixtures` 可在 `.cache/preview` 生成界面验证用的风景图、GIF 和视频，不会将样例加入正式媒体库。
+
+需要单独验证漫画识别时，运行 `pnpm exec tsx tests/manga-ocr-check.ts [图片路径...]`（依赖 `data/models`）：它只跑 CTD 检测与 manga-ocr 识别，把带框调试图和同名 JSON 写到 `test-results/manga-ocr`，加 `--full` 可输出完整 OCR 文本。
 
 ## 项目结构
 
 ```
 myMediaViewer/
 ├── index.html                  前端入口 HTML
-├── package.json                依赖与脚本（dev / build / start / test）
+├── package.json                依赖与脚本（dev / build / start / test / test:search / test:fixtures）
 ├── vite.config.ts              Vite 配置：Vue 插件、/api 代理到 3210、ES2022 构建目标
 ├── tsconfig.json               前端与共享代码的 TypeScript 配置（noEmit）
 ├── tsconfig.server.json        服务端编译配置，输出到 dist-server
-├── pnpm-workspace.yaml         pnpm 构建脚本许可（esbuild、sharp）
+├── pnpm-workspace.yaml         pnpm 构建脚本许可（esbuild、sharp、onnxruntime-node）
 ├── start.bat                   Windows 一键启动（pnpm start）
-├── .gitignore                  忽略 node_modules、构建产物和 data 等
+├── .gitignore                  忽略 node_modules、构建产物、data 等
 ├── public/
 │   └── favicon.svg             站点图标
 ├── shared/                     前后端共享代码
-│   ├── types.ts                Source / Work / Asset 等公共类型
+│   ├── types.ts                Source / Work / Asset / AI 翻译 / 漫画任务等公共类型
+│   ├── prompts.ts              作品信息与漫画翻译的内置系统提示词
 │   └── search-query.ts         搜索词解析（空格分词、#"标签" 语法）
 ├── server/                     Fastify 服务端
 │   ├── index.ts                入口：创建应用、监听端口、启动首次扫描
-│   ├── app.ts                  全部 /api 路由与前端静态资源托管
+│   ├── app.ts                  全部 /api 路由（含 AI 接口）与前端静态资源托管
 │   ├── config.ts               环境变量、data 目录与 sources.json 读写
 │   ├── access.ts               局域网 / 保留地址校验，公网默认 403
-│   ├── database.ts             SQLite（node:sqlite）索引与收藏读写
+│   ├── database.ts             SQLite（node:sqlite）索引、收藏与翻译缓存读写
 │   ├── scanner.ts              目录扫描：解析文件名和元文件并写入索引
 │   ├── parsers.ts              Pixiv / Telegram 命名规则与元数据解析
 │   ├── search.ts               搜索索引：简繁、全半角、拼音、模糊匹配
 │   ├── media.ts                媒体 Range 读取、缩略图与 FFmpeg 兼容转换
 │   ├── directories.ts          文件夹选择器的目录浏览接口
-│   ├── ai.ts                   AI 设置、连通性测试、模型列表与翻译缓存
+│   ├── log.ts                  精简日志：接口、关键操作、队列进度与报错
+│   ├── ai.ts                   AI 设置、调用封装、作品信息翻译与翻译缓存
+│   ├── ai/manga/               漫画图片翻译（本地识别 + AI 翻译 + 译图回填）
+│   │   ├── service.ts          任务队列、模型状态、缓存与整页流水线编排
+│   │   ├── detector.ts         comic-text-detector ONNX：文字框、mask 与 NMS
+│   │   ├── recognizer.ts       manga-ocr ONNX：encoder + GPT-2 贪心解码
+│   │   ├── pipeline.ts         识别结果过滤、置信度阈值与日漫阅读顺序
+│   │   ├── erase.ts            按 mask 擦除原文并估算气泡底色
+│   │   └── types.ts            检测框、mask、OCR 区域等内部类型
 │   └── vendor.d.ts             opencc-js 的类型补充
 ├── src/                        Vue 3 前端
 │   ├── main.ts                 应用入口：挂载 Vue 与路由
 │   ├── App.vue                 路由出口：KeepAlive 缓存媒体库列表
 │   ├── router.ts               SPA 路由与上次来源恢复
-│   ├── events.ts                mitt 事件总线：作品页退出时通知列表定位作品
-│   ├── route-cache-key.ts       列表实例缓存键：不同搜索会话互不覆盖
+│   ├── events.ts               mitt 事件总线：作品页退出时通知列表定位作品
+│   ├── route-cache-key.ts      列表实例缓存键：不同搜索会话互不覆盖
 │   ├── library-session.ts      列表会话：作品页翻到相邻作品时复用当前结果
 │   ├── api.ts                  fetch 封装与公共工具
 │   ├── style.css               全局样式与 Material Design 3 色彩变量
@@ -141,24 +198,29 @@ myMediaViewer/
 │   │   └── WorkPage.vue        作品页：独立 URL、相邻作品导航与标签搜索
 │   └── components/
 │       ├── WorkCard.vue        作品卡片：封面、类型徽标、收藏按钮
-│       ├── ViewerDialog.vue    作品查看器：页面模式与弹窗模式共用，支持翻页、全屏和翻译
+│       ├── ViewerDialog.vue    作品查看器：翻页、全屏、作品信息翻译与漫画译图
 │       ├── SettingsDialog.vue  媒体库设置主体：页面模式与弹窗模式共用
 │       ├── FolderPicker.vue    文件夹选择器：面包屑、上一级、名称筛选
-│       ├── AiSettingsPanel.vue AI 设置面板：接口、模型、参数与测试
+│       ├── AiSettingsPanel.vue AI 设置面板：接口、模型、目标语言、参数与测试
 │       └── Icon.vue            MDI 图标组件
 ├── tests/                      测试
 │   ├── library.test.ts         主测试：分组、解析、搜索、目录、收藏、离线恢复等
+│   ├── ai-prompt.test.ts       提示词拼接、追加内容与旧配置兼容
 │   ├── search-query.test.ts    搜索词解析单元测试
+│   ├── library-session.test.ts 列表会话隔离与相邻作品加载
 │   ├── search-benchmark.ts     2,500 组描述的搜索性能基准
+│   ├── manga-ocr-check.ts      CTD + manga-ocr 手动验证，输出调试图与 JSON
 │   └── preview-fixtures.ts     生成界面验证用样例媒体
 ├── data/                       运行时数据，已忽略提交
 │   ├── sources.json            媒体目录配置
-│   ├── library.sqlite          作品索引与收藏
-│   ├── ai.json                 AI 配置
-│   └── cache/                  缩略图与兼容视频缓存
+│   ├── library.sqlite          作品索引、收藏与翻译缓存
+│   ├── ai.json                 AI 接口配置（含 API Token）
+│   ├── models/                 漫画翻译的本地 ONNX 模型（需手动放置，见「AI 翻译」）
+│   └── cache/                  缩略图、兼容视频与漫画译图底图
 ├── dist/                       前端构建产物（pnpm build 生成）
 ├── dist-server/                服务端构建产物（pnpm build 生成）
+├── test-results/               漫画 OCR 调试输出（manga-ocr-check 生成）
 └── .cache/                     开发用临时输出（如 test:fixtures 的预览样例）
 ```
 
-构建产物、`data` 和 `.cache` 均不进入版本控制，可以随时删除后重新生成。
+构建产物、`data`、`.cache` 和 `test-results` 均不进入版本控制。除 `data/models` 需要自行备份外，其余内容可以随时删除后重新生成。
