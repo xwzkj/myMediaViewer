@@ -27,9 +27,8 @@ const EOS_TOKEN_ID = 3
 const PAD_TOKEN_ID = 0
 const MAX_LENGTH = 300
 
-/** 两个 encoder 变体，以及各自的解码器与词表。 */
+/** 固定的 HuggingFace 模型文件与词表。 */
 export const ENCODER_FP16 = 'encoder_model_fp16.onnx'
-export const ENCODER_QUANTIZED = 'encoder_model_quantized.onnx'
 export const DECODER_FILE = 'decoder_model_quantized.onnx'
 export const VOCAB_FILE = 'vocab.txt'
 
@@ -59,13 +58,13 @@ export class MangaOcrRecognizer {
   private encoder: ort.InferenceSession | null = null
   private decoder: ort.InferenceSession | null = null
   private vocab: string[] = []
-  /** 实际选中的 encoder 文件，以及模型的输入输出名（不同导出批次命名不一样）。 */
+  /** encoder 文件与模型的输入输出名。 */
   private encoderFileName = ''
   private encoderInputName = 'pixel_values'
   private encoderOutputName = 'last_hidden_state'
 
   get isLoaded() { return this.encoder !== null && this.decoder !== null }
-  /** 供日志显示当前用的是量化版还是 fp16 加速版。 */
+  /** 供日志显示已加载的 encoder 文件。 */
   get encoderFileUsed() { return this.encoderFileName }
   get imageSize() { return IMAGE_SIZE }
   get vocabSize() { return this.vocab.length }
@@ -77,39 +76,11 @@ export class MangaOcrRecognizer {
     const common: ort.InferenceSession.SessionOptions = {
       intraOpNumThreads: options.intraOpNumThreads ?? 0,
     }
-    const encoderProviders = options.encoderProviders ?? ['dml', 'cpu']
-    const fp16Path = path.join(modelDir, ENCODER_FP16)
-    const quantizedPath = path.join(modelDir, ENCODER_QUANTIZED)
-
-    // fp16 encoder 在 DirectML 上比动态量化版快约 4 倍，但在 CPU 上反而慢 3 倍。
-    // 所以先用「只指定 dml」建一次会话做探测：成功说明 GPU 路径真的可用，才用 fp16；
-    // 失败（没有独显、驱动太旧）就退回量化版，继续走 dml → cpu 的回退链。
-    let encoder: ort.InferenceSession | null = null
-    if (encoderProviders.includes('dml') && existsSync(fp16Path)) {
-      try {
-        encoder = await ort.InferenceSession.create(fp16Path, { ...common, executionProviders: ['dml'] })
-        this.encoderFileName = ENCODER_FP16
-      } catch { encoder = null }
-    }
-    // 回退顺序：量化版优先（CPU 上更快）；只装了 fp16 时也接受它，慢但能跑。
-    if (!encoder && existsSync(quantizedPath)) {
-      encoder = await ort.InferenceSession.create(quantizedPath, {
-        ...common,
-        executionProviders: encoderProviders,
-      })
-      this.encoderFileName = ENCODER_QUANTIZED
-    }
-    if (!encoder && existsSync(fp16Path)) {
-      encoder = await ort.InferenceSession.create(fp16Path, {
-        ...common,
-        executionProviders: encoderProviders,
-      })
-      this.encoderFileName = ENCODER_FP16
-    }
-    if (!encoder) {
-      throw new Error('缺少 encoder 模型：' + quantizedPath + ' 或 ' + fp16Path + ' 至少要有一个')
-    }
-    this.encoder = encoder
+    this.encoder = await ort.InferenceSession.create(path.join(modelDir, ENCODER_FP16), {
+      ...common,
+      executionProviders: options.encoderProviders ?? (process.platform === 'win32' ? ['dml', 'cpu'] : ['cpu']),
+    })
+    this.encoderFileName = ENCODER_FP16
 
     this.decoder = await ort.InferenceSession.create(path.join(modelDir, DECODER_FILE), {
       ...common,

@@ -1,7 +1,7 @@
 /**
  * 漫画识别模型的下载与就位。
  *
- * 两个模型全部来自 HuggingFace，不再依赖第三方导出的模型包：
+ * 模型文件来自以下 HuggingFace 仓库：
  *  - comic-text-detector（dmMaze/comic-text-detector 的 ONNX 导出）
  *  - manga-ocr-base（kha-white/manga-ocr-base 的 ONNX 导出）
  *
@@ -34,18 +34,11 @@ export const detectorModel: ModelSpec = {
   file: 'comic-text-detector.onnx',
 }
 
-/** DirectML 上的首选 encoder：fp16 权重，比量化版快约 4 倍。 */
+/** 所有平台共用的 fp16 encoder。 */
 export const encoderFp16Model: ModelSpec = {
   target: 'manga-ocr/encoder_model_fp16.onnx',
   repo: 'onnx-community/manga-ocr-base-ONNX',
   file: 'onnx/encoder_model_fp16.onnx',
-}
-
-/** 通用 encoder：动态量化，CPU 上比 fp16 快，也是没有独显时的首选。 */
-export const encoderQuantizedModel: ModelSpec = {
-  target: 'manga-ocr/encoder_model_quantized.onnx',
-  repo: 'onnx-community/manga-ocr-base-ONNX',
-  file: 'onnx/encoder_model_quantized.onnx',
 }
 
 export const decoderModel: ModelSpec = {
@@ -61,19 +54,9 @@ export const vocabModel: ModelSpec = {
   file: 'vocab.txt',
 }
 
-/** Windows 上优先用 fp16 encoder，其余平台用量化版。 */
-export function preferredEncoder(): ModelSpec {
-  return process.platform === 'win32' ? encoderFp16Model : encoderQuantizedModel
-}
-
-/** 首选 encoder 不可用时的备选（例如 Windows 上 DirectML 实际不可用）。 */
-export function alternateEncoder(): ModelSpec {
-  return process.platform === 'win32' ? encoderQuantizedModel : encoderFp16Model
-}
-
-/** 首次翻译必须就位的文件：检测模型 + 一个 encoder + decoder + 词表。 */
+/** 首次翻译必须就位的文件：检测模型 + fp16 encoder + decoder + 词表。 */
 export function requiredModels(): ModelSpec[] {
-  return [detectorModel, preferredEncoder(), decoderModel, vocabModel]
+  return [detectorModel, encoderFp16Model, decoderModel, vocabModel]
 }
 
 export function modelPath(spec: ModelSpec): string {

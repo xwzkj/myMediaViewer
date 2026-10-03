@@ -13,7 +13,7 @@ import { judgeRegion, mangaReadingOrder, trimTrailingNoise } from './pipeline.js
 import { MangaOcrRecognizer } from './recognizer.js'
 import { formatDuration, logError, logInfo } from '../../log.js'
 import { boxToRect, paddedRect, type OcrRegion, type TextMask } from './types.js'
-import { alternateEncoder, decoderModel, detectorModel, ensureMangaModels, hasModel, missingModels, modelPath, modelRoot, preferredEncoder, vocabModel } from './models.js'
+import { encoderFp16Model, decoderModel, detectorModel, ensureMangaModels, hasModel, missingModels, modelPath, modelRoot, vocabModel } from './models.js'
 
 const mangaCacheDir = path.join(cacheDir, 'manga')
 const PIPELINE_VERSION = 1
@@ -39,15 +39,10 @@ const jobLabel = (job: InternalJob) => `漫画翻译 #${job.id.slice(0, 6)}`
 // 只有真正需要模型的页面才占用这个队列。缓存查询不排队，也不会被 GPU 任务挡住。
 let inferenceQueue: Promise<void> = Promise.resolve()
 
-/**
- * 模型是否就位。encoder 有两个变体，装任意一个即可，所以单独判断，
- * 不能直接套用 requiredModels()（那里面只列了首选变体）。
- */
+/** 检查自动下载的固定模型文件是否就位。 */
 export function getMangaModelStatus(): MangaModelStatus {
-  const preferred = preferredEncoder()
-  const alternate = alternateEncoder()
-  const encoderReady = hasModel(preferred) || hasModel(alternate)
-  const encoderNames = [path.basename(preferred.target), path.basename(alternate.target)]
+  const encoderReady = hasModel(encoderFp16Model)
+  const encoderNames = [path.basename(encoderFp16Model.target)]
   const detectorReady = hasModel(detectorModel)
   const decoderReady = hasModel(decoderModel)
   const vocabReady = hasModel(vocabModel)

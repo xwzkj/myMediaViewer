@@ -19,9 +19,9 @@ import { debugLogging, logApi, logError, logInfo, setLoggingEnabled } from './lo
 
 export async function createApp(logging = true) {
   setLoggingEnabled(logging)
-  // 默认关掉 Fastify 的逐请求日志：每个请求都打印一条带请求头、响应头的记录属于流水账。
+  // 默认关掉 Fastify 的逐请求日志：常规运行使用下方的精简日志。
   // 常驻输出改由下面的 onResponse 钩子整理成「方法 + 路径 + 状态码 + 耗时」；
-  // 需要排查问题时，用 LOG_LEVEL=debug 启动即可拿回完整请求日志。
+  // 需要排查问题时，用 LOG_LEVEL=debug 启动即可启用默认逐请求日志。
   const app = Fastify({ logger: logging && debugLogging ? { level: 'info' } : false, bodyLimit: 16_384 })
   const onScanFailed = (error: unknown) => logError('扫描', `扫描失败：${(error as Error).message}`, error)
   // 由错误处理器记录过的请求不再重复打印状态码行。

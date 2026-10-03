@@ -6,7 +6,7 @@
 
 ## 启动
 
-需要 Node.js 24 或更新版本、pnpm 11。FFmpeg 为可选依赖，用于视频封面和兼容版本；AI 翻译需要自行准备 OpenAI 兼容接口的地址与 Token，漫画图片翻译还需要手动放置本地 ONNX 模型（见「AI 翻译」）。
+需要 Node.js 24 或更新版本、pnpm 11。FFmpeg 为可选依赖，用于视频封面和兼容版本；AI 翻译需要自行准备 OpenAI 兼容接口的地址与 Token，漫画图片翻译首次使用时会自动下载本地 ONNX 模型（见「AI 翻译」）。
 
 ```powershell
 pnpm install
@@ -23,14 +23,14 @@ pnpm start
 
 ## 使用
 
-- **作品分组**：Pixiv 按作品 ID 合并，Telegram 按编号和年月合并；页码按数字排序。重复导出的同页保留一个展示项。Pixiv 的 WebM（包括 `_p0` 等页码后缀和大写扩展名）识别为动图；同作品同页同时存在 GIF / WebM 时优先展示 WebM，只有 WebM 或只有 GIF 也能识别。WebM 动图静音自动循环播放，媒体文件保留原位。
+- **作品分组**：Pixiv 按作品 ID 合并，Telegram 按编号和年月合并；页码按数字排序，重复导出的同页保留一个展示项。Pixiv 支持 GIF / WebM 动图，同作品同页优先展示 WebM。WebM 静音自动循环播放，媒体文件保留原位。
 - **浏览**：前端是 Vue Router 单页应用，媒体库、收藏、媒体来源、搜索、设置和作品详情分别使用独立 URL；列表滚动到接近底部时自动加载下一批，后台扫描完成后只刷新最新的一批并保留已加载的内容。
 - **来源记忆**：打开 `/` 时恢复上次查看的媒体来源（若上次停在收藏也会恢复收藏页）；点击侧栏「媒体库」会进入 `/library`，明确查看全部来源。列表页使用 `KeepAlive` 保留滚动位置和已加载内容。
 - **返回**：从作品页返回列表时会自动滚动并居中到刚才那组作品的卡片；作品页内切换上下组只替换当前记录，连续翻页后浏览器返回仍直接回列表；点击标签或作者会进入搜索结果，搜索页不会滚动到来源作品；浏览器返回键会先回到原作品页。
-- **界面**：只有搜索行常驻页面顶部并铺满右侧区域，亮暗切换按钮也在这一行；媒体来源、媒体类型、模糊匹配、排序方式和时间依据收进搜索框右边的二级菜单，移动端不会挤成两行。视频与动图合并成「视频」一个筛选（动图仍照常播放）。
-- **元数据**：Pixiv 优先读取下载器生成的 `-meta.json`（字段最全，含翻译标签、原图链接和 JSON 里的简介），缺失字段再用 `-meta.txt` 补齐；两种元文件都带页码后缀（如 `38757265931-134522682_p0-meta.json`）时同样识别。Telegram 侧以 txt 为主，同样支持 json；没有元文件时显示作品编号。文本编码支持 UTF-8、带 BOM 的 UTF-16 和 GB18030 回退，json 里的 HTML 简介会在显示前转成纯文本。
+- **界面**：顶部搜索栏提供搜索和亮暗切换；右侧筛选菜单包含媒体来源、媒体类型、模糊匹配、排序方式和时间依据，支持手机布局。视频与动图统一归入「视频」筛选。
+- **元数据**：Pixiv 优先读取下载器生成的 `-meta.json`（字段最全，含翻译标签、原图链接和 JSON 里的简介），缺失字段再用 `-meta.txt` 补齐。Telegram 侧以 txt 为主，同样支持 json；没有元文件时显示作品编号。文本编码支持 UTF-8、带 BOM 的 UTF-16 和 GB18030 回退，json 里的 HTML 简介会在显示前转成纯文本。
 - **排序**：默认按收藏顺序排列，也就是文件名开头的收藏编号——Pixiv 是收藏 ID（`bmk_id`，如 `38885063179-133752873_p0.webm`），Telegram 是消息号——从大到小，与你收藏作品的先后一致；同一作品出现两个收藏编号时取较大的那个。这串编号只在同一个媒体目录内部可比：两种含义和量级都不同，所以混合显示多个目录时开关会停用并自动按发布时间排列，选中某个目录后即可按收藏顺序浏览。点开关也能随时改用发布时间，标题排序不受影响。
-- **搜索**：关键词用空格分隔，所有关键词均需命中，可分布在标题、作者、标签、描述或编号中。支持部分文字、简繁体、全半角、大小写、全拼及首字母。开启「模糊匹配」后加入错漏字候选。采用 SQLite 持久化 + 内存文本索引；不在每次搜索时读取 txt。当前没有语义模型或任意同义词理解。
+- **搜索**：关键词用空格分隔，所有关键词均需命中，可分布在标题、作者、标签、描述或编号中。支持部分文字、简繁体、全半角、大小写、全拼及首字母。开启「模糊匹配」后加入错漏字候选。搜索使用 SQLite 持久化数据与内存文本索引。
 - **播放**：原图、GIF、浏览器支持的视频直接播放。作品页支持数字页码切换、方向键、自动翻页、全屏和原文件链接；手机上左右滑动图片 / 视频区域切换分 P，滑到第一张 / 最后一张后继续滑动就切到上一组 / 下一组作品（往回切会停在上一组的最后一页，只有一张媒体时同样如此）；滑动信息区等其他位置直接切换作品；桌面端按住图片拖动、方向键和左右箭头按钮行为一致，都可以一路翻到底。对不支持的视频，点击「生成兼容版本」，通过 FFmpeg 生成 H.264 / AAC MP4 缓存。
 - **收藏**：整组收藏存入 SQLite，各设备共享；重新扫描和编辑同一个媒体目录的路径会保留收藏。移除目录会清理该目录索引和收藏记录，不删除原文件。
 - **更新**：启动时和每 5 分钟检查一次目录，也可以手动刷新。元文件的大小和修改时间都没变就复用解析缓存，解析逻辑升级时会自动重新解析；目录离线或扫描失败时保留已有索引。
@@ -65,38 +65,37 @@ AI 功能全部可选，未配置时不影响浏览、搜索和播放。设置�
 3. **翻译**：把这一页的文本作为 JSON 数组一次性交给 AI，要求返回等长、同顺序的译文数组；少返或漏返的条目回退原文。
 4. **回填**：用 CTD 的 mask 膨胀 1px 擦除原文，按文字框边缘估算气泡底色并回填；前端 Canvas 根据气泡尺寸自动换行、缩放后画上译文。译图与原文可随时切换，详情区还会列出逐条对照。
 
-两个模型分别基于 [dmMaze/comic-text-detector](https://github.com/dmMaze/comic-text-detector) 与 [kha-white/manga-ocr-base](https://huggingface.co/kha-white/manga-ocr-base)，使用 HuggingFace 上的 ONNX 导出。模型不随仓库分发，**首次翻译时自动下载**到 `data/models`：
+模型文件由程序从 HuggingFace 自动下载到 `data/models`：检测模型来自 [mayocream/comic-text-detector-onnx](https://huggingface.co/mayocream/comic-text-detector-onnx)，OCR 模型来自 [onnx-community/manga-ocr-base-ONNX](https://huggingface.co/onnx-community/manga-ocr-base-ONNX)，词表来自 [kha-white/manga-ocr-base](https://huggingface.co/kha-white/manga-ocr-base)。
 
 ```text
 data/models/
 ├── manga-ocr/
-│   ├── encoder_model_fp16.onnx        # Windows 上优先（DirectML 快约 4 倍）
-│   ├── encoder_model_quantized.onnx   # 其余平台优先（CPU 上更快）
+│   ├── encoder_model_fp16.onnx
 │   ├── decoder_model_quantized.onnx
 │   └── vocab.txt
 └── comic-text-detector/
     └── comic-text-detector.onnx
 ```
 
-首次翻译会自动下载缺失的模型（检测模型 90 MB、fp16 encoder 164 MB、decoder 28 MB、词表），下载完成后再加载。模型下载与加载只在第一次翻译时发生，之后整个进程内复用同一份会话，后续翻译不再重新下载或重建。国内网络访问不了 huggingface.co 时，设置 `HF_ENDPOINT` 指向镜像站（例如 `HF_ENDPOINT=https://hf-mirror.com`）即可。
+首次需要识别图片时下载缺失的模型文件并加载，进程内复用模型会话。重启服务后会重新加载已有文件。无法访问 huggingface.co 时，可设置 `HF_ENDPOINT` 指向可用镜像站。
 
-Windows 下 CTD 与 OCR encoder 优先使用 DirectML，失败自动回退 CPU；OCR decoder 固定在 CPU 上逐 token 解码。两个 encoder 的分工：`encoder_model_fp16.onnx` 在 DirectML 上快约 4 倍（实测 5 张真实漫画页，本地 OCR 合计 2.5 秒降到 2.0 秒），识别出的重复幻觉也更少；`encoder_model_quantized.onnx` 是动态量化版，CPU 上更快。程序会先探测 DirectML 是否真的可用：可用就用 fp16，不可用自动改用量化版，无需手动切换。
+所有平台使用同一套模型文件：fp16 encoder 与量化 decoder。Windows 下 CTD 和 encoder 使用 DirectML / CPU 执行提供程序，其他平台使用 CPU；decoder 使用 CPU。
 
 任务按「翻译本页」或「翻译整部」入队，前端轮询显示当前阶段；整部翻译逐张返回结果，单页失败不会中断其余页面，失败原因按页列出。译图按「文件内容哈希 + 目标语言 + 流水线版本」缓存：修改图片或切换目标语言会重新生成，其余情况直接复用 `data/cache/manga` 的译图底图和 SQLite 里的坐标、译文。
 
 ### 流水线模式
 
-整部翻译有三套流程，在设置页「AI 翻译 → 漫画翻译流水线」里选择，默认逐页处理。本地检测与 OCR 的耗时通常远小于大模型调用，所以翻译阶段的组织方式决定了整体快慢。
+整部翻译有三套流程，在设置页「AI 翻译 → 漫画翻译流水线」里选择，默认逐页处理。实际耗时取决于本地识别性能、文本量和接口响应速度。
 
 - **逐页处理**：一页走完「检测 → OCR → 翻译 → 回填」再处理下一页。内存占用最低，任何一步失败只影响当前页。适合单页翻译或内存紧张的环境。
-- **先批量识别，再合并翻译**：先把整部图片的检测与 OCR 全部跑完，再把所有页的文本拍平成一个数组，合并成尽量少的几次请求（每批最多 200 段）。请求数最少，实测 3 张 28 段只需 1 次调用；代价是合并调用失败会让整批一起失败。
-- **先批量识别，再并发翻译**：识别阶段与上一种相同，之后每页各发一个请求，按设置的并发数同时进行。速度最快，单页失败只影响该页，接口限流时把并发数调小即可。
+- **先批量识别，再合并翻译**：先把整部图片的检测与 OCR 全部跑完，再把所有页的文本拍平成一个数组，合并成尽量少的几次请求（每批最多 200 段）。可减少请求次数；合并调用失败会影响本次任务中等待合并翻译的页面。
+- **先批量识别，再并发翻译**：识别阶段与上一种相同，之后每页各发一个请求，按设置的并发数同时进行。可缩短等待多个请求的时间，单页失败只影响该页；遇到接口限流时可调低并发数。
 
 并发翻译模式的并发数范围为 1 - 10，默认 3；设为 1 即退化为依次发送。三种模式共用同一份本地识别代码与缓存键，切换模式不会让已有译图缓存失效。
 
 ## 日志
 
-终端输出只保留有信息量的内容，不再逐请求打印流水账：
+默认终端日志包括：
 
 - **接口**：方法、路径、状态码和耗时。前端每 2 秒的状态轮询，以及缩略图、原图、视频、漫画译图底图等二进制请求不记录。
 - **关键操作**：启动信息、媒体目录的新增 / 修改 / 移除、媒体库整理结果、视频兼容版本转码、AI 设置更新与翻译缓存清理。
@@ -104,7 +103,7 @@ Windows 下 CTD 与 OCR encoder 优先使用 DirectML，失败自动回退 CPU�
 - **调用与报错**：对 AI 接口的每次调用记录用途、模型、地址、状态和耗时；请求失败时输出状态码和具体原因，同一个失败只记一次。
 - **原始返回**：模型返回无法解析为 JSON、缺少预期字段、没有返回译文数组、译文与原文相同，或接口返回非 2xx 与非法 JSON 时，会把原始内容按行打印出来（默认最多 40 行 / 4000 字符，超出会标注总长度），方便直接对照模型到底回了什么。
 
-需要排查底层的请求细节（连接、请求头、响应头、每条请求的响应时间）时，用 `LOG_LEVEL=debug` 启动：
+需要查看 Fastify 的逐请求日志时，用 `LOG_LEVEL=debug` 启动：
 
 ```powershell
 $env:LOG_LEVEL = 'debug'
@@ -131,9 +130,10 @@ pnpm start
 | `PORT` | `3210` | HTTP 服务端口 |
 | `HOST` | `0.0.0.0` | 监听地址，仅本机可设为 `127.0.0.1` |
 | `MEDIA_DATA_DIR` | `./data` | 数据库、目录配置和缓存存放位置 |
+| `HF_ENDPOINT` | `https://huggingface.co` | 本地识别模型的下载站点，可设置为镜像地址 |
 | `FFMPEG_PATH` | `ffmpeg` | FFmpeg 可执行文件路径，也可直接加入 PATH |
 | `ALLOW_PUBLIC_ACCESS` | 未设置 | 默认只允许局域网与保留地址访问；设为 `1`（或 `true`/`yes`/`on`）才放行公网地址 |
-| `LOG_LEVEL` | 未设置 | 设为 `debug` 时输出 Fastify 的完整请求日志（含请求头和响应头），用于排查底层问题 |
+| `LOG_LEVEL` | 未设置 | 设为 `debug` 时启用 Fastify 默认逐请求日志，包含请求信息、状态码和耗时 |
 
 示例：
 
@@ -142,7 +142,7 @@ $env:FFMPEG_PATH = 'D:\ffmpeg\ffmpeg.exe'
 pnpm start
 ```
 
-`data/sources.json` 保存目录配置，`data/library.sqlite` 保存作品索引、收藏和翻译缓存，`data/ai.json` 保存 AI 接口配置，`data/models` 保存漫画翻译的本地 ONNX 模型，`data/cache` 保存缩略图、兼容视频和漫画译图底图。备份时停止服务后复制整个 `data` 目录。缓存可以在停止服务后单独清理，会按需重新生成；模型不会自动下载，需要保留 `data/models`。兼容视频暂不自动淘汰，请留意缓存占用。
+`data/sources.json` 保存目录配置，`data/library.sqlite` 保存作品索引、收藏和翻译缓存，`data/ai.json` 保存 AI 接口配置，`data/models` 保存漫画翻译的本地 ONNX 模型，`data/cache` 保存缩略图、兼容视频和漫画译图底图。备份时停止服务后复制整个 `data` 目录。缓存可以在停止服务后单独清理，会按需重新生成；模型文件缺失时会在下次识别时自动下载。兼容视频暂不自动淘汰，请留意缓存占用。
 
 FFmpeg 不可用时，图片、GIF 和浏览器可直接播放的视频仍然可用；视频封面显示占位图，兼容转换不可用。视频编码兼容性仍取决于设备浏览器，扩展名不能保证可播放。
 
@@ -158,7 +158,7 @@ pnpm build
 
 `pnpm test:search` 对 2,500 组生成的描述进行独立性能测试，输出索引建立和多关键词、拼音、错字搜索耗时。`pnpm test:fixtures` 可在 `.cache/preview` 生成界面验证用的风景图、GIF 和视频，不会将样例加入正式媒体库。
 
-需要单独验证漫画识别时，运行 `pnpm exec tsx tests/manga-ocr-check.ts [图片路径...]`：它只跑 CTD 检测与 manga-ocr 识别（缺模型时同样会自动下载），把带框调试图和同名 JSON 写到 `test-results/manga-ocr`，加 `--full` 可输出完整 OCR 文本。检测框会按生产路径加一圈 padding —— 紧贴文字的裁剪会让 manga-ocr 陷入重复输出，实测同一个框不加 padding 要 265 个 token / 1.5 秒，加了只要 68 个 token / 0.2 秒。
+需要单独验证漫画识别时，运行 `pnpm exec tsx tests/manga-ocr-check.ts [图片绝对路径...]`：执行 CTD 检测与 manga-ocr 识别，缺失模型会自动下载。带框调试图和同名 JSON 写到 `test-results/manga-ocr`，加 `--full` 可输出完整 OCR 文本。
 
 ## 项目结构
 
@@ -193,6 +193,7 @@ myMediaViewer/
 │   ├── ai.ts                   AI 设置、调用封装、作品信息翻译与翻译缓存
 │   ├── ai/manga/               漫画图片翻译（本地识别 + AI 翻译 + 译图回填）
 │   │   ├── service.ts          任务队列、模型状态、缓存与整页流水线编排
+│   │   ├── models.ts           HuggingFace 模型清单、下载与文件检查
 │   │   ├── detector.ts         comic-text-detector ONNX：文字框、mask 与 NMS
 │   │   ├── recognizer.ts       manga-ocr ONNX：encoder + GPT-2 贪心解码
 │   │   ├── pipeline.ts         识别结果过滤、置信度阈值与日漫阅读顺序
@@ -206,6 +207,7 @@ myMediaViewer/
 │   ├── events.ts               mitt 事件总线：作品页退出时通知列表定位作品
 │   ├── route-cache-key.ts      列表实例缓存键：不同搜索会话互不覆盖
 │   ├── library-session.ts      列表会话：作品页翻到相邻作品时复用当前结果
+│   ├── manga-layout.ts         漫画译文的 Canvas 排版
 │   ├── api.ts                  fetch 封装与公共工具
 │   ├── style.css               全局样式与 Material Design 3 色彩变量
 │   ├── views/
@@ -222,6 +224,8 @@ myMediaViewer/
 ├── tests/                      测试
 │   ├── library.test.ts         主测试：分组、解析、搜索、目录、收藏、离线恢复等
 │   ├── ai-prompt.test.ts       提示词拼接、追加内容与旧配置兼容
+│   ├── manga-layout.test.ts    漫画译文排版测试
+│   ├── manga-models.test.ts    模型自动下载与固定 encoder 加载测试
 │   ├── manga-pipeline.test.ts  流水线模式与并发数的默认值、夹紧与持久化
 │   ├── search-query.test.ts    搜索词解析单元测试
 │   ├── library-session.test.ts 列表会话隔离与相邻作品加载
@@ -232,7 +236,7 @@ myMediaViewer/
 │   ├── sources.json            媒体目录配置
 │   ├── library.sqlite          作品索引、收藏与翻译缓存
 │   ├── ai.json                 AI 接口配置（含 API Token）
-│   ├── models/                 漫画翻译的本地 ONNX 模型（需手动放置，见「AI 翻译」）
+│   ├── models/                 漫画翻译的本地 ONNX 模型（首次识别时自动下载）
 │   └── cache/                  缩略图、兼容视频与漫画译图底图
 ├── dist/                       前端构建产物（pnpm build 生成）
 ├── dist-server/                服务端构建产物（pnpm build 生成）
@@ -240,4 +244,4 @@ myMediaViewer/
 └── .cache/                     开发用临时输出（如 test:fixtures 的预览样例）
 ```
 
-构建产物、`data`、`.cache` 和 `test-results` 均不进入版本控制。除 `data/models` 需要自行备份外，其余内容可以随时删除后重新生成。
+构建产物、`data`、`.cache` 和 `test-results` 均不进入版本控制。请备份 `data` 中的目录配置、AI 配置和 SQLite 数据库；收藏记录无法通过重新扫描恢复。构建产物与缓存可重新生成，模型可重新下载。

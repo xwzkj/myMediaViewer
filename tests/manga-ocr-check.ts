@@ -19,10 +19,9 @@ import { ComicTextDetector } from '../server/ai/manga/detector.js'
 import { MangaOcrRecognizer } from '../server/ai/manga/recognizer.js'
 import { judgeRegion, mangaReadingOrder, trimTrailingNoise } from '../server/ai/manga/pipeline.js'
 import { boxToRect, paddedRect, type OcrRegion } from '../server/ai/manga/types.js'
-import { detectorModel, ensureMangaModels, modelPath } from '../server/ai/manga/models.js'
+import { detectorModel, ensureMangaModels, modelPath, modelRoot } from '../server/ai/manga/models.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const modelRoot = path.join(root, 'data', 'models')
 const outDir = path.join(root, 'test-results', 'manga-ocr')
 
 const SOURCE_ROOT = process.env.MANGA_OCR_TEST_ROOT || ''
@@ -73,7 +72,7 @@ async function main() {
   await ensureMangaModels()
 
   let t = process.hrtime.bigint()
-  await detector.load(modelPath(detectorModel))
+  await detector.load(modelPath(detectorModel), { executionProviders: process.platform === 'win32' ? ['dml', 'cpu'] : ['cpu'] })
   await recognizer.load(path.join(modelRoot, 'manga-ocr'))
   console.log(`模型加载完成 ${ms(t).toFixed(0)} ms`)
   console.log(`OCR encoder：${recognizer.encoderFileUsed}`)

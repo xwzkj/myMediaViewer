@@ -1,6 +1,6 @@
 /**
  * 精简日志：只输出接口调用、关键操作、队列进度和报错，不再逐请求打印流水账。
- * 需要 Fastify 自带的完整请求日志（含请求头、响应头）时，用 LOG_LEVEL=debug 启动。
+ * 需要 Fastify 自带的默认逐请求日志时，用 LOG_LEVEL=debug 启动。
  */
 export const debugLogging = (process.env.LOG_LEVEL || '').trim().toLowerCase() === 'debug'
 
