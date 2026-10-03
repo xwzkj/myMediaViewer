@@ -10,7 +10,8 @@
   "scripts": {
     "dev": "concurrently -k -n server,web \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
     "build": "vue-tsc --noEmit && tsc -p tsconfig.server.json && vite build",
-    "start": "node dist-server/server/index.js",
+    "start": "pnpm run build && node dist-server/server/index.js",
+    "serve": "node dist-server/server/index.js",
     "test": "tsx --test tests/*.test.ts",
     "test:fixtures": "tsx tests/preview-fixtures.ts",
     "test:search": "tsx tests/search-benchmark.ts"

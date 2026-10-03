@@ -10,9 +10,10 @@
 
 ```powershell
 pnpm install
-pnpm build
 pnpm start
 ```
+
+`pnpm start` 会先构建再启动。只想启动已经构建好的产物、不重新构建时用 `pnpm serve`。
 
 打开 `http://localhost:3210`，进入「媒体库设置」点击「添加目录」，在文件夹选择器中打开磁盘、逐级浏览文件夹，再点击「选择此文件夹」。支持面包屑返回、上一级、当前层级名称筛选和已添加目录快捷入口，无需手动输入路径。选择器浏览的是**运行服务的电脑**，手机也可以直接操作，不会上传文件。目录名称默认使用文件夹名称，可自行修改。
 
@@ -164,12 +165,12 @@ pnpm build
 ```
 myMediaViewer/
 ├── index.html                  前端入口 HTML
-├── package.json                依赖与脚本（dev / build / start / test / test:search / test:fixtures）
+├── package.json                依赖与脚本（dev / build / start / serve / test / test:search / test:fixtures）
 ├── vite.config.ts              Vite 配置：Vue 插件、/api 代理到 3210、ES2022 构建目标
 ├── tsconfig.json               前端与共享代码的 TypeScript 配置（noEmit）
 ├── tsconfig.server.json        服务端编译配置，输出到 dist-server
 ├── pnpm-workspace.yaml         pnpm 构建脚本许可（esbuild、sharp、onnxruntime-node）
-├── start.bat                   Windows 一键启动（pnpm start）
+├── start.bat                   Windows 一键启动（pnpm start，先构建再启动）
 ├── .gitignore                  忽略 node_modules、构建产物、data 等
 ├── public/
 │   └── favicon.svg             站点图标
