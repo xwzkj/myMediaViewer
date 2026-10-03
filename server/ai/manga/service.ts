@@ -8,6 +8,7 @@ import { getAiSettings, translateMangaTexts } from '../../ai.js'
 import { cacheDir, dataDir } from '../../config.js'
 import { db, type StoredAsset } from '../../database.js'
 import { ComicTextDetector } from './detector.js'
+import { createTranslationLimiter } from './concurrency.js'
 import { eraseTranslatedRegions, type EraseRegion } from './erase.js'
 import { judgeRegion, mangaReadingOrder, trimTrailingNoise } from './pipeline.js'
 import { MangaOcrRecognizer } from './recognizer.js'
@@ -161,7 +162,7 @@ interface PreparedPage {
 }
 
 /**
- * 三种流水线模式共用「本地识别」这一段：检测 + OCR + 筛选。
+ * 批量与异步流水线共用「本地识别」这一段：检测 + OCR + 筛选。
  * 不涉及大模型调用，也不写任何缓存。
  */
 async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void): Promise<PreparedPage> {
@@ -335,6 +336,7 @@ async function runJob(job: InternalJob, assets: StoredAsset[], force: boolean): 
   logInfo('任务', `${jobLabel(job)} 开始处理 · 共 ${assets.length} 张 · 模式 ${modeLabel(mode)}`)
   try {
     if (mode === 'sequential') await runSequential(job, assets, force)
+    else if (mode === 'streaming') await runStreaming(job, assets, force)
     else await runBatched(job, assets, force, mode)
     finishJob(job, assets.length, jobStarted)
   } catch (error) {
@@ -350,6 +352,7 @@ async function runJob(job: InternalJob, assets: StoredAsset[], force: boolean): 
 function modeLabel(mode: MangaPipelineMode): string {
   return mode === 'merged' ? '先批量识别再合并翻译'
     : mode === 'parallel' ? '先批量识别再并发翻译'
+    : mode === 'streaming' ? '边识别边并发翻译'
     : '逐页处理'
 }
 
@@ -397,11 +400,78 @@ async function runSequential(job: InternalJob, assets: StoredAsset[], force: boo
   }
 }
 
+/** 本地识别逐页进行，识别结果立即进入独立的限流翻译队列。 */
+async function runStreaming(job: InternalJob, assets: StoredAsset[], force: boolean): Promise<void> {
+  const concurrency = getAiSettings().mangaConcurrency
+  const translate = createTranslationLimiter(concurrency)
+  const pending: Promise<void>[] = []
+  let recognized = 0
+  let recognitionStage = '准备识别'
+  const updateStage = () => {
+    job.completed = (job.results?.length || 0) + (job.failed?.length || 0)
+    job.progress = Math.round(job.completed / assets.length * 100)
+    job.stage = `识别 ${recognized}/${assets.length} · 完成 ${job.completed}/${assets.length} · ${recognitionStage}`
+  }
+  const fail = (asset: StoredAsset, error: unknown, prefix: string) => {
+    recordFailure(job, asset, error, () => {}, prefix)
+    updateStage()
+  }
+  const finishPage = async (page: PreparedPage, prefix: string) => {
+    try {
+      const translated = await translate(() => translateMangaTexts({
+        texts: page.kept.map(region => region.text),
+        targetLanguage: page.targetLanguage,
+      }))
+      const result = await finalizePage(page, translated.translations, translated.model)
+      pushResult(job, page.asset.id, result, assets.length)
+      logInfo('任务', `${jobLabel(job)} ${prefix}完成 · ${result.regions.length} 处文本`)
+    } catch (error) {
+      fail(page.asset, error, prefix)
+    }
+    updateStage()
+  }
+
+  // 翻译等待网络响应或并发名额时，不占用本地推理队列。
+  try {
+    for (let i = 0; i < assets.length; i++) {
+      const asset = assets[i]!
+      const prefix = `第 ${i + 1}/${assets.length} 张 · `
+      job.currentAssetId = asset.id
+      recognitionStage = `${prefix}准备识别`
+      updateStage()
+      try {
+        const info = job.prepared.get(asset.id) || await prepareAsset(asset, force)
+        if (info.cached) {
+          pushResult(job, asset.id, info.cached, assets.length)
+        } else {
+          const page = await runInference(() => recognizePage(asset, info, stage => {
+            recognitionStage = `${prefix}${stage}`
+            updateStage()
+          }))
+          logInfo('任务', `${jobLabel(job)} ${prefix}识别完成 · ${page.kept.length} 处文本 · 检测 ${formatDuration(page.detectionMs)} / OCR ${formatDuration(page.ocrMs)}`)
+          if (page.empty) pushResult(job, asset.id, page.empty, assets.length)
+          else pending.push(finishPage(page, prefix))
+        }
+      } catch (error) {
+        fail(asset, error, prefix)
+      }
+      recognized++
+      updateStage()
+    }
+    delete job.currentAssetId
+    recognitionStage = `等待翻译与译图生成（并发 ${concurrency}）`
+    updateStage()
+  } finally {
+    // 所有已排队页面落盘或失败后，才允许任务进入最终状态。
+    await Promise.all(pending)
+  }
+}
+
 /**
  * 批量模式：先把所有页的检测与 OCR 跑完，再进入翻译阶段。
  * merged 把所有文本合并成尽量少的几次调用；parallel 按页并发、受并发数限制。
  */
-async function runBatched(job: InternalJob, assets: StoredAsset[], force: boolean, mode: MangaPipelineMode): Promise<void> {
+async function runBatched(job: InternalJob, assets: StoredAsset[], force: boolean, mode: 'merged' | 'parallel'): Promise<void> {
   // ── 阶段一：本地识别（检测 + OCR）──
   const prepared: PreparedPage[] = []
   for (let i = 0; i < assets.length; i++) {

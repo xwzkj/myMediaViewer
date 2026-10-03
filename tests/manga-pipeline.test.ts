@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -16,23 +16,24 @@ function save(patch: Record<string, unknown>) {
   })
 }
 
-test('漫画流水线默认逐页处理、并发数 3', () => {
+test('漫画流水线默认边识别边并发翻译、并发数 3', () => {
   save({})
   const settings = getAiSettings()
-  assert.equal(settings.mangaPipelineMode, 'sequential')
+  assert.equal(settings.mangaPipelineMode, 'streaming')
   assert.equal(settings.mangaConcurrency, 3)
 })
 
-test('三种流水线模式都能保存并读回', () => {
-  for (const mode of ['sequential', 'merged', 'parallel'] as const) {
+test('四种流水线模式都能保存并读回', () => {
+  for (const mode of ['sequential', 'merged', 'parallel', 'streaming'] as const) {
     save({ mangaPipelineMode: mode })
     assert.equal(getAiSettings().mangaPipelineMode, mode)
   }
 })
 
-test('非法模式回落到逐页处理', () => {
+test('非法模式回落到默认异步模式', () => {
+  save({ mangaPipelineMode: 'sequential' })
   save({ mangaPipelineMode: 'turbo' })
-  assert.equal(getAiSettings().mangaPipelineMode, 'sequential')
+  assert.equal(getAiSettings().mangaPipelineMode, 'streaming')
 })
 
 test('并发数被夹在 1 - 10 之间', () => {
@@ -46,10 +47,12 @@ test('并发数被夹在 1 - 10 之间', () => {
   assert.equal(getAiSettings().mangaConcurrency, 3)
 })
 
-test('旧配置缺少新字段时自动补默认值', () => {
+test('旧配置缺少新字段时自动补默认值', async () => {
   // 直接写一份不含新字段的配置，模拟升级前的 ai.json
-  save({})
-  const settings = getAiSettings()
-  assert.equal(settings.mangaPipelineMode, 'sequential')
+  writeFileSync(path.join(process.env.MEDIA_DATA_DIR!, 'ai.json'), JSON.stringify({ model: 'm' }))
+  const modulePath = '../server/ai.js?legacy-settings'
+  const { getAiSettings: readLegacySettings } = await import(modulePath)
+  const settings = readLegacySettings()
+  assert.equal(settings.mangaPipelineMode, 'streaming')
   assert.equal(settings.mangaConcurrency, 3)
 })

@@ -26,7 +26,7 @@ const defaults: AiSettings = {
   // 直接合并进请求体的自定义参数，例如关闭思考、思考等级、思考预算、温度等。
   params: { thinking: { type: 'disabled' } },
   timeoutMs: 120000,
-  mangaPipelineMode: 'sequential',
+  mangaPipelineMode: 'streaming',
   mangaConcurrency: 3,
 }
 
@@ -53,7 +53,7 @@ function asAppendPrompt(raw: Record<string, unknown>): string {
   return typeof raw.appendPrompt === 'string' ? raw.appendPrompt : DEFAULT_APPEND_PROMPT
 }
 
-const PIPELINE_MODES = ['sequential', 'merged', 'parallel'] as const
+const PIPELINE_MODES = ['sequential', 'merged', 'parallel', 'streaming'] as const
 function asPipelineMode(value: unknown, fallback: AiSettings['mangaPipelineMode']): AiSettings['mangaPipelineMode'] {
   return typeof value === 'string' && (PIPELINE_MODES as readonly string[]).includes(value)
     ? value as AiSettings['mangaPipelineMode']

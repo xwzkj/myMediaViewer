@@ -33,7 +33,7 @@ export interface TagSuggestionsResponse { items: TagSuggestion[]; total: number 
  * - merged：先把所有页检测与 OCR 完，再把整部文本合并成尽量少的几次大模型调用。
  * - parallel：同 merged 的本地识别阶段，但按页并发调用大模型，并发数可配置。
  */
-export type MangaPipelineMode = 'sequential' | 'merged' | 'parallel'
+export type MangaPipelineMode = 'sequential' | 'merged' | 'parallel' | 'streaming'
 
 // AI 翻译：服务端保存的接口配置。
 export interface AiSettings {

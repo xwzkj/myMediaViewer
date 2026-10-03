@@ -20,7 +20,7 @@ const paramsText = ref('{}')
 const showKey = ref(false)
 // 界面展示与编辑使用“秒”，保存与请求时换算为毫秒
 const timeoutSeconds = ref(120)
-const pipelineMode = ref<AiSettings['mangaPipelineMode']>('sequential')
+const pipelineMode = ref<AiSettings['mangaPipelineMode']>('streaming')
 const concurrency = ref(3)
 
 const paramsExample = '{\n  "reasoning_effort": "low",\n  "thinking": { "type": "disabled" },\n  "thinking_budget": 1024,\n  "temperature": 0.3\n}'
@@ -37,7 +37,7 @@ function apply(data: AiSettings) {
   settings.value = data
   paramsText.value = JSON.stringify(data.params || {}, null, 2)
   timeoutSeconds.value = Math.max(5, Math.round((data.timeoutMs || 120000) / 1000))
-  pipelineMode.value = data.mangaPipelineMode || 'sequential'
+  pipelineMode.value = data.mangaPipelineMode || 'streaming'
   concurrency.value = Math.min(10, Math.max(1, data.mangaConcurrency || 3))
 }
 
@@ -163,11 +163,18 @@ function pickModel(model: string) {
             <input v-model="pipelineMode" name="manga-pipeline" type="radio" value="parallel" />
             <span class="pipeline-copy">
               <span class="pipeline-name">先批量识别，再并发翻译</span>
-              <span class="pipeline-desc">识别阶段同上，之后每页各发一个请求并按并发数同时进行。速度最快，失败只影响单页。</span>
+              <span class="pipeline-desc">识别阶段同上，之后每页各发一个请求并按并发数同时进行。失败只影响单页。</span>
+            </span>
+          </label>
+          <label class="pipeline-option" :class="{ active: pipelineMode === 'streaming' }">
+            <input v-model="pipelineMode" name="manga-pipeline" type="radio" value="streaming" />
+            <span class="pipeline-copy">
+              <span class="pipeline-name">边识别边并发翻译</span>
+              <span class="pipeline-desc">速度最快。每识别完一张就排入翻译队列，同时继续识别下一张。翻译达到并发上限时等待空位，失败只影响单页。</span>
             </span>
           </label>
         </div>
-        <label v-if="pipelineMode === 'parallel'" class="concurrency-field">并发数<input v-model.number="concurrency" type="number" min="1" max="10" step="1" /><span>同时进行的翻译请求数，1 - 10，默认 3。接口限流时调小。</span></label>
+        <label v-if="pipelineMode === 'parallel' || pipelineMode === 'streaming'" class="concurrency-field">并发数<input v-model.number="concurrency" type="number" min="1" max="10" step="1" /><span>同时进行的翻译请求数，1 - 10，默认 3。接口限流时调小。</span></label>
       </div>
       <div class="ai-actions">
         <button type="button" class="button tonal" :disabled="testing || saving" @click="test"><Icon name="sparkle" :size="18" />{{ testing ? '正在测试…' : '测试连接' }}</button>
