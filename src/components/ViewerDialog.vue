@@ -1,16 +1,18 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, nextTick, onMounted, onBeforeUnmount, onUnmounted, watch } from 'vue'
 import type { AiTranslateFields, AiTranslateResult, MangaJob, MangaPageResult, WorkDetail, Work } from '../../shared/types'
 import { Viewer } from 'v-viewer'
 import { api, formatSize, kindLabel } from '../api'
 import Icon from './Icon.vue'
 import { drawMangaRegion } from '../manga-layout'
+import { vReleaseVideo, releaseVideos } from '../video-lifecycle'
 
 const props = defineProps<{ work: Work; page?: boolean }>()
 const emit = defineEmits<{ close: []; favorite: [work: Work]; notice: [message: string, action?: { label: string; handler: () => void }, tone?: 'info' | 'error']; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
 const root = ref<HTMLDialogElement | HTMLElement>()
 const stage = ref<HTMLElement>()
 const video = ref<HTMLVideoElement>()
+onBeforeUnmount(() => { if (root.value) releaseVideos(root.value) })
 const detail = ref<WorkDetail | null>(null)
 const index = ref(0)
 const error = ref('')
@@ -91,6 +93,7 @@ onMounted(async () => {
     if (gap > 0) document.body.style.paddingRight = `${gap}px`
   }
   await load()
+  if (disposed) return
   timer = setInterval(() => { if (slideshow.value && !isVideo.value && !previewing.value) next(1, true) }, 4500)
 })
 // 滑动切换到别的作品后重新取详情，并回到第一张。
@@ -217,6 +220,11 @@ function pointerDown(event: PointerEvent) {
 function pointerMove(event: PointerEvent) { if (event.pointerType === 'mouse') moveGesture(event.pointerId, event.clientX, event.clientY) }
 function pointerUp(event: PointerEvent) { if (event.pointerType === 'mouse') endGesture(event.pointerId, event.clientX, event.clientY) }
 function pointerCancel() { gesture = null; dragX.value = 0 }
+function suppressGestureClick(event: MouseEvent) {
+  if (!suppressClick) return
+  event.preventDefault()
+  event.stopPropagation()
+}
 // 触屏用 touch 事件，滑到视频画面上也能收到（视频控件不会把它吞掉）。
 function touchStart(event: TouchEvent) {
   const touch = event.changedTouches[0]
@@ -466,21 +474,22 @@ async function makeCompatible() {
   catch (e) { converting.value = false; convertMessage.value = (e as Error).message }
 }
 function closeRoot() {
+  if (root.value) releaseVideos(root.value)
   if (props.page) emit('close')
   else if (root.value instanceof HTMLDialogElement) root.value.close()
 }
 </script>
 
 <template>
-  <component :is="page ? 'main' : 'dialog'" ref="root" class="viewer-dialog" :class="{ 'viewer-page': page }" :aria-label="work.title" @close="emit('close')" @cancel="onCancel" @keydown="keyboard" @pointerdown="pointerDown" @pointermove="pointerMove" @pointerup="pointerUp" @pointercancel="pointerCancel" @touchstart.passive="touchStart" @touchmove.passive="touchMove" @touchend="touchEnd" @touchcancel="touchCancel">
+  <component :is="page ? 'main' : 'dialog'" ref="root" class="viewer-dialog" :class="{ 'viewer-page': page }" :aria-label="work.title" @close="emit('close')" @cancel="onCancel" @keydown="keyboard" @click.capture="suppressGestureClick" @pointerdown="pointerDown" @pointermove="pointerMove" @pointerup="pointerUp" @pointercancel="pointerCancel" @touchstart.passive="touchStart" @touchmove.passive="touchMove" @touchend="touchEnd" @touchcancel="touchCancel">
     <div class="viewer-content">
       <div class="viewer-main">
         <div ref="stage" class="media-stage" :style="dragX ? { transform: `translateX(${dragX}px)`, transition: 'none' } : undefined">
-          <Transition :name="slideName" mode="out-in">
+          <Transition :name="slideName" mode="out-in" @before-leave="releaseVideos">
             <div :key="mediaKey" class="media-frame">
               <p v-if="error" class="inline-error">{{ error }}</p><div v-else-if="!asset" class="loading-state"><span class="spinner" />正在打开作品…</div>
               <template v-else>
-                <video v-if="isVideo" ref="video" :key="mediaUrl" :src="mediaUrl" :poster="asset.thumbnail" controls playsinline preload="metadata" :autoplay="slideshow || asset.kind === 'animation'" :muted="asset.kind === 'animation'" :loop="asset.kind === 'animation' && !slideshow" @error="mediaError = true" @ended="slideshow && next(1, true)" />
+                <video v-if="isVideo" v-release-video ref="video" :key="mediaUrl" :src="mediaUrl" :poster="asset.thumbnail" controls playsinline preload="metadata" :autoplay="slideshow || asset.kind === 'animation'" :muted="asset.kind === 'animation'" :loop="asset.kind === 'animation' && !slideshow" @error="mediaError = true" @ended="slideshow && next(1, true)" />
                 <canvas v-else-if="mangaResult && mangaMode === 'translated' && mangaResult.regions.length" :key="mangaResult.key" ref="mangaCanvas" class="manga-canvas" :width="mangaResult.width" :height="mangaResult.height" :aria-label="`${work.title}，第 ${index + 1} 张的漫画译图`" @click="openPreview" />
                 <img v-else :key="asset.id" :src="asset.url" draggable="false" :alt="`${work.title}，第 ${index + 1} 张`" @click="openPreview" @error="mediaError = true" />
                 <div v-if="mediaError" class="media-error"><Icon name="warning" :size="32" /><p>{{ isVideo ? '浏览器无法播放这个视频' : '无法读取这张图片' }}</p><button v-if="isVideo" class="button tonal" :disabled="converting" @click="makeCompatible">{{ converting ? '正在处理…' : '生成兼容版本' }}</button></div>
