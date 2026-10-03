@@ -591,8 +591,8 @@ function closeRoot() {
           </button>
         </div>
         <div v-if="mangaScopeOpen && !mangaBusy" class="manga-scope-menu" role="menu" aria-label="选择漫画翻译范围">
-          <button type="button" role="menuitem" @click="runMangaTranslation('page', Boolean(mangaResult))">翻译本页</button>
-          <button type="button" role="menuitem" @click="runMangaTranslation('work')">翻译整部 · {{ mangaPageAssets.length }} 张</button>
+          <button type="button" role="menuitem" @click="runMangaTranslation('page', Boolean(mangaResult))">{{ mangaResult ? '重新翻译本页' : '翻译本页' }}</button>
+          <button type="button" role="menuitem" @click="runMangaTranslation('work', Boolean(mangaResult))">{{ mangaResult ? '重新翻译整部' : '翻译整部' }} · {{ mangaPageAssets.length }} 张</button>
         </div>
         <p v-if="mangaBusy && mangaJob?.stage" class="manga-progress" role="status">
           <span class="spinner" />当前进度：{{ mangaJob.stage }}
