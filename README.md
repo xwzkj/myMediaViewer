@@ -2,6 +2,8 @@
 
 本地媒体查看器，使用 Vue 3、TypeScript、Vite、Fastify 和 SQLite。界面按 Material Design 3 的色彩角色、曲面、圆角、导航和状态设计，支持浅色 / 深色模式及手机布局。可选 AI 翻译支持作品信息与漫画图片，兼容 OpenAI 接口。
 
+项目使用codex编写
+
 ## 启动
 
 需要 Node.js 24 或更新版本、pnpm 11。FFmpeg 为可选依赖，用于视频封面和兼容版本；AI 翻译需要自行准备 OpenAI 兼容接口的地址与 Token，漫画图片翻译还需要手动放置本地 ONNX 模型（见「AI 翻译」）。
