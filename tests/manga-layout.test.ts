@@ -137,7 +137,7 @@ function recordingContext() {
   return { ctx, calls }
 }
 
-test('竖排从左往右排，列内自上而下', () => {
+test('竖排从右往左排，列内自上而下', () => {
   const { ctx, calls } = recordingContext()
   // 窄高气泡：宽 120、高 300，足够放下多列
   drawMangaRegion(ctx, { x: 0, y: 0, width: 120, height: 300, translation: '一二三四五六七八九十' })
@@ -152,10 +152,10 @@ test('竖排从左往右排，列内自上而下', () => {
   for (const column of byX.values()) {
     for (let i = 1; i < column.length; i++) assert.ok(column[i]!.y > column[i - 1]!.y, '列内应自上而下')
   }
-  // 列与列之间：先画的列 x 更小，即整体从左往右
+  // 列与列之间：先画的列 x 更大，即整体从右往左
   const firstColumnX = calls[0]!.x
   const lastColumnX = calls[calls.length - 1]!.x
-  assert.ok(lastColumnX > firstColumnX, '后画的列应在右侧，整体从左往右')
+  assert.ok(lastColumnX < firstColumnX, '后画的列应在左侧，整体从右往左')
 })
 
 test('竖排整块文字在气泡里居中', () => {

@@ -1,6 +1,6 @@
 /**
  * 漫画译文的排版：把一段译文塞进检测框里，横排塞不下、或者窄高气泡横排后
- * 每行只剩两三个字时改用竖排（从左往右），列内自上而下。
+ * 每行只剩两三个字时改用竖排（从右往左），列内自上而下。
  *
  * 这里只做「选哪种排法、每行/每列放哪些字、用多大字号」，具体绘制由调用方
  * 负责，便于用假的测量上下文做单元测试。
@@ -44,7 +44,7 @@ export interface MangaDrawRegion {
 
 export interface MangaTextLayout {
   size: number
-  /** true 表示 lines 是竖排列（每列自上而下，整体从左往右），否则是横排行。 */
+  /** true 表示 lines 是竖排列（每列自上而下，整体从右往左），否则是横排行。 */
   vertical: boolean
   lines: string[]
 }
@@ -165,12 +165,12 @@ export function drawMangaRegion(ctx: TextDrawContext, region: MangaDrawRegion) {
   ctx.textAlign = 'center'
   ctx.textBaseline = 'middle'
   if (layout.vertical) {
-    // 竖排：从左往右排列，列内自上而下，整块文字在气泡里居中。
+    // 竖排：从右往左排列，列内自上而下，整块文字在气泡里居中。
     const pitch = layout.size * MANGA_COLUMN_PITCH
     const blockWidth = layout.lines.length * pitch
-    const firstX = region.x + (region.width - blockWidth) / 2 + pitch / 2
+    const firstX = region.x + (region.width + blockWidth) / 2 - pitch / 2
     layout.lines.forEach((column, columnIndex) => {
-      const x = firstX + columnIndex * pitch
+      const x = firstX - columnIndex * pitch
       const startY = region.y + (region.height - (column.length - 1) * pitch) / 2
       for (let i = 0; i < column.length; i++) ctx.fillText(column[i]!, x, startY + i * pitch)
     })
