@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import * as ort from 'onnxruntime-node'
@@ -6,30 +7,31 @@ import sharp from 'sharp'
 /**
  * kha-white/manga-ocr-base 的 ONNX 推理实现，ViT(DeiT) encoder + GPT-2 decoder。
  *
+ * 模型来自 HuggingFace（onnx-community/manga-ocr-base-ONNX），不再依赖第三方
+ * 导出的模型包，因此不再需要 config.json —— 这些超参就是该模型的固定属性。
+ *
  * 与原版一致、不能改的三处：
  *  1. 预处理是 `PIL Image.convert('L').convert('RGB')` 的等价物 —— 用 BT.601 权重转
  *     灰度后**复制成三通道**，再 (v-0.5)/0.5。直接喂彩色会掉精度。
- *  2. 输入尺寸从 config.json 读（**实测是 224，不是 384**）。
+ *  2. 输入尺寸 224（模型固定）。
  *  3. 贪心解码，输入从 BOS 开始逐 token 增长；decoder 没有 past_key_values，
  *     每步都要重算整段前缀。
  */
 
-const MODEL_IMAGE_SIZE_FALLBACK = 224
-const DEFAULT_MAX_LENGTH = 300
+/** 模型固定超参：manga-ocr-base 的结构与分词设置。 */
+const IMAGE_SIZE = 224
+const IMAGE_MEAN = 0.5
+const IMAGE_STD = 0.5
+const BOS_TOKEN_ID = 2
+const EOS_TOKEN_ID = 3
+const PAD_TOKEN_ID = 0
+const MAX_LENGTH = 300
 
-export interface OcrConfig {
-  encoderFile: string
-  decoderFile: string
-  vocabFile: string
-  imageSize: number
-  imageMean: number[]
-  imageStd: number[]
-  bosTokenId: number
-  eosTokenId: number
-  padTokenId: number
-  vocabSize: number
-  maxLength: number
-}
+/** 两个 encoder 变体，以及各自的解码器与词表。 */
+export const ENCODER_FP16 = 'encoder_model_fp16.onnx'
+export const ENCODER_QUANTIZED = 'encoder_model_quantized.onnx'
+export const DECODER_FILE = 'decoder_model_quantized.onnx'
+export const VOCAB_FILE = 'vocab.txt'
 
 export interface RecognizerOptions {
   /**
@@ -57,36 +59,69 @@ export class MangaOcrRecognizer {
   private encoder: ort.InferenceSession | null = null
   private decoder: ort.InferenceSession | null = null
   private vocab: string[] = []
-  private config: OcrConfig | null = null
+  /** 实际选中的 encoder 文件，以及模型的输入输出名（不同导出批次命名不一样）。 */
+  private encoderFileName = ''
+  private encoderInputName = 'pixel_values'
+  private encoderOutputName = 'last_hidden_state'
 
   get isLoaded() { return this.encoder !== null && this.decoder !== null }
-  get imageSize() { return this.config?.imageSize ?? MODEL_IMAGE_SIZE_FALLBACK }
-  get vocabSize() { return this.config?.vocabSize ?? this.vocab.length }
+  /** 供日志显示当前用的是量化版还是 fp16 加速版。 */
+  get encoderFileUsed() { return this.encoderFileName }
+  get imageSize() { return IMAGE_SIZE }
+  get vocabSize() { return this.vocab.length }
 
   async load(modelDir: string, options: RecognizerOptions = {}): Promise<void> {
     if (this.encoder && this.decoder) return
-    const config = parseConfig(JSON.parse(await readFile(path.join(modelDir, 'config.json'), 'utf8')))
-    this.config = config
-    this.vocab = JSON.parse(await readFile(path.join(modelDir, config.vocabFile), 'utf8')) as string[]
+    this.vocab = await loadVocab(modelDir)
 
     const common: ort.InferenceSession.SessionOptions = {
       intraOpNumThreads: options.intraOpNumThreads ?? 0,
     }
-    this.encoder = await ort.InferenceSession.create(path.join(modelDir, config.encoderFile), {
-      ...common,
-      executionProviders: options.encoderProviders ?? ['dml', 'cpu'],
-    })
-    this.decoder = await ort.InferenceSession.create(path.join(modelDir, config.decoderFile), {
+    const encoderProviders = options.encoderProviders ?? ['dml', 'cpu']
+    const fp16Path = path.join(modelDir, ENCODER_FP16)
+    const quantizedPath = path.join(modelDir, ENCODER_QUANTIZED)
+
+    // fp16 encoder 在 DirectML 上比动态量化版快约 4 倍，但在 CPU 上反而慢 3 倍。
+    // 所以先用「只指定 dml」建一次会话做探测：成功说明 GPU 路径真的可用，才用 fp16；
+    // 失败（没有独显、驱动太旧）就退回量化版，继续走 dml → cpu 的回退链。
+    let encoder: ort.InferenceSession | null = null
+    if (encoderProviders.includes('dml') && existsSync(fp16Path)) {
+      try {
+        encoder = await ort.InferenceSession.create(fp16Path, { ...common, executionProviders: ['dml'] })
+        this.encoderFileName = ENCODER_FP16
+      } catch { encoder = null }
+    }
+    // 回退顺序：量化版优先（CPU 上更快）；只装了 fp16 时也接受它，慢但能跑。
+    if (!encoder && existsSync(quantizedPath)) {
+      encoder = await ort.InferenceSession.create(quantizedPath, {
+        ...common,
+        executionProviders: encoderProviders,
+      })
+      this.encoderFileName = ENCODER_QUANTIZED
+    }
+    if (!encoder && existsSync(fp16Path)) {
+      encoder = await ort.InferenceSession.create(fp16Path, {
+        ...common,
+        executionProviders: encoderProviders,
+      })
+      this.encoderFileName = ENCODER_FP16
+    }
+    if (!encoder) {
+      throw new Error('缺少 encoder 模型：' + quantizedPath + ' 或 ' + fp16Path + ' 至少要有一个')
+    }
+    this.encoder = encoder
+
+    this.decoder = await ort.InferenceSession.create(path.join(modelDir, DECODER_FILE), {
       ...common,
       executionProviders: options.decoderProviders ?? ['cpu'],
     })
 
-    // 以 ONNX 实际输入形状为准，config 只作交叉校验 —— 两者不一致时以模型为准。
-    const declared = this.encoder.inputMetadata[0]
-    const modelSize = declared?.isTensor ? Number(declared.shape[2]) : Number.NaN
-    if (Number.isFinite(modelSize) && modelSize !== config.imageSize) {
-      config.imageSize = modelSize
-    }
+    // 输出名随导出批次变化（last_hidden_state / encoder_hidden_states），按名字取，取不到再退回第一个输出。
+    this.encoderInputName = this.encoder.inputNames[0] ?? 'pixel_values'
+    this.encoderOutputName = this.encoder.outputNames.find(name => name === 'last_hidden_state')
+      ?? this.encoder.outputNames.find(name => name === 'encoder_hidden_states')
+      ?? this.encoder.outputNames[0]
+      ?? 'last_hidden_state'
   }
 
   async release(): Promise<void> {
@@ -107,21 +142,21 @@ export class MangaOcrRecognizer {
     crops: CropRect[],
     onProgress?: (completed: number, total: number) => void,
   ): Promise<OcrResult[]> {
-    if (!this.encoder || !this.decoder || !this.config) throw new Error('manga-ocr 模型未加载')
+    if (!this.encoder || !this.decoder) throw new Error('manga-ocr 模型未加载')
     if (!crops.length) return []
-    const size = this.config.imageSize
+    const size = IMAGE_SIZE
     const plane = size * size
     const batch = new Float32Array(crops.length * 3 * plane)
     for (let i = 0; i < crops.length; i++) {
       const pixels = await cropToSquareRgb(pageRaw, pageWidth, pageHeight, crops[i]!, size)
-      writeGrayscaleChw(batch, i * 3 * plane, pixels, this.config)
+      writeGrayscaleChw(batch, i * 3 * plane, pixels)
     }
 
     const encOut = await this.encoder.run({
-      pixel_values: new ort.Tensor('float32', batch, [crops.length, 3, size, size]),
+      [this.encoderInputName]: new ort.Tensor('float32', batch, [crops.length, 3, size, size]),
     })
     try {
-      const hiddenTensor = encOut.encoder_hidden_states as ort.Tensor
+      const hiddenTensor = encOut[this.encoderOutputName] as ort.Tensor
       const hiddenDims = hiddenTensor.dims
       const seq = Number(hiddenDims[1])
       const dim = Number(hiddenDims[2])
@@ -137,20 +172,19 @@ export class MangaOcrRecognizer {
       }
       return results
     } finally {
-      try { (encOut.encoder_hidden_states as ort.Tensor).dispose?.() } catch { /* 忽略 */ }
+      try { (encOut[this.encoderOutputName] as ort.Tensor).dispose?.() } catch { /* 忽略 */ }
     }
   }
 
   /** 贪心解码一段：每步取最后一个位置的 logits，argmax 即下一个 token。 */
   private async decodeOne(hidden: Float32Array, seq: number, dim: number): Promise<OcrResult> {
     const decoder = this.decoder!
-    const cfg = this.config!
     const vocabSize = this.vocabSize
-    const ids: number[] = [cfg.bosTokenId]
+    const ids: number[] = [BOS_TOKEN_ID]
     let logProbSum = 0
     let counted = 0
 
-    for (let step = 0; step < cfg.maxLength; step++) {
+    for (let step = 0; step < MAX_LENGTH; step++) {
       const out = await decoder.run({
         input_ids: new ort.Tensor('int64', BigInt64Array.from(ids, BigInt), [1, ids.length]),
         encoder_hidden_states: new ort.Tensor('float32', hidden, [1, seq, dim]),
@@ -169,7 +203,7 @@ export class MangaOcrRecognizer {
         let sum = 0
         for (let v = 0; v < vocabSize; v++) sum += Math.exp(logits[offset + v]! - maxVal)
         const logProb = -Math.log(sum)
-        if (idx === cfg.eosTokenId) break
+        if (idx === EOS_TOKEN_ID) break
         ids.push(idx)
         logProbSum += logProb
         counted++
@@ -187,8 +221,7 @@ export class MangaOcrRecognizer {
 
   /** 词表是 WordPiece（manga-ocr 实际用的）：`##` 前缀去掉后直接拼接，最后 NFKC 归一。 */
   private detokenize(ids: number[]): string {
-    const cfg = this.config!
-    const special = new Set([cfg.bosTokenId, cfg.eosTokenId, cfg.padTokenId])
+    const special = new Set([BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID])
     const specialText = new Set(['[CLS]', '[SEP]', '[PAD]', '[UNK]', '[MASK]'])
     const sb: string[] = []
     for (const id of ids) {
@@ -204,34 +237,21 @@ export class MangaOcrRecognizer {
 }
 
 /**
- * 解析 config.json。字段是 snake_case（由 Shaft 的导出脚本写出），
- * 这里统一映射成 camelCase，并对缺失项给默认值。
+ * 读词表。一行一个 token，共 6144 个。
+ *
+ * 不能改用按 \n 切分后过滤空串的写法：词表里有 3 个 token 本身就是空串，
+ * 过滤掉会让后面所有 token 的下标整体前移，解码结果全错。
  */
-export function parseConfig(raw: Record<string, unknown>): OcrConfig {
-  const num = (key: string, fallback: number): number => {
-    const v = Number(raw[key])
-    return Number.isFinite(v) ? v : fallback
-  }
-  const str = (key: string, fallback: string): string =>
-    typeof raw[key] === 'string' && (raw[key] as string).length ? raw[key] as string : fallback
-  const arr = (key: string): number[] => {
-    const v = raw[key]
-    return Array.isArray(v) && v.length >= 3 ? v.map(Number) : [0.5, 0.5, 0.5]
-  }
-  return {
-    encoderFile: str('encoder_file', 'encoder_model_quantized.onnx'),
-    decoderFile: str('decoder_file', 'decoder_model_quantized.onnx'),
-    vocabFile: str('vocab_file', 'vocab.json'),
-    imageSize: num('image_size', MODEL_IMAGE_SIZE_FALLBACK),
-    imageMean: arr('image_mean'),
-    imageStd: arr('image_std'),
-    bosTokenId: num('bos_token_id', 2),
-    eosTokenId: num('eos_token_id', 3),
-    padTokenId: num('pad_token_id', 0),
-    vocabSize: num('vocab_size', 0),
-    maxLength: num('max_length', DEFAULT_MAX_LENGTH),
-  }
+async function loadVocab(modelDir: string): Promise<string[]> {
+  const txtPath = path.join(modelDir, VOCAB_FILE)
+  if (!existsSync(txtPath)) throw new Error('缺少词表文件：' + txtPath)
+  const text = await readFile(txtPath, 'utf8')
+  const lines = text.split('\n')
+  // 末尾换行会多出一个空串，去掉它；中间的空 token 必须保留。
+  if (lines.length && lines[lines.length - 1] === '') lines.pop()
+  return lines.map(line => line.endsWith('\r') ? line.slice(0, -1) : line)
 }
+
 /** 裁一块并缩放到 size×size（直接拉伸，与上游 Bitmap.createScaledBitmap 行为一致）。 */
 async function cropToSquareRgb(
   pageRaw: Buffer, pageWidth: number, pageHeight: number, rect: CropRect, size: number,
@@ -248,18 +268,13 @@ async function cropToSquareRgb(
 }
 
 /** BT.601 灰度 → 复制三通道 → (v-mean)/std → CHW。 */
-function writeGrayscaleChw(
-  out: Float32Array, base: number, rgb: Buffer, cfg: OcrConfig,
-): void {
-  const size = cfg.imageSize
-  const plane = size * size
-  const mean = cfg.imageMean[0] ?? 0.5
-  const std = cfg.imageStd[0] ?? 0.5
+function writeGrayscaleChw(out: Float32Array, base: number, rgb: Buffer): void {
+  const plane = IMAGE_SIZE * IMAGE_SIZE
   for (let i = 0; i < plane; i++) {
     const r = rgb[i * 3]!
     const g = rgb[i * 3 + 1]!
     const b = rgb[i * 3 + 2]!
-    const v = ((0.299 * r + 0.587 * g + 0.114 * b) / 255 - mean) / std
+    const v = ((0.299 * r + 0.587 * g + 0.114 * b) / 255 - IMAGE_MEAN) / IMAGE_STD
     out[base + i] = v
     out[base + plane + i] = v
     out[base + 2 * plane + i] = v

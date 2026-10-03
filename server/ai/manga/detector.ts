@@ -5,7 +5,7 @@ import type { DetectionBox, DetectionResult, TextMask } from './types.js'
 /**
  * dmMaze/comic-text-detector，跑在 ONNX Runtime 上。
  *
- * 与上游（Pixiv-Shaft 的 ComicTextDetector.kt / dmMaze 的 inference 脚本）严格对齐的三处：
+ * 与 dmMaze 的 inference 脚本严格对齐的三处：
  *  1. letterbox 是**左上对齐**，padding 全部堆在右下，填充色黑。
  *     （常见实现在中心 padding，但该模型训练时看到的是右下 padding 分布。）
  *  2. 输入是 RGB/255，**不做 ImageNet 归一化**。

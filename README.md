@@ -64,20 +64,22 @@ AI 功能全部可选，未配置时不影响浏览、搜索和播放。设置�
 3. **翻译**：把这一页的文本作为 JSON 数组一次性交给 AI，要求返回等长、同顺序的译文数组；少返或漏返的条目回退原文。
 4. **回填**：用 CTD 的 mask 膨胀 1px 擦除原文，按文字框边缘估算气泡底色并回填；前端 Canvas 根据气泡尺寸自动换行、缩放后画上译文。译图与原文可随时切换，详情区还会列出逐条对照。
 
-两个模型分别基于 [dmMaze/comic-text-detector](https://github.com/dmMaze/comic-text-detector) 与 [kha-white/manga-ocr-base](https://huggingface.co/kha-white/manga-ocr-base)，需要自行准备 ONNX（量化）版本。模型文件手动放进 `data/models`，仓库和安装过程都不会下载：
+两个模型分别基于 [dmMaze/comic-text-detector](https://github.com/dmMaze/comic-text-detector) 与 [kha-white/manga-ocr-base](https://huggingface.co/kha-white/manga-ocr-base)，使用 HuggingFace 上的 ONNX 导出。模型不随仓库分发，**首次翻译时自动下载**到 `data/models`：
 
 ```text
 data/models/
 ├── manga-ocr/
-│   ├── config.json
-│   ├── encoder_model_quantized.onnx
+│   ├── encoder_model_fp16.onnx        # Windows 上优先（DirectML 快约 4 倍）
+│   ├── encoder_model_quantized.onnx   # 其余平台优先（CPU 上更快）
 │   ├── decoder_model_quantized.onnx
-│   └── vocab.json
+│   └── vocab.txt
 └── comic-text-detector/
-    └── comictextdetector.pt.onnx
+    └── comic-text-detector.onnx
 ```
 
-模型缺失时漫画任务会失败并提示路径，作品信息翻译不受影响。Windows 下 CTD 与 OCR encoder 优先使用 DirectML，失败自动回退 CPU；OCR decoder 固定在 CPU 上逐 token 解码。首次翻译需要加载模型，会明显慢一些。
+首次翻译会自动下载缺失的模型（检测模型 90 MB、fp16 encoder 164 MB、decoder 28 MB、词表），下载完成后再加载。模型下载与加载只在第一次翻译时发生，之后整个进程内复用同一份会话，后续翻译不再重新下载或重建。国内网络访问不了 huggingface.co 时，设置 `HF_ENDPOINT` 指向镜像站（例如 `HF_ENDPOINT=https://hf-mirror.com`）即可。
+
+Windows 下 CTD 与 OCR encoder 优先使用 DirectML，失败自动回退 CPU；OCR decoder 固定在 CPU 上逐 token 解码。两个 encoder 的分工：`encoder_model_fp16.onnx` 在 DirectML 上快约 4 倍（实测 5 张真实漫画页，本地 OCR 合计 2.5 秒降到 2.0 秒），识别出的重复幻觉也更少；`encoder_model_quantized.onnx` 是动态量化版，CPU 上更快。程序会先探测 DirectML 是否真的可用：可用就用 fp16，不可用自动改用量化版，无需手动切换。
 
 任务按「翻译本页」或「翻译整部」入队，前端轮询显示当前阶段；整部翻译逐张返回结果，单页失败不会中断其余页面，失败原因按页列出。译图按「文件内容哈希 + 目标语言 + 流水线版本」缓存：修改图片或切换目标语言会重新生成，其余情况直接复用 `data/cache/manga` 的译图底图和 SQLite 里的坐标、译文。
 
@@ -155,7 +157,7 @@ pnpm build
 
 `pnpm test:search` 对 2,500 组生成的描述进行独立性能测试，输出索引建立和多关键词、拼音、错字搜索耗时。`pnpm test:fixtures` 可在 `.cache/preview` 生成界面验证用的风景图、GIF 和视频，不会将样例加入正式媒体库。
 
-需要单独验证漫画识别时，运行 `pnpm exec tsx tests/manga-ocr-check.ts [图片路径...]`（依赖 `data/models`）：它只跑 CTD 检测与 manga-ocr 识别，把带框调试图和同名 JSON 写到 `test-results/manga-ocr`，加 `--full` 可输出完整 OCR 文本。
+需要单独验证漫画识别时，运行 `pnpm exec tsx tests/manga-ocr-check.ts [图片路径...]`：它只跑 CTD 检测与 manga-ocr 识别（缺模型时同样会自动下载），把带框调试图和同名 JSON 写到 `test-results/manga-ocr`，加 `--full` 可输出完整 OCR 文本。检测框会按生产路径加一圈 padding —— 紧贴文字的裁剪会让 manga-ocr 陷入重复输出，实测同一个框不加 padding 要 265 个 token / 1.5 秒，加了只要 68 个 token / 0.2 秒。
 
 ## 项目结构
 
@@ -223,7 +225,7 @@ myMediaViewer/
 │   ├── search-query.test.ts    搜索词解析单元测试
 │   ├── library-session.test.ts 列表会话隔离与相邻作品加载
 │   ├── search-benchmark.ts     2,500 组描述的搜索性能基准
-│   ├── manga-ocr-check.ts      CTD + manga-ocr 手动验证，输出调试图与 JSON
+│   ├── manga-ocr-check.ts      CTD + manga-ocr 手动验证，输出调试图与 JSON（裁剪带 padding，与生产一致）
 │   └── preview-fixtures.ts     生成界面验证用样例媒体
 ├── data/                       运行时数据，已忽略提交
 │   ├── sources.json            媒体目录配置

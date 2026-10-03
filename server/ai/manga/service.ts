@@ -12,9 +12,9 @@ import { eraseTranslatedRegions, type EraseRegion } from './erase.js'
 import { judgeRegion, mangaReadingOrder, trimTrailingNoise } from './pipeline.js'
 import { MangaOcrRecognizer } from './recognizer.js'
 import { formatDuration, logError, logInfo } from '../../log.js'
-import { boxToRect, type OcrRegion, type TextMask } from './types.js'
+import { boxToRect, paddedRect, type OcrRegion, type TextMask } from './types.js'
+import { alternateEncoder, decoderModel, detectorModel, ensureMangaModels, hasModel, missingModels, modelPath, modelRoot, preferredEncoder, vocabModel } from './models.js'
 
-const modelRoot = path.join(dataDir, 'models')
 const mangaCacheDir = path.join(cacheDir, 'manga')
 const PIPELINE_VERSION = 1
 const MAX_REGIONS = 80
@@ -39,28 +39,38 @@ const jobLabel = (job: InternalJob) => `漫画翻译 #${job.id.slice(0, 6)}`
 // 只有真正需要模型的页面才占用这个队列。缓存查询不排队，也不会被 GPU 任务挡住。
 let inferenceQueue: Promise<void> = Promise.resolve()
 
+/**
+ * 模型是否就位。encoder 有两个变体，装任意一个即可，所以单独判断，
+ * 不能直接套用 requiredModels()（那里面只列了首选变体）。
+ */
 export function getMangaModelStatus(): MangaModelStatus {
+  const preferred = preferredEncoder()
+  const alternate = alternateEncoder()
+  const encoderReady = hasModel(preferred) || hasModel(alternate)
+  const encoderNames = [path.basename(preferred.target), path.basename(alternate.target)]
+  const detectorReady = hasModel(detectorModel)
+  const decoderReady = hasModel(decoderModel)
+  const vocabReady = hasModel(vocabModel)
+
+  const detectorFiles = [path.basename(detectorModel.target)]
+  const ocrFiles = [...encoderNames, path.basename(decoderModel.target), path.basename(vocabModel.target)]
+  const detectorMissing = detectorReady ? [] : detectorFiles
+  const ocrMissing = [
+    ...(encoderReady ? [] : encoderNames),
+    ...(decoderReady ? [] : [path.basename(decoderModel.target)]),
+    ...(vocabReady ? [] : [path.basename(vocabModel.target)]),
+  ]
+
   const models = [
-    {
-      name: 'manga-ocr',
-      dir: path.join(modelRoot, 'manga-ocr'),
-      files: ['config.json', 'encoder_model_quantized.onnx', 'decoder_model_quantized.onnx', 'vocab.json'],
-    },
-    {
-      name: 'comic-text-detector',
-      dir: path.join(modelRoot, 'comic-text-detector'),
-      files: ['comictextdetector.pt.onnx'],
-    },
-  ].map(model => {
-    const missing = model.files.filter(file => !existsSync(path.join(model.dir, file)))
-    return { name: model.name, ready: missing.length === 0, files: model.files, missing }
-  })
+    { name: 'comic-text-detector', ready: detectorReady, files: detectorFiles, missing: detectorMissing },
+    { name: 'manga-ocr', ready: encoderReady && decoderReady && vocabReady, files: ocrFiles, missing: ocrMissing },
+  ]
   const ready = models.every(model => model.ready)
   return {
     ready,
     device: providers()[0] === 'dml' ? 'DirectML（不可用时回退 CPU）' : 'CPU',
     models,
-    message: ready ? undefined : `请把模型文件放到 ${modelRoot}`,
+    message: ready ? undefined : `首次翻译会自动下载模型到 ${modelRoot}；网络不通时设置 HF_ENDPOINT 指向镜像站`,
   }
 }
 
@@ -160,10 +170,8 @@ interface PreparedPage {
  * 不涉及大模型调用，也不写任何缓存。
  */
 async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void): Promise<PreparedPage> {
-  const status = getMangaModelStatus()
-  if (!status.ready) throw new Error(status.message || '本地漫画 OCR 模型未就绪')
-  setStage('加载本地识别模型')
-  await ensureModels()
+  setStage('准备本地识别模型')
+  await ensureModels(setStage)
 
   setStage('识别气泡区域')
   const detectStarted = Date.now()
@@ -530,10 +538,8 @@ async function processUncachedAsset(
   targetLanguage: string,
   setStage: (stage: string) => void,
 ): Promise<MangaPageResult> {
-  const status = getMangaModelStatus()
-  if (!status.ready) throw new Error(status.message || '本地漫画 OCR 模型未就绪')
-  setStage('加载本地识别模型')
-  await ensureModels()
+  setStage('准备本地识别模型')
+  await ensureModels(setStage)
 
   setStage('识别气泡区域')
   const detection = await detector.detect(asset.path)
@@ -632,29 +638,37 @@ function runInference<T>(task: () => Promise<T>): Promise<T> {
   return result
 }
 
-async function ensureModels(): Promise<void> {
+/**
+ * 保证模型就位并加载进内存。模型是懒加载的：首次翻译时才下载、加载，之后
+ * 一直复用同一份会话，直到进程退出，不会每次翻译都重建。
+ */
+async function ensureModels(setStage?: (stage: string) => void): Promise<void> {
   if (detector.isLoaded && recognizer.isLoaded) return
   if (!loading) {
-    loading = Promise.all([
-      detector.load(path.join(modelRoot, 'comic-text-detector', 'comictextdetector.pt.onnx'), { executionProviders: providers() }),
-      recognizer.load(path.join(modelRoot, 'manga-ocr'), { encoderProviders: providers(), decoderProviders: ['cpu'] }),
-    ]).then(() => undefined).finally(() => { loading = null })
-    logInfo('任务', '首次调用需要加载本地识别与 OCR 模型，耗时会长一些')
+    loading = (async () => {
+      // 只下载真正缺失的文件；全部就位时这一步不做任何网络请求。
+      if (missingModels().length) {
+        setStage?.('下载本地识别模型')
+        logInfo('任务', '首次调用需要下载本地识别与 OCR 模型，耗时会长一些')
+        await ensureMangaModels(undefined, progress => {
+          if (!progress.total) return
+          const percent = Math.round(progress.received / progress.total * 100)
+          setStage?.(`下载本地识别模型 ${percent}%`)
+        })
+      }
+      setStage?.('加载本地识别模型')
+      await Promise.all([
+        detector.load(modelPath(detectorModel), { executionProviders: providers() }),
+        recognizer.load(path.join(modelRoot, 'manga-ocr'), { encoderProviders: providers(), decoderProviders: ['cpu'] }),
+      ])
+      logInfo('任务', `本地 OCR encoder：${recognizer.encoderFileUsed}`)
+    })().finally(() => { loading = null })
   }
   return loading
 }
 
 function providers(): string[] {
   return process.platform === 'win32' ? ['dml', 'cpu'] : ['cpu']
-}
-
-function paddedRect(rect: { left: number; top: number; width: number; height: number }, pageWidth: number, pageHeight: number) {
-  const padding = Math.max(3, Math.round(Math.min(rect.width, rect.height) * 0.04))
-  const left = Math.max(0, rect.left - padding)
-  const top = Math.max(0, rect.top - padding)
-  const right = Math.min(pageWidth, rect.left + rect.width + padding)
-  const bottom = Math.min(pageHeight, rect.top + rect.height + padding)
-  return { left, top, width: Math.max(1, right - left), height: Math.max(1, bottom - top) }
 }
 
 function emptyResult(asset: StoredAsset, key: string, targetLanguage: string): MangaPageResult {

@@ -18,7 +18,8 @@ import sharp from 'sharp'
 import { ComicTextDetector } from '../server/ai/manga/detector.js'
 import { MangaOcrRecognizer } from '../server/ai/manga/recognizer.js'
 import { judgeRegion, mangaReadingOrder, trimTrailingNoise } from '../server/ai/manga/pipeline.js'
-import { boxToRect, type OcrRegion } from '../server/ai/manga/types.js'
+import { boxToRect, paddedRect, type OcrRegion } from '../server/ai/manga/types.js'
+import { detectorModel, ensureMangaModels, modelPath } from '../server/ai/manga/models.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const modelRoot = path.join(root, 'data', 'models')
@@ -68,10 +69,14 @@ async function main() {
   const detector = new ComicTextDetector()
   const recognizer = new MangaOcrRecognizer()
 
+  // 与生产一致：缺模型时自动从 HuggingFace 下载。
+  await ensureMangaModels()
+
   let t = process.hrtime.bigint()
-  await detector.load(path.join(modelRoot, 'comic-text-detector', 'comictextdetector.pt.onnx'))
+  await detector.load(modelPath(detectorModel))
   await recognizer.load(path.join(modelRoot, 'manga-ocr'))
   console.log(`模型加载完成 ${ms(t).toFixed(0)} ms`)
+  console.log(`OCR encoder：${recognizer.encoderFileUsed}`)
   console.log(`manga-ocr 输入尺寸：${recognizer.imageSize}（来自模型/配置）\n`)
 
   const summary: Array<Record<string, unknown>> = []
@@ -103,7 +108,8 @@ async function main() {
     // ── 识别（整页 raw 只解一次，crop 从内存里切）──
     const pageRaw = await sharp(fileBuffer, { limitInputPixels: 500_000_000 })
       .removeAlpha().toColourspace('srgb').raw().toBuffer()
-    const crops = detection.boxes.map(b => boxToRect(b, pageWidth, pageHeight))
+    // 必须和生产路径一样加 padding：紧贴文字的裁剪会让 manga-ocr 陷入重复幻觉。
+    const crops = detection.boxes.map(b => paddedRect(boxToRect(b, pageWidth, pageHeight), pageWidth, pageHeight))
 
     t = process.hrtime.bigint()
     const ocrResults = await recognizer.recognizeBatch(pageRaw, pageWidth, pageHeight, crops)
