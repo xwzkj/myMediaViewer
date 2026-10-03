@@ -2,22 +2,12 @@ import type { Work, WorksResponse } from '../shared/types'
 
 type SessionLoader = () => Promise<void>
 
-export interface LibraryContext {
-  source: string
-  kind: string
-  fuzzy: boolean
-  sort: string
-  order: 'collected' | 'published'
-  seed: string
-}
-
 export interface LibrarySession {
   key: string
   items: Work[]
   total: number
   page: number
   pages: number
-  context: LibraryContext
   loadMore: SessionLoader | null
 }
 
@@ -30,7 +20,6 @@ function createSession(key: string): LibrarySession {
     total: 0,
     page: 1,
     pages: 1,
-    context: { source: '', kind: '', fuzzy: false, sort: 'newest', order: 'collected', seed: '' },
     loadMore: null,
   }
 }
@@ -54,10 +43,6 @@ export function syncLibrarySession(key: string, response: WorksResponse, append 
   session.total = response.total
   session.page = response.page
   session.pages = response.pages
-}
-
-export function setLibraryContext(key: string, context: LibraryContext) {
-  ensureLibrarySession(key).context = context
 }
 
 export function setLibraryLoader(key: string, loader: SessionLoader | null) {

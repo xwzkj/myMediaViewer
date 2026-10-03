@@ -4,6 +4,8 @@ import { useRoute, useRouter } from 'vue-router'
 import type { LibraryStatus } from '../../shared/types'
 import { api } from '../api'
 import Icon from '../components/Icon.vue'
+import AppNotice from '../components/AppNotice.vue'
+import { useNotice } from '../use-notice'
 import SettingsContent from '../components/SettingsContent.vue'
 
 const route = useRoute()
@@ -11,8 +13,7 @@ const router = useRouter()
 const status = ref<LibraryStatus | null>(null)
 const loading = ref(true)
 const error = ref('')
-const toast = ref('')
-let toastTimer: ReturnType<typeof setTimeout> | undefined
+const { toast, notice, dismiss, runAction } = useNotice()
 
 async function refresh() {
   try {
@@ -23,12 +24,6 @@ async function refresh() {
   } finally {
     loading.value = false
   }
-}
-
-function notice(message: string) {
-  toast.value = message
-  clearTimeout(toastTimer)
-  toastTimer = setTimeout(() => { toast.value = '' }, 4200)
 }
 
 function close() {
@@ -43,5 +38,5 @@ onMounted(refresh)
   <SettingsContent v-if="status" :status="status" @close="close" @changed="refresh" @notice="notice" />
   <div v-else-if="loading" class="route-state"><span class="spinner" />正在读取媒体库设置…</div>
   <div v-else class="route-state error-state"><Icon name="warning" :size="30" /><p>{{ error }}</p><button class="button filled" @click="refresh">重试</button></div>
-  <Transition name="toast"><div v-if="toast" class="snackbar" role="status"><Icon name="success" :size="20" /><span>{{ toast }}</span></div></Transition>
+  <AppNotice :notice="toast" @dismiss="dismiss" @action="runAction" />
 </template>

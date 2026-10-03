@@ -2,12 +2,14 @@
 import { ref, computed, onActivated, onDeactivated, onMounted, onUnmounted, watch, watchEffect, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { LibraryStatus, TagSuggestion, TagSuggestionsResponse, Work, WorksResponse } from '../../shared/types'
-import { activeSearchToken, replaceWithTag, tagQuery } from '../../shared/search-query'
+import { activeSearchToken, replaceWithTag } from '../../shared/search-query'
 import { api, formatNumber } from '../api'
 import { appEvents, type WorkReturnPayload } from '../events'
 import { createSearchSessionId, routeCacheKey } from '../route-cache-key'
-import { setLibraryContext, setLibraryLoader, syncLibrarySession } from '../library-session'
+import { setLibraryLoader, syncLibrarySession } from '../library-session'
 import Icon from '../components/Icon.vue'
+import AppNotice from '../components/AppNotice.vue'
+import { useNotice } from '../use-notice'
 import WorkCard from '../components/WorkCard.vue'
 
 defineOptions({ name: 'LibraryView' })
@@ -45,17 +47,7 @@ const loadingMore = ref(false)
 const moreFailed = ref(false)
 const sentinel = ref<HTMLElement>()
 const error = ref('')
-const toast = ref('')
-// toast 可以带一个操作链接，例如缓存译文提供的“重新翻译”。
-const toastAction = ref<{ label: string; handler: () => void } | null>(null)
-const toastTone = ref<'info' | 'error'>('info')
-// 原生 dialog 打开后会进入浏览器 top layer，普通 DOM 再高的 z-index 也会被它盖住，
-// 所以提示要挂到当前最上层的 dialog 里；没有弹窗时才挂在 body。
-const toastHost = ref<HTMLElement | null>(null)
-function topLayerHost() {
-  const dialogs = document.querySelectorAll<HTMLElement>('dialog[open]')
-  return dialogs.length ? dialogs[dialogs.length - 1] : null
-}
+const { toast, notice, dismiss, runAction } = useNotice()
 const dark = ref(localStorage.getItem('theme') === 'dark')
 const busyFavorites = new Set<string>()
 const suggestions = ref<TagSuggestion[]>([])
@@ -65,7 +57,6 @@ const suggestionIndex = ref(-1)
 const searchInput = ref<HTMLInputElement>()
 let poll: ReturnType<typeof setInterval>
 let debounce: ReturnType<typeof setTimeout>
-let toastTimer: ReturnType<typeof setTimeout>
 let controller: AbortController | undefined
 let destroyed = false
 let refreshInProgress = false
@@ -123,7 +114,6 @@ async function loadPage(target: number, silent = false) {
     if (target <= 1) { if (silent) mergeFirstPage(response); else result.value = response }
     else result.value = { ...response, items: [...result.value.items, ...response.items] }
     syncLibrarySession(pageKey, target <= 1 ? result.value : response, target > 1)
-    setLibraryContext(pageKey, { source: source.value, kind: kind.value, fuzzy: fuzzy.value, sort: sort.value, order: order.value, seed: seed.value })
   } catch (e) {
     if (active.signal.aborted) return
     if (target <= 1) error.value = (e as Error).message
@@ -154,25 +144,6 @@ async function refreshStatus() {
     if (previous !== undefined && previous !== next.scan.finishedAt) void loadPage(1, true)
   } catch (e) { if (!status.value) error.value = (e as Error).message }
   finally { refreshInProgress = false }
-}
-function notice(message: string, action?: { label: string; handler: () => void }, tone: 'info' | 'error' = 'info') {
-  toastHost.value = topLayerHost()
-  toast.value = message
-  toastTone.value = tone
-  toastAction.value = action || null
-  clearTimeout(toastTimer)
-  toastTimer = setTimeout(dismissToast, action ? 8000 : 4200)
-}
-function dismissToast() {
-  toast.value = ''
-  toastAction.value = null
-  clearTimeout(toastTimer)
-}
-// 点 toast 里的操作链接：先收起提示，再执行动作。
-function runToastAction() {
-  const action = toastAction.value
-  dismissToast()
-  action?.handler()
 }
 async function scan() {
   try { await api('/scan', { method: 'POST' }); await refreshStatus(); notice('正在检查目录中的新增和修改') }
@@ -412,6 +383,7 @@ onActivated(() => {
   void refreshStatus()
 })
 onDeactivated(() => {
+  dismiss()
   unbindGlobalListeners()
   clearInterval(poll)
 })
@@ -422,7 +394,6 @@ onUnmounted(() => {
   unbindGlobalListeners()
   clearInterval(poll)
   clearTimeout(debounce)
-  clearTimeout(toastTimer)
   clearTimeout(suggestionTimer)
   clearTimeout(blurTimer)
   controller?.abort()
@@ -465,6 +436,6 @@ onUnmounted(() => {
       <footer class="page-footer"><span>拾光 MEDIA GARDEN</span><span>为每一份喜欢，留一处安放。</span></footer>
     </main>
     <nav class="mobile-nav" aria-label="手机导航"><button :class="{ active: view === 'library' }" @click="navigate('library')"><span><Icon name="gallery" /></span>媒体库</button><button :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><span><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /></span>我的收藏</button><button @click="openSettings"><span><Icon name="settings" /></span>设置</button></nav>
-    <Teleport :to="toastHost || 'body'"><Transition name="toast"><div v-if="toast" class="snackbar" :class="{ error: toastTone === 'error' }" :role="toastTone === 'error' ? 'alert' : 'status'"><Icon :name="toastTone === 'error' ? 'warning' : 'success'" :size="20" /><span>{{ toast }}</span><button v-if="toastAction" class="toast-action" type="button" @click="runToastAction">{{ toastAction.label }}</button><button class="icon-button" aria-label="关闭提示" @click="dismissToast"><Icon name="close" :size="18" /></button></div></Transition></Teleport>
+    <AppNotice :notice="toast" @dismiss="dismiss" @action="runAction" />
   </div>
 </template>

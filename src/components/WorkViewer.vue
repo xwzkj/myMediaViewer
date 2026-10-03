@@ -6,9 +6,10 @@ import { api, formatSize, kindLabel } from '../api'
 import Icon from './Icon.vue'
 import { drawMangaRegion } from '../manga-layout'
 import { vReleaseVideo, releaseVideos } from '../video-lifecycle'
+import type { Notice, NoticeAction } from '../use-notice'
 
 const props = defineProps<{ work: Work }>()
-const emit = defineEmits<{ close: []; favorite: [work: Work]; notice: [message: string, action?: { label: string; handler: () => void }, tone?: 'info' | 'error']; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
+const emit = defineEmits<{ close: []; favorite: [work: Work]; notice: [message: string, action?: NoticeAction, tone?: Notice['tone']]; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
 const root = ref<HTMLElement>()
 const stage = ref<HTMLElement>()
 const video = ref<HTMLVideoElement>()
