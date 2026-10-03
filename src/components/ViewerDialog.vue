@@ -4,6 +4,7 @@ import type { AiTranslateFields, AiTranslateResult, MangaJob, MangaPageResult, W
 import { Viewer } from 'v-viewer'
 import { api, formatSize, kindLabel } from '../api'
 import Icon from './Icon.vue'
+import { drawMangaRegion } from '../manga-layout'
 
 const props = defineProps<{ work: Work; page?: boolean }>()
 const emit = defineEmits<{ close: []; favorite: [work: Work]; notice: [message: string, action?: { label: string; handler: () => void }, tone?: 'info' | 'error']; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
@@ -441,63 +442,6 @@ async function drawMangaResult() {
   for (const region of result.regions) drawMangaRegion(ctx, region)
 }
 
-function drawMangaRegion(ctx: CanvasRenderingContext2D, region: MangaPageResult['regions'][number]) {
-  const translation = region.translation.trim()
-  if (!translation) return
-  const padding = Math.max(2, Math.round(Math.min(region.width, region.height) * 0.06))
-  const maxWidth = Math.max(4, region.width - padding * 2)
-  const maxHeight = Math.max(4, region.height - padding * 2)
-  const fontFamily = '"Noto Sans SC","Microsoft YaHei","PingFang SC",sans-serif'
-  const maxSize = Math.max(8, Math.floor(Math.min(maxWidth, maxHeight)))
-  let chosenSize = 7
-  let chosenLines = wrapCanvasText(ctx, translation, 7, fontFamily, maxWidth)
-  for (let size = maxSize; size >= 7; size--) {
-    const lines = wrapCanvasText(ctx, translation, size, fontFamily, maxWidth)
-    if (lines.every(line => ctx.measureText(line).width <= maxWidth) && lines.length * size * 1.14 <= maxHeight) {
-      chosenSize = size
-      chosenLines = lines
-      break
-    }
-  }
-  ctx.save()
-  ctx.beginPath()
-  ctx.rect(region.x + 1, region.y + 1, Math.max(1, region.width - 2), Math.max(1, region.height - 2))
-  ctx.clip()
-  ctx.fillStyle = region.textColor || '#111111'
-  ctx.font = `600 ${chosenSize}px ${fontFamily}`
-  ctx.textAlign = 'center'
-  ctx.textBaseline = 'middle'
-  const lineHeight = chosenSize * 1.14
-  const startY = region.y + (region.height - chosenLines.length * lineHeight) / 2 + lineHeight / 2
-  const centerX = region.x + region.width / 2
-  chosenLines.forEach((line, index) => ctx.fillText(line, centerX, startY + index * lineHeight))
-  ctx.restore()
-}
-
-function wrapCanvasText(
-  ctx: CanvasRenderingContext2D,
-  text: string,
-  size: number,
-  family: string,
-  maxWidth: number,
-): string[] {
-  ctx.font = `600 ${size}px ${family}`
-  const lines: string[] = []
-  for (const paragraph of text.split(/\r?\n/)) {
-    let line = ''
-    for (const char of paragraph) {
-      const next = line + char
-      if (line && ctx.measureText(next).width > maxWidth) {
-        lines.push(line)
-        line = char
-      } else {
-        line = next
-      }
-    }
-    lines.push(line)
-  }
-  return lines.length ? lines : [text]
-}
 // 点击按钮在“原文 + 译文 / 仅原文 / 仅译文”之间循环。
 function cycleTranslationDisplay() {
   const at = translationDisplayOrder.indexOf(translationDisplay.value)
