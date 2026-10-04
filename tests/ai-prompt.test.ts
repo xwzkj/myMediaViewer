@@ -25,7 +25,7 @@ test('首次使用默认 DeepSeek 配置，显式自定义设置可覆盖默认�
   assert.deepEqual(fallback.params, initial.params)
 })
 
-type ChatBody = { messages: Array<{ role: string; content: string }> }
+type ChatBody = { messages: Array<{ role: string; content: string }>; response_format?: any }
 
 const calls: ChatBody[] = []
 
@@ -103,3 +103,48 @@ test('保存后再读回来，追加提示词原样保留', () => {
   useSettings({ appendPrompt: '先补全术语表再翻译。' })
   assert.equal(getAiSettings().appendPrompt, '先补全术语表再翻译。')
 })
+
+test('输出模式默认兼容旧配置，非法值回落默认，覆盖配置继承已保存模式', async () => {
+  const { mergeAiSettings } = await import('../server/ai.js')
+  useSettings({})
+  assert.equal(getAiSettings().outputMode, 'prompt')
+  useSettings({ outputMode: 'invalid' })
+  assert.equal(getAiSettings().outputMode, 'prompt')
+  useSettings({ outputMode: 'json_schema' })
+  assert.equal(mergeAiSettings({}).outputMode, 'json_schema')
+  assert.equal(mergeAiSettings({ outputMode: 'json_object' }).outputMode, 'json_object')
+  const reloaded = await import(`../server/ai.js?output-mode=${Date.now()}`)
+  assert.equal(reloaded.getAiSettings().outputMode, 'json_schema')
+})
+
+for (const outputMode of ['prompt', 'json_schema', 'json_object'] as const) {
+  test(`${outputMode}：作品与漫画请求使用所选格式且自定义参数不能覆盖`, async () => {
+    useSettings({ outputMode, params: { response_format: { type: 'invalid' } } })
+    stubReply({ title: '译文', tags: ['标签'] })
+    await translateFields({ fields: { title: 'title', tags: ['tag'] }, force: true })
+    const work = calls.at(-1)!
+    stubReply({ translations: ['译文'] })
+    await translateMangaTexts({ texts: ['text'] })
+    const manga = calls.at(-1)!
+    for (const body of [work, manga]) {
+      if (outputMode === 'prompt') assert.equal('response_format' in body, false)
+      else assert.equal(body.response_format.type, outputMode)
+    }
+    if (outputMode === 'json_schema') {
+      assert.deepEqual(work.response_format.json_schema, {
+        name: 'work_translation', strict: true,
+        schema: {
+          type: 'object', additionalProperties: false, required: ['title', 'tags'],
+          properties: { title: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } } },
+        },
+      })
+      assert.deepEqual(manga.response_format.json_schema, {
+        name: 'manga_translation', strict: true,
+        schema: {
+          type: 'object', additionalProperties: false, required: ['translations'],
+          properties: { translations: { type: 'array', items: { type: 'string' } } },
+        },
+      })
+    }
+  })
+}

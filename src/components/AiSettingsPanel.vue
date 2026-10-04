@@ -139,6 +139,14 @@ function pickModel(model: string) {
       <label class="field">API Token<div class="key-field"><input v-model="settings.apiKey" :type="showKey ? 'text' : 'password'" placeholder="sk-…" spellcheck="false" autocomplete="off" /><button type="button" class="button text small" @click="showKey = !showKey">{{ showKey ? '隐藏' : '显示' }}</button></div><span>保存在服务端 data/ai.json，不会发送到其他设备。</span></label>
       <div class="field">模型名称<div class="model-field"><input v-model="settings.model" required placeholder="例如 gpt-4o-mini" spellcheck="false" autocomplete="off" /><button type="button" class="button outlined small" :disabled="loadingModels" @click="loadModels"><Icon name="refresh" :class="{ spinning: loadingModels }" :size="17" />{{ loadingModels ? '正在获取…' : '获取模型列表' }}</button></div><div v-if="modelsOpen" class="model-list"><p v-if="loadingModels">正在向接口请求模型列表…</p><template v-else><button v-for="model in models" :key="model" type="button" class="model-option" :class="{ active: model === settings.model }" @click="pickModel(model)">{{ model }}</button><p v-if="!models.length">没有获取到模型，可手动填写名称。</p></template></div></div>
       <label class="field">目标语言<input v-model="settings.targetLanguage" maxlength="40" placeholder="简体中文" /></label>
+      <label class="field">输出模式
+        <select v-model="settings.outputMode">
+          <option value="prompt">提示词 JSON（默认，兼容性最好）</option>
+          <option value="json_schema">JSON Schema（严格结构，需接口支持）</option>
+          <option value="json_object">JSON Object（需接口支持）</option>
+        </select>
+        <span>作品信息与漫画翻译共用。提示词 JSON 不发送格式参数；JSON Schema 约束字段和类型；JSON Object 要求返回 JSON 对象。自定义参数不能覆盖此选项。测试连接仅检查基础连通性。</span>
+      </label>
       <label class="field">自定义参数<textarea v-model="paramsText" rows="6" spellcheck="false" :placeholder="paramsExample" /><span>JSON 对象，会原样合并进请求体。可用来关闭思考、设置思考等级或思考预算，例如 reasoning_effort、thinking、thinking_budget。</span></label>
       <div class="field prompt-field"><div class="prompt-head"><span>追加系统提示词</span><button type="button" class="button text small" @click="restoreAppendPrompt">恢复默认</button></div><textarea v-model="settings.appendPrompt" rows="4" spellcheck="false" placeholder="现在开始工作" /><span>内置翻译提示词不可编辑，这段内容会追加在它之后，中间空两行（标题/标签/描述与漫画翻译都生效）。留空表示不追加。</span></div>
       <label class="field">超时时间（秒）<input v-model.number="timeoutSeconds" type="number" min="5" max="600" step="5" /><span>默认 120 秒，范围 5 - 600 秒。</span></label>

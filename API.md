@@ -371,6 +371,7 @@ ready 时返回 `video/mp4`，支持 Range。未就绪、文件或来源不可�
 | apiKey | string | 空；由用户填写上游 Token |
 | model | string | `deepseek-flash` |
 | targetLanguage | string | `简体中文` |
+| outputMode | string | `prompt`（提示词 JSON，不传 response_format）；另支持 `json_schema`、`json_object`；缺失或非法值使用默认值 |
 | appendPrompt | string | `shared/prompts.ts` 中的 DEFAULT_APPEND_PROMPT；空串表示不追加 |
 | params | object | `{"thinking":{"type":"disabled"}}` |
 | timeoutMs | number | 120000，归一化到 5000–600000 并取整 |
@@ -475,7 +476,7 @@ ready 时返回 `video/mp4`，支持 Range。未就绪、文件或来源不可�
 - API 不保证返回 tags 数量与原数组一致；需要逐项展示的客户端自行处理缺项。
 - 缓存依据清洗后的原文字段与目标语言，换模型、提示词或参数不会自动失效；用 force 重译。
 - 即便命中缓存，此接口仍先检查 Token 和模型是否已配置。
-- 翻译请求固定 model、messages、response_format、stream，自定义 params 不能覆盖这些字段。
+- 翻译请求固定 model、messages、response_format、stream，自定义 params 不能覆盖这些字段。outputMode 为 prompt 时省略 response_format，通过提示词要求 JSON；json_schema 时发送 strict schema（作品按实际字段生成，漫画为 translations 字符串数组）；json_object 时发送 `{ "type": "json_object" }`。后两种模式需要上游支持；测试连接只检查基础连通性，不验证输出模式。
 
 ### 7.7 DELETE /api/ai/cache
 

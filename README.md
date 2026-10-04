@@ -47,6 +47,7 @@ AI 功能全部可选，未配置时不影响浏览、搜索和播放。设置�
 默认使用 DeepSeek：接口地址为 `https://api.deepseek.com`，模型为 `deepseek-flash`，自定义参数为 `{"thinking":{"type":"disabled"}}`。使用前填写自己的 API Token；已有配置会继续保留。
 
 - **接口地址**：填到 `/v1` 或完整的 `/chat/completions` 地址都可以，程序会自动补全聊天与模型列表路径。
+- **输出模式**：默认「提示词 JSON」，省略格式参数，兼容性最好；接口支持时可选「JSON Schema」约束输出结构，或「JSON Object」要求 JSON 对象。作品与漫画翻译共用，旧配置自动采用默认模式；测试连接仅检查基础连通性。
 - **API Token / 模型**：Token 明文保存在服务端 `data/ai.json`；可以点「获取模型列表」从接口拉取模型，也可以手动填写模型名。接口地址、Token、模型和参数都支持在保存前先「测试连接」。
 - **目标语言**：默认「简体中文」，作品信息与漫画译文都使用这个语言。
 - **自定义参数**：填写 JSON 对象后原样合并进请求体，可用来关闭思考或设置思考等级 / 预算，例如 `reasoning_effort`、`thinking`、`thinking_budget`、`temperature`；`model`、`messages` 等由程序控制的字段不允许覆盖。

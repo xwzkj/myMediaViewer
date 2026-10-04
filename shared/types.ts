@@ -40,6 +40,7 @@ export interface AiSettings {
   baseUrl: string; apiKey: string; model: string; targetLanguage: string;
   // 用户可编辑的追加提示词，会拼在内置系统提示词之后。
   appendPrompt: string; params: Record<string, unknown>; timeoutMs: number
+  outputMode: 'prompt' | 'json_schema' | 'json_object'
   // 漫画翻译流水线，默认边识别边并发翻译。
   mangaPipelineMode: MangaPipelineMode
   // parallel 和 streaming 模式同时发出的翻译请求数上限。

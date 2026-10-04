@@ -23,6 +23,7 @@ const defaults: AiSettings = {
   model: 'deepseek-flash',
   targetLanguage: '简体中文',
   appendPrompt: DEFAULT_APPEND_PROMPT,
+  outputMode: 'prompt',
   // 直接合并进请求体的自定义参数，例如关闭思考、思考等级、思考预算、温度等。
   params: { thinking: { type: 'disabled' } },
   timeoutMs: 120000,
@@ -55,6 +56,10 @@ function asAppendPrompt(raw: Record<string, unknown>): string {
 }
 
 const PIPELINE_MODES = ['sequential', 'merged', 'parallel', 'streaming'] as const
+function asOutputMode(value: unknown, fallback: AiSettings['outputMode']): AiSettings['outputMode'] {
+  return value === 'prompt' || value === 'json_schema' || value === 'json_object' ? value : fallback
+}
+
 function asPipelineMode(value: unknown, fallback: AiSettings['mangaPipelineMode']): AiSettings['mangaPipelineMode'] {
   return typeof value === 'string' && (PIPELINE_MODES as readonly string[]).includes(value)
     ? value as AiSettings['mangaPipelineMode']
@@ -77,6 +82,7 @@ function normalize(input: unknown): AiSettings {
     model: asText(raw.model, defaults.model),
     targetLanguage: asText(raw.targetLanguage, defaults.targetLanguage) || defaults.targetLanguage,
     appendPrompt: asAppendPrompt(raw),
+    outputMode: asOutputMode(raw.outputMode, defaults.outputMode),
     params: 'params' in raw ? asParams(raw.params) : structuredClone(defaults.params),
     timeoutMs: clampTimeout(raw.timeoutMs, defaults.timeoutMs),
     mangaPipelineMode: asPipelineMode(raw.mangaPipelineMode, defaults.mangaPipelineMode),
@@ -119,6 +125,7 @@ export function mergeAiSettings(input: unknown): AiSettings {
     model: typeof raw.model === 'string' ? raw.model.trim() : current.model,
     targetLanguage: typeof raw.targetLanguage === 'string' ? raw.targetLanguage.trim() : current.targetLanguage,
     appendPrompt: typeof raw.appendPrompt === 'string' ? raw.appendPrompt : current.appendPrompt,
+    outputMode: asOutputMode(raw.outputMode, current.outputMode),
     params: 'params' in raw ? asParams(raw.params) : { ...current.params },
     timeoutMs: 'timeoutMs' in raw ? clampTimeout(raw.timeoutMs, current.timeoutMs) : current.timeoutMs,
     mangaPipelineMode: 'mangaPipelineMode' in raw
@@ -206,6 +213,20 @@ function bodyWithParams(params: Record<string, unknown>, base: Record<string, un
 }
 
 export interface AiConnectionResult { reply: string; model: string; elapsed: number }
+
+// undefined 会在序列化时省略，同时覆盖自定义参数，确保提示词模式不发送 response_format。
+function responseFormat(mode: AiSettings['outputMode'], name: string, properties: Record<string, unknown>) {
+  if (mode === 'prompt') return undefined
+  if (mode === 'json_object') return { type: 'json_object' }
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name,
+      strict: true,
+      schema: { type: 'object', properties, required: Object.keys(properties), additionalProperties: false },
+    },
+  }
+}
 
 export async function testAiConnection(override?: unknown): Promise<AiConnectionResult> {
   const settings = configured(override)
@@ -366,7 +387,9 @@ export async function translateMangaTexts(input: { texts: string[]; targetLangua
       },
       { role: 'user', content: JSON.stringify(texts) },
     ],
-    response_format: { type: 'json_object' },
+    response_format: responseFormat(settings.outputMode, 'manga_translation', {
+      translations: { type: 'array', items: { type: 'string' } },
+    }),
     stream: false,
   }, ['model', 'messages', 'response_format', 'stream'])
   const label = `翻译漫画文本（${texts.length} 段${settings.model ? ` · ${settings.model}` : ''}）`
@@ -416,8 +439,11 @@ export async function translateFields(input: { fields: AiTranslateFields; target
       { role: 'system', content: systemPrompt(targetLanguage, settings.appendPrompt) },
       { role: 'user', content: JSON.stringify(fields, null, 2) },
     ],
-    // 结构化输出：内容必须是 JSON 对象，便于直接解析。
-    response_format: { type: 'json_object' },
+    response_format: responseFormat(settings.outputMode, 'work_translation', Object.fromEntries(
+      Object.keys(fields).map(key => [key, key === 'tags'
+        ? { type: 'array', items: { type: 'string' } }
+        : { type: 'string' }]),
+    )),
     stream: false,
   }, ['model', 'messages', 'response_format', 'stream'])
   const label = `翻译作品信息（${Object.keys(fields).length} 个字段${settings.model ? ` · ${settings.model}` : ''}）`
