@@ -136,6 +136,12 @@ export function getMangaJob(id: string): MangaJob | undefined {
   return job ? publicJob(job) : undefined
 }
 
+/** 只读取当前语言的已有译图，不创建任务、不加载识别模型、不调用翻译接口。 */
+export async function getAutoMangaTranslation(asset: StoredAsset): Promise<MangaPageResult | null> {
+  if (!getAiSettings().mangaAutoShowTranslated) return null
+  return (await prepareAsset(asset, false)).cached || null
+}
+
 export function mangaBaseImagePath(key: string): string | undefined {
   if (!/^[a-f0-9]{64}$/.test(key)) return undefined
   const row = db.prepare('SELECT image_path FROM manga_translations WHERE key = ?').get(key) as { image_path: string | null } | undefined

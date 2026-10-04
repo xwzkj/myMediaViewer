@@ -1,5 +1,9 @@
 @layer base, components, responsive;
 @layer components {
+  .manga-auto-setting{display:flex;align-items:flex-start;gap:10px;margin:18px 0;font-size:12px;cursor:pointer}
+  .manga-auto-setting input{margin-top:3px;accent-color:var(--primary)}
+  .manga-auto-setting strong{display:block;font-weight:500}
+  .manga-auto-setting small{display:block;margin-top:5px;color:var(--muted);line-height:1.7}
   .folder-choice { display: flex; align-items: center; gap: 11px; width: 100%; min-height: 56px; padding: 13px; margin-top: 9px; border: 1px solid var(--outline); border-radius: 10px; background: var(--surface); text-align: left; color: var(--primary); }
   .folder-choice:hover { background: var(--surface-high); border-color: var(--primary); }
   #selected-folder-path { min-width: 0; flex: 1; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; color: var(--text); }

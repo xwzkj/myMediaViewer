@@ -40,10 +40,11 @@ export interface AiSettings {
   baseUrl: string; apiKey: string; model: string; targetLanguage: string;
   // 用户可编辑的追加提示词，会拼在内置系统提示词之后。
   appendPrompt: string; params: Record<string, unknown>; timeoutMs: number
-  // 漫画翻译流水线：默认逐页，可切到先批量识别再合并 / 并发翻译。
+  // 漫画翻译流水线，默认边识别边并发翻译。
   mangaPipelineMode: MangaPipelineMode
-  // parallel 模式下同时发出的翻译请求数上限。
+  // parallel 和 streaming 模式同时发出的翻译请求数上限。
   mangaConcurrency: number
+  mangaAutoShowTranslated: boolean
 }
 // 可供翻译的文字字段，键名与模型输出的 JSON 保持一致。
 export interface AiTranslateFields {

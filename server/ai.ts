@@ -28,6 +28,7 @@ const defaults: AiSettings = {
   timeoutMs: 120000,
   mangaPipelineMode: 'streaming',
   mangaConcurrency: 3,
+  mangaAutoShowTranslated: true,
 }
 
 function asText(value: unknown, fallback = ''): string {
@@ -80,6 +81,7 @@ function normalize(input: unknown): AiSettings {
     timeoutMs: clampTimeout(raw.timeoutMs, defaults.timeoutMs),
     mangaPipelineMode: asPipelineMode(raw.mangaPipelineMode, defaults.mangaPipelineMode),
     mangaConcurrency: clampConcurrency(raw.mangaConcurrency, defaults.mangaConcurrency),
+    mangaAutoShowTranslated: typeof raw.mangaAutoShowTranslated === 'boolean' ? raw.mangaAutoShowTranslated : defaults.mangaAutoShowTranslated,
   }
 }
 
@@ -125,6 +127,7 @@ export function mergeAiSettings(input: unknown): AiSettings {
     mangaConcurrency: 'mangaConcurrency' in raw
       ? clampConcurrency(raw.mangaConcurrency, current.mangaConcurrency)
       : current.mangaConcurrency,
+    mangaAutoShowTranslated: typeof raw.mangaAutoShowTranslated === 'boolean' ? raw.mangaAutoShowTranslated : current.mangaAutoShowTranslated,
   }
   if (!/^https?:\/\//i.test(merged.baseUrl)) throw new AiError('接口地址需要以 http:// 或 https:// 开头')
   return merged

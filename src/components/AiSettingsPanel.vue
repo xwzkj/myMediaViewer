@@ -176,6 +176,10 @@ function pickModel(model: string) {
         </div>
         <label v-if="pipelineMode === 'parallel' || pipelineMode === 'streaming'" class="concurrency-field">并发数<input v-model.number="concurrency" type="number" min="1" max="10" step="1" /><span>同时进行的翻译请求数，1 - 10，默认 3。接口限流时调小。</span></label>
       </div>
+      <label class="manga-auto-setting">
+        <input v-model="settings.mangaAutoShowTranslated" type="checkbox" />
+        <span><strong>自动显示已有译图</strong><small>打开或切换图片时，自动加载当前目标语言的已有译图；没有译图时显示原图。设置保存在服务端，所有设备共用。</small></span>
+      </label>
       <div class="ai-actions">
         <button type="button" class="button tonal" :disabled="testing || saving" @click="test"><Icon name="sparkle" :size="18" />{{ testing ? '正在测试…' : '测试连接' }}</button>
         <button class="button filled" :disabled="saving || testing"><Icon name="check" :size="18" />{{ saving ? '正在保存…' : '保存设置' }}</button>

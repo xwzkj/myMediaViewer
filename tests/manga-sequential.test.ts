@@ -9,11 +9,11 @@ import type { StoredAsset } from '../server/database.js'
 
 const testDir = mkdtempSync(path.join(os.tmpdir(), 'media-manga-sequential-'))
 process.env.MEDIA_DATA_DIR = testDir
-const { saveAiSettings } = await import('../server/ai.js')
+const { saveAiSettings, getAiSettings } = await import('../server/ai.js')
 const { db } = await import('../server/database.js')
 const { ComicTextDetector } = await import('../server/ai/manga/detector.js')
 const { MangaOcrRecognizer } = await import('../server/ai/manga/recognizer.js')
-const { startMangaTranslation, getMangaJob, mangaBaseImagePath } = await import('../server/ai/manga/service.js')
+const { startMangaTranslation, getMangaJob, mangaBaseImagePath, getAutoMangaTranslation } = await import('../server/ai/manga/service.js')
 after(() => db.close())
 
 async function asset(id: string, color: string): Promise<StoredAsset> {
@@ -83,6 +83,26 @@ test('逐页模式复用识别和回填，保持串行、缓存、空页和失�
       assert.equal(result.targetLanguage, '简体中文')
       assert.equal((await sharp(mangaBaseImagePath(result.key)!).metadata()).width, 80)
     }
+  })
+
+  await t.test('自动译图只读已有缓存，关闭设置或语言不匹配时返回空', async () => {
+    const original = getAiSettings()
+    const calls = detect.mock.callCount()
+    const requests = fetchMock.mock.callCount()
+    try {
+      const cached = await getAutoMangaTranslation(first)
+      assert.equal(cached?.cached, true)
+      assert.equal(cached?.regions[0]?.translation, '你好')
+      saveAiSettings({ ...original, mangaAutoShowTranslated: false })
+      assert.equal(await getAutoMangaTranslation(first), null)
+      saveAiSettings({ ...original, targetLanguage: 'English' })
+      assert.equal(await getAutoMangaTranslation(first), null)
+      saveAiSettings(original)
+      const untranslated = await asset('untranslated', '#dddddd')
+      assert.equal(await getAutoMangaTranslation(untranslated), null)
+      assert.equal(detect.mock.callCount(), calls)
+      assert.equal(fetchMock.mock.callCount(), requests)
+    } finally { saveAiSettings(original) }
   })
 
   await t.test('缓存命中跳过识别和模型请求，强制重译重新执行', async () => {

@@ -102,6 +102,23 @@ watch(index, async () => {
   mangaMode.value = mangaResult.value ? 'translated' : 'source'
   if (mangaResult.value) void drawMangaResult()
 })
+// 每次换图撤销上一次查询；手动翻译开始后也不让旧缓存覆盖新结果。
+watch(() => asset.value?.id, async (assetId, _previous, onCleanup) => {
+  if (!assetId || !canTranslateManga.value || mangaResults.value[assetId]) return
+  const controller = new AbortController()
+  onCleanup(() => controller.abort())
+  const token = mangaToken
+  try {
+    const { result } = await api<{ result: MangaPageResult | null }>(`/ai/manga/auto/${encodeURIComponent(assetId)}`, { signal: controller.signal })
+    if (controller.signal.aborted || disposed || token !== mangaToken || asset.value?.id !== assetId || mangaBusy.value || mangaResults.value[assetId]) return
+    if (result?.regions.length) {
+      mangaResults.value[assetId] = result
+      mangaMode.value = 'translated'
+    }
+  } catch {
+    // 缓存查询失败仍可看原图、手动翻译，不打断浏览。
+  }
+})
 // v-if 切换会让 canvas 重新挂载；只要译图、显示模式或 canvas 实例变化，就重新绘制一次。
 watch([mangaMode, () => mangaResult.value?.key, () => mangaCanvas.value], async ([mode, key, canvas]) => {
   if (mode !== 'translated' || !key || !canvas) return

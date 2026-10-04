@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -28,6 +28,19 @@ test('四种流水线模式都能保存并读回', () => {
     save({ mangaPipelineMode: mode })
     assert.equal(getAiSettings().mangaPipelineMode, mode)
   }
+})
+
+test('自动显示译图默认开启，关闭后写入服务端并在重新加载时保留', async () => {
+  save({})
+  assert.equal(getAiSettings().mangaAutoShowTranslated, true)
+  save({ mangaAutoShowTranslated: false })
+  const saved = JSON.parse(readFileSync(path.join(process.env.MEDIA_DATA_DIR!, 'ai.json'), 'utf8'))
+  assert.equal(saved.mangaAutoShowTranslated, false)
+  const modulePath = '../server/ai.js?auto-display-settings'
+  const reloaded = await import(modulePath)
+  assert.equal(reloaded.getAiSettings().mangaAutoShowTranslated, false)
+  save({ mangaAutoShowTranslated: 'false' })
+  assert.equal(getAiSettings().mangaAutoShowTranslated, true)
 })
 
 test('非法模式回落到默认异步模式', () => {

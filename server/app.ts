@@ -14,7 +14,7 @@ import { accessibleAsset, sendMedia, thumbnail, detectFFmpeg, ffmpegAvailable, c
 import type { Source, LibraryStatus, AiTranslateFields } from '../shared/types.js'
 import { listDirectories } from './directories.js'
 import { getAiSettings, saveAiSettings, testAiConnection, listAiModels, translateFields, clearTranslationCache } from './ai.js'
-import { getMangaJob, getMangaModelStatus, mangaBaseImagePath, startMangaTranslation } from './ai/manga/service.js'
+import { getAutoMangaTranslation, getMangaJob, getMangaModelStatus, mangaBaseImagePath, startMangaTranslation } from './ai/manga/service.js'
 import { debugLogging, logApi, logError, logInfo, setLoggingEnabled } from './log.js'
 
 export async function createApp(logging = true) {
@@ -261,6 +261,12 @@ export async function createApp(logging = true) {
     return translateFields({ fields: body.fields || {}, targetLanguage: body.targetLanguage, force: body.force === true })
   })
   app.get('/api/ai/manga/status', async () => getMangaModelStatus())
+  app.get<{ Params: { assetId: string } }>('/api/ai/manga/auto/:assetId', async (request, reply) => {
+    const asset = getAsset(request.params.assetId)
+    if (!asset || !await accessibleAsset(asset)) return reply.code(404).send({ message: '图片不存在或媒体目录离线' })
+    if (asset.kind !== 'image' || asset.extension === 'gif') return { result: null }
+    return { result: await getAutoMangaTranslation(asset) }
+  })
   app.post<{ Body: { assetId?: string; assetIds?: string[]; force?: boolean } }>('/api/ai/manga/translate', async (request, reply) => {
     const body = request.body || {}
     const requested = Array.isArray(body.assetIds) ? body.assetIds : [body.assetId]
