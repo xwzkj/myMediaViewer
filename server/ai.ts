@@ -465,3 +465,34 @@ export function clearTranslationCache(): number {
   db.prepare('DELETE FROM translations').run()
   return row?.count || 0
 }
+
+/** Reuse the configured endpoint, model, token, timeout, params and structured-output mode. */
+export async function generateSourceRules(tree: string, turns: Array<{role: 'user' | 'assistant'; content: string}>, ignoreCustomParams = false) {
+  const settings = configured()
+  const { SOURCE_RULES_AI_PROMPT } = await import('../shared/source-ai-prompt.js')
+  const payload = bodyWithParams(ignoreCustomParams ? {} : settings.params, {
+    model: settings.model, stream: false,
+    messages: [
+      {role:'system',content:SOURCE_RULES_AI_PROMPT},
+      {role:'user',content:JSON.stringify({directoryTree:tree})},
+      ...turns,
+    ],
+    response_format: responseFormat(settings.outputMode, 'source_rules', {
+      // JSON text keeps strict schema portable while allowing arbitrary named captures/type overrides.
+      rules: {type:'string',description:'SourceRules 对象序列化后的 JSON 字符串'},
+      explanation: {type:'string'},
+    }),
+  }, ['model','messages','stream','response_format'])
+  const body = JSON.parse(payload)
+  if (settings.outputMode === 'json_schema') body.messages[0].content += '\n结构化输出模式：rules 字段请返回 SourceRules 的 JSON 字符串，而不是对象。'
+  const label = '生成媒体分组规则'
+  const data = await requestJson(endpoints(settings.baseUrl).chat, {method:'POST',headers:headers(settings),body:JSON.stringify(body)},settings.timeoutMs,label)
+  const content = extractContent(data,label)
+  if (Buffer.byteLength(content) > 256 * 1024) throw new AiError('生成结果超过 256 KiB，请缩小需求后重试',502)
+  const result = parseJsonObject(content,label)
+  let rules: unknown = result.rules
+  if (typeof rules === 'string') {try {rules = JSON.parse(rules)} catch {throw new AiError('AI 返回的规则 JSON 无效',502)}}
+  const { validateRules } = await import('./source-sandbox.js')
+  try {await validateRules(rules,true)} catch(error) {throw new AiError(`AI 生成的规则未通过校验：${(error as Error).message}`,502)}
+  return {rules: rules as import('../shared/types.js').SourceRules, explanation: typeof result.explanation === 'string' ? result.explanation.slice(0,4000) : '', model:asText(data.model,settings.model)}
+}

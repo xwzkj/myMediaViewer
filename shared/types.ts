@@ -16,7 +16,7 @@ export interface ScriptFile {
 }
 export interface ScriptInput { id: string; directory: string; media: ScriptFile[]; files: Array<ScriptFile & { text: string }> }
 export interface SourcePreview {
-  enumerated: number; truncated: boolean; errors: string[];
+  token?: string; enumerated: number; truncated: boolean; errors: string[];
   groups: Array<{ id: string; directory: string; media: string[]; metadata: string[]; captures?: Array<{ relativePath: string; metadata: boolean; captures: Record<string, string> }>; result?: MetadataFields; error?: string }>
 }
 export interface Asset {
@@ -140,3 +140,6 @@ export interface DirectoryListing {
   path: string | null; parent: string | null;
   breadcrumbs: DirectoryEntry[]; directories: DirectoryEntry[]
 }
+
+export interface SourceAiSample { token: string; tree: string; truncated: boolean; lines: number }
+export interface SourceAiResult { conversationId: string; contextTrimmed: boolean; rules: SourceRules; explanation: string; model: string }

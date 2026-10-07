@@ -14,7 +14,9 @@ import { accessibleAsset, sendMedia, thumbnail, detectFFmpeg, ffmpegAvailable, c
 import type { Source, LibraryStatus, AiTranslateFields } from '../shared/types.js'
 import { sourcePreset } from '../shared/source-presets.js'
 import { validateRules } from './source-sandbox.js'
-import { previewSource } from './source-engine.js'
+import { sourceTreeSample } from './source-tree.js'
+import { sourceAiTurn, forgetSourceAiConversation, type SourceAiTurn } from './source-ai.js'
+import { previewSource, calculatePreviewGroup } from './source-engine.js'
 import { listDirectories } from './directories.js'
 import { getAiSettings, saveAiSettings, testAiConnection, listAiModels, translateFields, clearTranslationCache } from './ai.js'
 import { getAutoMangaTranslation, getMangaJob, getMangaModelStatus, mangaBaseImagePath, startMangaTranslation } from './ai/manga/service.js'
@@ -120,10 +122,32 @@ export async function createApp(logging = true) {
     }
     if (!body.name.trim()) throw Object.assign(new Error('请输入目录名称'), { statusCode: 400 })
     const rules = body.rules ?? (body.kind === 'pixiv' || body.kind === 'telegram' ? sourcePreset(body.kind) : undefined)
-    try { await validateRules(rules) } catch (error) { throw Object.assign(new Error((error as Error).message), { statusCode: 400 }) }
+    try { await validateRules(rules, preview) } catch (error) { throw Object.assign(new Error((error as Error).message), { statusCode: 400 }) }
     return { name: body.name.trim(), path: resolved, kind: body.rules ? 'custom' as const : body.kind, rules }
 
   }
+  app.post<{Body:{path:string}}>('/api/sources/ai/sample', {
+    schema:{body:{type:'object',additionalProperties:false,required:['path'],properties:{path:{type:'string',minLength:1,maxLength:2048}}}},
+  }, async request => {
+    if(!path.isAbsolute(request.body.path)) throw Object.assign(new Error('请选择服务端绝对目录'),{statusCode:400})
+    try {return await sourceTreeSample(request.body.path)} catch(error) {throw Object.assign(new Error((error as Error).message),{statusCode:400})}
+  })
+  app.post<{Body:SourceAiTurn}>('/api/sources/ai/chat', {
+    bodyLimit:256*1024,
+    schema:{body:{type:'object',additionalProperties:false,required:['sampleToken','message'],properties:{
+      sampleToken:{type:'string',minLength:1,maxLength:80},conversationId:{type:'string',minLength:1,maxLength:80},
+      message:{type:'string',minLength:1,maxLength:4000},currentRules:{type:'object',additionalProperties:true},ignoreCustomParams:{type:'boolean'},
+    }}},
+  }, async request => sourceAiTurn(request.body))
+  app.delete<{Params:{id:string}}>('/api/sources/ai/chat/:id', async request => {
+    forgetSourceAiConversation(request.params.id); return {ok:true}
+  })
+  app.post<{Body:{token:string;index:number}}>('/api/sources/preview/calculate', {
+    schema:{body:{type:'object',additionalProperties:false,required:['token','index'],properties:{token:{type:'string',minLength:1,maxLength:80},index:{type:'integer',minimum:0,maximum:19}}}},
+  }, async (request,reply) => {
+    try {return {result:await calculatePreviewGroup(request.body.token,request.body.index)}}
+    catch(error) {const e=error as Error & {statusCode?:number};return reply.code(e.statusCode || 400).send({message:e.message})}
+  })
   app.get('/api/source-presets', async () => (['pixiv', 'telegram'] as const).map(id => ({ id, name: id === 'pixiv' ? 'Pixiv' : 'Telegram', rules: sourcePreset(id) })))
   let previewRunning = false
   app.post<{ Body: Omit<Source, 'id'> }>('/api/sources/preview', { bodyLimit: 256 * 1024, schema: { body: sourceBody } }, async (request, reply) => {

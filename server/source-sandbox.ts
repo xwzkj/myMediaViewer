@@ -2,7 +2,7 @@ import { Worker } from 'node:worker_threads'
 import type { SourceRules, ScriptInput, MetadataFields } from '../shared/types.js'
 import { validateRulesShape } from './source-rules.js'
 
-type Task = { type: 'validate' | 'match' | 'extract'; rules: SourceRules; names?: string[]; input?: ScriptInput }
+type Task = { type: 'validate' | 'syntax' | 'match' | 'extract'; rules: SourceRules; names?: string[]; input?: ScriptInput }
 type Job = { task: Task; resolve(value: any): void; reject(error: Error): void }
 type Slot = { worker: Worker; ready: boolean; job?: Job; timer?: ReturnType<typeof setTimeout> }
 const slots = new Set<Slot>(), queue: Job[] = []
@@ -46,9 +46,9 @@ export function sandbox<T = unknown>(task: Task): Promise<T> {
   if (queue.length >= 32) return Promise.reject(new Error('沙箱任务队列已满，请稍后重试'))
   return new Promise((resolve, reject) => { queue.push({ task, resolve, reject }); pump() })
 }
-export async function validateRules(rules: unknown): Promise<void> {
+export async function validateRules(rules: unknown, syntaxOnly = false): Promise<void> {
   validateRulesShape(rules)
-  await sandbox({ type: 'validate', rules })
+  await sandbox({ type: syntaxOnly ? 'syntax' : 'validate', rules })
 }
 export function normalizeMetadata(value: unknown): MetadataFields {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('提取结果必须为对象')

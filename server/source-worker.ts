@@ -6,7 +6,7 @@ import type { FileRule, SourceRules, ScriptInput } from '../shared/types.js'
 
 const QuickJS = await getQuickJS()
 function compile(rule: FileRule) { return new RegExp(`^(?:${rulePattern(rule)})$`, rule.caseSensitive ? '' : 'i') }
-function execute(script: string, input?: ScriptInput) {
+function execute(script: string, input?: ScriptInput, compileOnly = false) {
   const rt = QuickJS.newRuntime()
   rt.setMemoryLimit(64 * 1024 * 1024)
   rt.setMaxStackSize(512 * 1024)
@@ -33,7 +33,8 @@ function execute(script: string, input?: ScriptInput) {
         return text;
       });
     })()`)))
-    const mod = take(vm.unwrapResult(vm.evalCode(script, 'extract.js', { type: 'module' })))
+    const mod = take(vm.unwrapResult(vm.evalCode(script, 'extract.js', { type: 'module', compileOnly })))
+    if (compileOnly) return null
     const fn = take(vm.getProp(mod, 'extract'))
     if (vm.typeof(fn) !== 'function') throw new Error('脚本必须导出 extract(input) 函数')
     if (!input) return null
@@ -70,7 +71,7 @@ parentPort!.on('message', (task: { type: string; rules: SourceRules; names?: str
     if (task.type === 'extract') result = execute(task.rules.script, task.input)
     else {
       const media = compile(task.rules.media), metas = task.rules.metadata.map(compile)
-      if (task.type === 'validate') result = execute(task.rules.script)
+      if (task.type === 'validate' || task.type === 'syntax') result = execute(task.rules.script, undefined, task.type === 'syntax')
       else result = task.names!.map(name => {
         for (let i = 0; i < metas.length; i++) { const subject = ruleSubject(task.rules.metadata[i], name); const match = metas[i].exec(subject); if (match?.groups && match[0].length === subject.length) return { metadata: true, captures: match.groups } }
         const subject = ruleSubject(task.rules.media, name)

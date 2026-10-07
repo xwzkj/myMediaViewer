@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, symlink, link, rm, rename } from '
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { sandbox, validateRules, normalizeMetadata } from '../server/source-sandbox.js'
-import { collectGroups, extractGroup, groupWorkId, groupStamp, readSnapshot, isWithin, previewSource } from '../server/source-engine.js'
+import { collectGroups, extractGroup, groupWorkId, groupStamp, readSnapshot, isWithin, previewSource, calculatePreviewGroup } from '../server/source-engine.js'
 import { customRules, sourcePreset } from '../shared/source-presets.js'
 import type { Source, ScriptInput } from '../shared/types.js'
 
@@ -109,7 +109,8 @@ test('引擎：元文件快照、分组范围、匹配白名单、路径与预�
     assert.notEqual(groupWorkId(source, collected.groups[0]), groupWorkId(source, collected.groups[1]))
     source.rules!.script = 'export async function extract(input) {return JSON.parse(input.files[0].text)}'
     const preview = await previewSource(source)
-    assert.equal(preview.groups[0].result?.title, 'a')
+    assert.equal(preview.groups[0].result, undefined)
+    assert.equal((await calculatePreviewGroup(preview.token!,0)).title,'a')
     const partial = await collectGroups(source, 1)
     assert.equal(partial.enumerated, 1); assert.equal(partial.truncated, true)
     const meta = collected.groups[0].entries.find(e => e.metadata)!

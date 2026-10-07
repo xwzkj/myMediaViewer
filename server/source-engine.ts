@@ -1,10 +1,10 @@
 import type { Stats } from 'node:fs'
 import { readdir, lstat, realpath, open } from 'node:fs/promises'
 import path from 'node:path'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { Source, SourceRules, ScriptFile, ScriptInput, MediaKind, SourcePreview, MetadataFields } from '../shared/types.js'
 import { sourcePreset } from '../shared/source-presets.js'
-import { decodeText, emptyMetadata } from './parsers.js'
+import { decodeText } from './parsers.js'
 import { sandbox, normalizeMetadata } from './source-sandbox.js'
 import { LIMITS } from './source-rules.js'
 
@@ -150,11 +150,22 @@ export async function previewSource(source: Source): Promise<SourcePreview> {
   for (const group of collected.groups.slice(0, 20)) {
     const row: SourcePreview['groups'][number] = { id: group.id, directory: group.directory, captures: group.entries.map(e => ({relativePath: e.relativePath, metadata: e.metadata, captures: e.captures})),
       media: group.entries.filter(e => !e.metadata).map(e => e.relativePath), metadata: group.entries.filter(e => e.metadata).map(e => e.relativePath) }
-    if (result.groups.length < 5) {
-      try { row.result = await extractGroup(source, group) }
-      catch (error) { row.error = (error as Error).message; row.result = emptyMetadata() }
-    }
     result.groups.push(row)
   }
-  return result
+  const token = randomUUID()
+  prunePreviews()
+  if (previews.size >= 8) previews.delete(previews.keys().next().value!)
+  previews.set(token, {source: structuredClone(source), groups: collected.groups.slice(0,20), expires: Date.now() + 5 * 60_000})
+  return {...result, token}
+}
+
+const previews = new Map<string, {source: Source; groups: Group[]; expires: number}>()
+function prunePreviews() { for (const [key, value] of previews) if (value.expires < Date.now()) previews.delete(key) }
+export async function calculatePreviewGroup(token: string, index: number): Promise<MetadataFields> {
+  prunePreviews()
+  const session = previews.get(token)
+  if (!session) throw Object.assign(new Error('预览已过期，请重新预览分组'), {statusCode: 410})
+  if (!Number.isInteger(index) || !session.groups[index]) throw Object.assign(new Error('预览分组不存在'), {statusCode: 404})
+  // Reuses the exact server-held group/rules, never accepts caller-supplied file paths.
+  return extractGroup(session.source, session.groups[index])
 }

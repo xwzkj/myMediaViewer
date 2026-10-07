@@ -6,6 +6,7 @@ import { activeSearchToken, replaceWithTag } from '../../shared/search-query'
 import { api, formatNumber } from '../api'
 import { appEvents, type WorkReturnPayload } from '../events'
 import { createSearchSessionId, routeCacheKey } from '../route-cache-key'
+import { watchLibraryMemory } from '../library-memory'
 import { setLibraryLoader, syncLibrarySession } from '../library-session'
 import Icon from '../components/Icon.vue'
 import AppNotice from '../components/AppNotice.vue'
@@ -282,12 +283,15 @@ watch([view, source, kind, sort, fuzzy, order, seed], () => void loadWorks())
 // 搜索词不保存，其余的来源 / 筛选 / 排序都写进 localStorage。
 // 搜索期间会临时切到相关度排序，这里记下用户原本选过的排序，清空搜索后还原。
 let preSearchSort = sort.value
-watch([view, source, kind, fuzzy, sort, order, seed], () => {
-  localStorage.setItem('libraryState', JSON.stringify({
+watchLibraryMemory(
+  () => ({
     view: view.value, source: source.value, kind: kind.value, fuzzy: fuzzy.value, order: order.value, seed: seed.value,
     sort: sort.value === 'relevance' ? preSearchSort : sort.value,
-  }))
-})
+  }),
+  () => route.fullPath,
+  () => routeCacheKey(route) === pageKey,
+  state => localStorage.setItem('libraryState', JSON.stringify(state)),
+)
 // 列表底部进入视野附近时自动追加下一页。
 watchEffect(onCleanup => {
   const element = sentinel.value

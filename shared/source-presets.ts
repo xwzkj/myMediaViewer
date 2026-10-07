@@ -18,3 +18,10 @@ export function customRules(): SourceRules {
     metadata: [{ mode: 'template', pattern: '{id}.json', caseSensitive: false }],
     script: customScript }
 }
+
+/** Ignore property order/default target when deciding whether to send an untouched blank preset. */
+export function isBlankSourceRules(rules: SourceRules): boolean {
+  const normalizeRule = (r: SourceRules['media']) => ({mode:r.mode,pattern:r.pattern,caseSensitive:r.caseSensitive,target:r.target ?? 'filename',defaultPage:r.defaultPage})
+  const normalize = (r: SourceRules) => ({version:r.version,scope:r.scope,duplicates:r.duplicates,media:normalizeRule(r.media),metadata:r.metadata.map(normalizeRule),typeOverrides:Object.entries(r.typeOverrides).sort(),script:r.script.trim()})
+  return JSON.stringify(normalize(rules)) === JSON.stringify(normalize(customRules()))
+}

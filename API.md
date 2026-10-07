@@ -285,6 +285,7 @@ interface ScriptInput {
 
 ```ts
 interface SourcePreview {
+  token: string; // 服务端预览快照，5 分钟有效
   enumerated: number;
   truncated: boolean;
   errors: string[];
@@ -299,7 +300,7 @@ interface SourcePreview {
 }
 ```
 
-最多枚举 5000 个文件、返回 20 组、执行前 5 组。后续组无 `result`，某组提取失败时有 `error` 和空元信息结果。预览只读，不写配置/缓存/索引。无效配置返回 400；正在扫描或已有预览返回 409。仅为样本，不承诺未预览文件可以成功处理。
+最多枚举 5000 个文件、返回 20 组。所有分组初始都无 `result/error`；预览只编译校验脚本，不执行模块顶层或 extract，不读取元文件内容。预览只读，不写配置/缓存/索引。无效配置返回 400；正在扫描或已有预览返回 409。仅为样本，不承诺未预览文件可以成功处理。
 
 全来源作品 ID 保持 `${sourceId}:${id}`；子目录隔离 ID 为 `v2:` 加 `[sourceId, directory, id]` 的 JSON 编码。客户端应将 ID 视为不透明字符串，并在 URL 路径中编码。改变分组 ID/范围可能改变作品身份，收藏不做猜测迁移。
 
@@ -765,3 +766,22 @@ curl.exe -H "Range: bytes=0-1023" "http://localhost:3210/api/assets/ASSET_ID/fil
 - POST/PUT 来源保存后，仅整理该来源；POST `/api/scan` 仍手动整理全部来源。
 - `scan.files` / `scan.works` 是本次整理任务的进度，单来源整理时不代表全库总数；全库总数使用 `/api/status` 顶层字段。
 - 设置页串行轮询 `/api/status`（1.5 秒间隔），保存后立即刷新，失败重试、卸载后停止。此轮询只读状态，不触发整理。
+
+### 按需计算预览分组
+
+`POST /api/sources/preview/calculate`，请求 `{ "token": "预览返回的 token", "index": 0 }`。
+
+只计算该预览中的指定组（index 0–19），200 返回 `{ result: MetadataFields }`；脚本失败或读取时文件变化返回 400，组不存在返回 404，预览过期返回 410。规则与文件清单保存在服务端，客户端不能指定额外路径。最多保留 8 份预览、5 分钟有效；不写入元信息缓存或索引。前端修改配置后丢弃预览并要求重新生成。
+
+### AI 规则生成与多轮对话
+
+- `POST /api/sources/ai/sample`：`{ path: "绝对目录" }`，返回 `{token, tree, truncated, lines}`。仅列文件/目录名，最多 200 行/24 KiB/8 层，裁切标记 `...`，跳过符号链接/目录联接；不读取文件内容。样本在内存中保留 5 分钟。
+- `POST /api/sources/ai/chat`：`{sampleToken, conversationId?, message, currentRules?, ignoreCustomParams?}`。message 最多 4000 字符。首轮不传 conversationId，之后使用返回 ID。currentRules 是当前编辑草稿，允许含待修复语法错误；空白自定义预设自动省略。请求体最多 256 KiB。
+- 成功返回 `{conversationId, contextTrimmed, rules, explanation, model}`。规则和脚本经过静态/沙箱编译校验，但不执行代码。模型输出无效返回 502，过期会话/样本返回 410，目录样本不一致或同会话并发返回 409，并发总量超限返回 429。
+- `DELETE /api/sources/ai/chat/:id`：清空内存对话，返回 `{ok:true}`；生成中返回 409。
+
+模型输入含规则语法/脚本契约、目录树、当前非空白配置、近期对话。复用已有 AI endpoint/token/model/timeout/params/outputMode，不使用翻译专用 appendPrompt。模型结果只作为候选，不自动保存来源、扫描或执行脚本。
+
+对话不落盘，闲置 30 分钟失效，最多 8 个内存会话、两个并发请求。历史按完整往返截断，至多近期 6 轮并受 384 KiB 上限约束；截断时 contextTrimmed=true。发生 AI 请求/验证错误不会把失败回合追加到上下文。
+
+AI 规则对话可传 `ignoreCustomParams: true`，本次请求不合并 AI 设置中的自定义参数；默认 false，保留现有行为。接口、Token、模型、超时及输出模式不受影响，全局配置不变。
