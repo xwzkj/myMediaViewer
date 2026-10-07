@@ -48,7 +48,7 @@ export function setFavorite(id: string, favorite: boolean): void {
   if (favorite) db.prepare('INSERT OR IGNORE INTO favorites VALUES (?, ?)').run(id, Date.now())
   else db.prepare('DELETE FROM favorites WHERE work_id = ?').run(id)
 }
-export function saveSource(source: Source, works: StoredWork[], assets: StoredAsset[]): void {
+export function saveSource(source: Source, works: StoredWork[], assets: StoredAsset[], metadata: Array<{key: string; stamp: string; data: string}> = []): void {
   const addWork = db.prepare('INSERT INTO works VALUES (?, ?, ?)')
   const addAsset = db.prepare('INSERT INTO assets VALUES (?, ?, ?)')
   db.exec('BEGIN')
@@ -57,6 +57,8 @@ export function saveSource(source: Source, works: StoredWork[], assets: StoredAs
     db.prepare('DELETE FROM works WHERE source_id = ?').run(source.id)
     for (const work of works) addWork.run(work.id, source.id, JSON.stringify(work))
     for (const asset of assets) addAsset.run(asset.id, asset.workId, JSON.stringify(asset))
+    const cache = db.prepare('INSERT OR REPLACE INTO group_metadata_cache VALUES (?, ?, ?)')
+    for (const row of metadata) cache.run(row.key, row.stamp, row.data)
     db.exec('COMMIT')
   } catch (error) { db.exec('ROLLBACK'); throw error }
 }

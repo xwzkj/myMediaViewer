@@ -237,6 +237,7 @@
 ```ts
 interface FileRule {
   mode: 'template' | 'regex';
+  target?: 'filename' | 'relativePath' | 'directory' | 'directoryName'; // 省略为 filename
   pattern: string;               // 最多 4096 字符，必须捕获 id
   caseSensitive: boolean;
   defaultPage?: number;          // 媒体缺失页码的兼容默认值，不填则不折叠
@@ -253,13 +254,13 @@ interface SourceRules {
 }
 ```
 
-模板 `{id}[_p{page}].{ext}`；反斜杠转义特殊字符，中括号为可选段。高级正则使用命名组 `(?<id>...)`，统一完整匹配，只支持大小写开关。`page`、`sequence` 必须为非负安全整数；其他捕获字段透传。规则匹配文件名，不匹配路径，元文件优先。媒体支持 jpg/jpeg/png/webp/avif/bmp/gif/mp4/mov/webm/mkv/m4v/avi。
+模板 `{id}[_p{page}].{ext}`；反斜杠转义特殊字符，中括号为可选段。高级正则使用命名组 `(?<id>...)`，统一完整匹配，只支持大小写开关。`page`、`sequence` 必须为非负安全整数；其他捕获字段透传。规则完整匹配 target 指定的文本，默认文件名；相对路径统一使用 `/` 且不含来源根目录。directory 是相对目录路径，directoryName 是直属目录名，根目录文件的目录文本为空。元文件优先。媒体支持 jpg/jpeg/png/webp/avif/bmp/gif/mp4/mov/webm/mkv/m4v/avi。
 
 脚本 `export async function extract(input)` 的输入是深度冻结的 JSON：
 
 ```ts
 interface ScriptFile {
-  filename: string; relativePath: string; extension: string;
+  filename: string; relativePath: string; directory: string; directoryName: string; extension: string;
   size: number; modified: number; captures: Record<string, string>;
   page?: number; sequence?: number;
 }
@@ -270,7 +271,7 @@ interface ScriptInput {
 }
 ```
 
-全来源分组时 `directory` 为空。只提供本组匹配元文件的内容，不提供文件访问 API、宿主绝对路径或网络。返回 `title/author/description/date/originalUrl` 字符串和 `tags: string[]`，均可省略，其余字段丢弃；标题/作者/日期最多 2000 字符、简介 100000、URL 4096、标签最多 1000 个且单个最多 200 字符。日期须可解析，URL 限 HTTP(S)。错误和超限不影响媒体入库。
+全来源分组时顶层 `input.directory` 为空；每个文件的 `directory` 和 `directoryName` 仍提供真实相对目录信息。即使没有元文件，脚本也可解析 `input.media[*].relativePath` 提取标题/作者。只提供本组匹配元文件的内容，不提供文件访问 API、宿主绝对路径或网络。返回 `title/author/description/date/originalUrl` 字符串和 `tags: string[]`，均可省略，其余字段丢弃；标题/作者/日期最多 2000 字符、简介 100000、URL 4096、标签最多 1000 个且单个最多 200 字符。日期须可解析，URL 限 HTTP(S)。错误和超限不影响媒体入库。
 
 限制及迁移方式参见 README「沙箱与限制」。配置保存时在沙箱内校验模块与 extract 入口，不运行 extract；顶层代码也受时间/内存限制，不可联网或导入模块。
 
@@ -290,6 +291,7 @@ interface SourcePreview {
   groups: {
     id: string; directory: string;
     media: string[]; metadata: string[]; // 来源内相对路径
+    captures?: { relativePath: string; metadata: boolean; captures: Record<string, string> }[];
     result?: { title: string; author: string; description: string;
       tags: string[]; date: string; originalUrl: string };
     error?: string;
@@ -756,3 +758,10 @@ curl.exe -H "Range: bytes=0-1023" "http://localhost:3210/api/assets/ASSET_ID/fil
 - `server/media.ts`：Range、ETag、缩略图和转码队列。
 - `server/ai.ts`：AI 配置、上游调用、文本翻译和缓存。
 - `server/ai/manga/service.ts`、`models.ts`：漫画任务、模型检查及自动下载。
+
+### 整理触发与状态刷新
+
+- 启动时整理全部来源一次，不再后台定时整理。
+- POST/PUT 来源保存后，仅整理该来源；POST `/api/scan` 仍手动整理全部来源。
+- `scan.files` / `scan.works` 是本次整理任务的进度，单来源整理时不代表全库总数；全库总数使用 `/api/status` 顶层字段。
+- 设置页串行轮询 `/api/status`（1.5 秒间隔），保存后立即刷新，失败重试、卸载后停止。此轮询只读状态，不触发整理。

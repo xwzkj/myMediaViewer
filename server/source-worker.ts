@@ -1,5 +1,6 @@
 import { parentPort } from 'node:worker_threads'
 import { getQuickJS } from 'quickjs-emscripten'
+import { ruleSubject } from '../shared/file-rules.js'
 import { rulePattern, LIMITS } from './source-rules.js'
 import type { FileRule, SourceRules, ScriptInput } from '../shared/types.js'
 
@@ -50,7 +51,9 @@ function execute(script: string, input?: ScriptInput) {
         take(state.error)
         // Reading stack/message can execute user getters; the outer worker deadline remains authoritative.
         const message = take(vm.getProp(state.error, 'message'))
-        throw new Error(vm.typeof(message) === 'string' ? vm.getString(message).slice(0, 1000) : '脚本执行失败')
+        const stack = take(vm.getProp(state.error, 'stack'))
+        const location = vm.typeof(stack) === 'string' ? vm.getString(stack).match(/extract\.js:(\d+)(?::(\d+))?/) : null
+        throw new Error((location ? `JS 第 ${location[1]} 行${location[2] ? `，第 ${location[2]} 列` : ''}：` : '') + (vm.typeof(message) === 'string' ? vm.getString(message).slice(0, 1000) : '脚本执行失败'))
       }
       if (!rt.hasPendingJob()) throw new Error('脚本 Promise 未完成，沙箱不提供外部 I/O')
       const result = rt.executePendingJobs(32)
@@ -69,9 +72,10 @@ parentPort!.on('message', (task: { type: string; rules: SourceRules; names?: str
       const media = compile(task.rules.media), metas = task.rules.metadata.map(compile)
       if (task.type === 'validate') result = execute(task.rules.script)
       else result = task.names!.map(name => {
-        for (const re of metas) { const match = re.exec(name); if (match?.groups && match[0].length === name.length) return { metadata: true, captures: match.groups } }
-        const match = media.exec(name)
-        return match?.groups && match[0].length === name.length ? { metadata: false, captures: match.groups } : null
+        for (let i = 0; i < metas.length; i++) { const subject = ruleSubject(task.rules.metadata[i], name); const match = metas[i].exec(subject); if (match?.groups && match[0].length === subject.length) return { metadata: true, captures: match.groups } }
+        const subject = ruleSubject(task.rules.media, name)
+        const match = media.exec(subject)
+        return match?.groups && match[0].length === subject.length ? { metadata: false, captures: match.groups } : null
       })
     }
     parentPort!.postMessage({ ok: true, result })

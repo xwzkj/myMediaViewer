@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, onBeforeUnmount, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { LibraryStatus } from '../../shared/types'
+import { createStatusPoller } from '../status-poller'
 import { api } from '../api'
 import Icon from '../components/Icon.vue'
 import AppNotice from '../components/AppNotice.vue'
@@ -15,23 +16,20 @@ const loading = ref(true)
 const error = ref('')
 const { toast, notice, dismiss, runAction } = useNotice()
 
-async function refresh() {
-  try {
-    status.value = await api<LibraryStatus>('/status')
-    error.value = ''
-  } catch (e) {
-    error.value = (e as Error).message
-  } finally {
-    loading.value = false
-  }
-}
+const poller = createStatusPoller(
+  () => api<LibraryStatus>('/status'),
+  value => { status.value = value; error.value = ''; loading.value = false },
+  e => { error.value = (e as Error).message; loading.value = false },
+)
+const refresh = poller.refresh
 
 function close() {
   const from = typeof route.query.from === 'string' ? route.query.from : '/'
   router.replace(from)
 }
 
-onMounted(refresh)
+onMounted(poller.start)
+onBeforeUnmount(poller.stop)
 </script>
 
 <template>

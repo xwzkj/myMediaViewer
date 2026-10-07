@@ -232,3 +232,18 @@
 .source-preview strong { display: block; font-size: 11px; font-weight: 600; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
 .source-preview pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 340px; overflow: auto; font-family: ui-monospace, SFMemo-Regular, Consolas, monospace; font-size: 11px; line-height: 1.6; background: var(--surface-high); padding: 10px; border-radius: 8px; color: var(--text); }
 @media (max-width: 600px) { .rule-grid { grid-template-columns: 1fr; } .source-rule-editor { padding: 14px; } .preset-actions { padding: 12px; gap: 8px; } .source-script { min-height: 240px; } }
+.source-code-editor { min-width: 0; width: 100%; border: 1px solid var(--outline); border-radius: 9px; overflow: hidden; }
+.source-code-editor.has-errors { border-color: var(--error, #c45a5a); }
+.source-code-editor .cm-editor.cm-focused { outline: 1px solid var(--primary); }
+.file-rule-control { min-width: 0; display: grid; gap: 9px; }
+.editor-error { color: var(--error, #c45a5a); font: 12px/1.6 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+.rule-guide { padding: 16px; border: 1px solid var(--outline); background: var(--surface); border-radius: 12px; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.rule-guide p { margin: 9px 0; }
+.rule-guide code { color: var(--primary); }
+.rule-guide table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.rule-guide th, .rule-guide td { text-align: left; border-bottom: 1px solid var(--outline); padding: 6px; }
+.metadata-rule-block { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--outline); border-radius: 10px; }
+/* Existing .helper uses flex for icon + text; editor prose contains inline code instead. */
+.source-rule-editor .helper { display: block; line-height: 1.8; }
+.source-rule-editor h4 { margin: 0; }
+.input-contract { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.8 Consolas, monospace; background: var(--surface-low); border-radius: 8px; padding: 12px; margin-top: 12px; color: var(--text); }

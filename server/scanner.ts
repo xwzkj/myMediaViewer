@@ -1,10 +1,11 @@
 import path from 'node:path'
+import { setImmediate as yieldToRequests } from 'node:timers/promises'
 import { createHash } from 'node:crypto'
 import { sources } from './config.js'
 import { db, saveSource, type StoredAsset, type StoredWork } from './database.js'
 import { emptyMetadata, type Metadata } from './parsers.js'
-import { collectGroups, extractGroup, groupStamp, groupWorkId, rulesFor, type Group } from './source-engine.js'
-import type { ScanStatus, Source } from '../shared/types.js'
+import { collectGroups, extractGroup, groupStamp, groupWorkId, rulesFor } from './source-engine.js'
+import type { ScanStatus } from '../shared/types.js'
 import { formatDuration, logError, logInfo, logWarn } from './log.js'
 
 export const scanStatus: ScanStatus = { running: false, phase: '尚未扫描', files: 0, works: 0, startedAt: null, finishedAt: null, errors: [] }
@@ -12,49 +13,69 @@ export const sourceOnline = new Map<string, boolean>()
 let afterScan: () => void = () => {}
 export function onScan(callback: () => void) { afterScan = callback }
 
-async function metadata(source: Source, group: Group): Promise<Metadata> {
-  const key = groupWorkId(source, group), stamp = groupStamp(source, group)
-  const row = db.prepare('SELECT stamp, data FROM group_metadata_cache WHERE key = ?').get(key) as { stamp: string; data: string } | undefined
-  if (row?.stamp === stamp) return JSON.parse(row.data)
-  const value = await extractGroup(source, group)
-  db.prepare('INSERT OR REPLACE INTO group_metadata_cache VALUES (?, ?, ?)').run(key, stamp, JSON.stringify(value))
-  return value
-}
-
 export interface ScanOptions {
-  /** manual：用户手动刷新或启动时整理，逐目录汇报；auto：每 5 分钟的对账，只在发现变化或出错时说话。 */
-  reason?: 'manual' | 'auto'
+  /** Omit to scan the entire library. Configuration changes pass only the changed source. */
+  sourceIds?: string[]
+  reason?: 'manual' | 'startup' | 'source-change'
 }
 
 export async function scanLibrary(options: ScanOptions = {}): Promise<void> {
   if (scanStatus.running) return
-  const manual = options.reason !== 'auto'
+  const selected = options.sourceIds ? sources.filter(s => options.sourceIds!.includes(s.id)) : [...sources]
   const started = Date.now()
-  const previous = { files: scanStatus.files, works: scanStatus.works }
   Object.assign(scanStatus, { running: true, phase: '正在读取目录', files: 0, works: 0, startedAt: started, errors: [] })
-  if (manual) logInfo('扫描', `开始检查 ${sources.length} 个媒体目录`)
+  logInfo('扫描', `开始检查 ${selected.length} 个媒体目录`)
   try {
-    for (const source of sources) {
+    for (const source of selected) {
       const sourceStarted = Date.now()
       const baseline = scanStatus.works
       scanStatus.phase = `正在整理 ${source.name}`
       try {
         const rules = rulesFor(source)
-        const collected = await collectGroups(source)
-        scanStatus.files += collected.matched
+        const fileBaseline = scanStatus.files
+        const collected = await collectGroups(source, Infinity, matched => { scanStatus.files = fileBaseline + matched })
+        scanStatus.files = fileBaseline + collected.matched
         scanStatus.errors.push(...collected.errors.map(e => `${source.name}: ${e}`))
+        const collectedAt = Date.now()
+        const ruleJSON = JSON.stringify(rules)
+        const cachedRows = new Map((db.prepare('SELECT key, stamp, data FROM group_metadata_cache WHERE key IN (SELECT id FROM works WHERE source_id = ?)').all(source.id) as Array<{key: string; stamp: string; data: string}>).map(row => [row.key, row]))
+        const pendingCache: Array<{key: string; stamp: string; data: string}> = []
+        const detailsByGroup: Metadata[] = new Array(collected.groups.length)
+        let next = 0, hits = 0, completed = 0
+        // Two independent runtimes, bounded input preparation and no unbounded sandbox queue.
+        await Promise.all(Array.from({length: Math.min(2, collected.groups.length)}, async () => {
+          while (next < collected.groups.length) {
+            const index = next++, group = collected.groups[index]
+            const key = groupWorkId(source, group), stamp = groupStamp(source, group, ruleJSON)
+            const row = cachedRows.get(key)
+            try {
+              if (row?.stamp === stamp) { detailsByGroup[index] = JSON.parse(row.data); hits++ }
+              else {
+                const value = await extractGroup(source, group)
+                detailsByGroup[index] = value
+                pendingCache.push({key, stamp, data: JSON.stringify(value)})
+              }
+            } catch (error) {
+              detailsByGroup[index] = emptyMetadata()
+              if (scanStatus.errors.length < 200) scanStatus.errors.push(`${source.name} / ${group.id}: ${(error as Error).message}`)
+            }
+            completed++
+            scanStatus.phase = `正在整理 ${source.name} · 元信息 ${completed}/${collected.groups.length}`
+            if (index % 128 === 0) await yieldToRequests()
+          }
+        }))
+        const extractedAt = Date.now()
         const works: StoredWork[] = [], assets: StoredAsset[] = []
-        for (const group of collected.groups) {
+        const natural = new Intl.Collator('en', { numeric: true }).compare
+        for (const [groupIndex, group] of collected.groups.entries()) {
           const { id: externalId, entries } = group
           const media = entries.filter(e => !e.metadata)
           const id = groupWorkId(source, group)
-          let details: Metadata = emptyMetadata()
-          try { details = await metadata(source, group) }
-          catch (error) { if (scanStatus.errors.length < 200) scanStatus.errors.push(`${source.name} / ${externalId}: ${(error as Error).message}`) }
+          const details = detailsByGroup[groupIndex]
           const priority = (entry: typeof media[number]) => entry.kind === 'animation' && entry.extension === 'webm' ? 2 : 1
           media.sort((a, b) => (a.page ?? 0) - (b.page ?? 0)
             || (rules.duplicates === 'page' && a.page !== undefined && b.page !== undefined ? priority(b) - priority(a) || b.modified - a.modified : 0)
-            || a.relativePath.localeCompare(b.relativePath, 'en', { numeric: true }))
+            || natural(a.relativePath, b.relativePath))
           // Missing page numbers never collapse unrelated files. Presets explicitly capture a default page.
           const seen = new Set<string>()
           const workAssets: StoredAsset[] = media.map((entry, index) => {
@@ -80,10 +101,11 @@ export async function scanLibrary(options: ScanOptions = {}): Promise<void> {
             coverId: visible[0].id,
           })
           scanStatus.works++
+          if (groupIndex % 128 === 0) await yieldToRequests()
         }
-        saveSource(source, works, assets)
+        saveSource(source, works, assets, pendingCache)
         sourceOnline.set(source.id, true)
-        if (manual) logInfo('扫描', `${source.name}：整理出 ${scanStatus.works - baseline} 组作品 · 用时 ${formatDuration(Date.now() - sourceStarted)}`)
+        logInfo('扫描', `${source.name}：整理出 ${scanStatus.works - baseline} 组作品 · 用时 ${formatDuration(Date.now() - sourceStarted)}（枚举/匹配 ${formatDuration(collectedAt - sourceStarted)} · 元信息 ${formatDuration(extractedAt - collectedAt)} · 缓存 ${hits}/${collected.groups.length}）`)
       } catch (error) {
         sourceOnline.set(source.id, false)
         const detail = `${source.name} 扫描失败，保留已有索引：${(error as Error).message}`
@@ -96,12 +118,8 @@ export async function scanLibrary(options: ScanOptions = {}): Promise<void> {
   } finally {
     scanStatus.running = false
     scanStatus.finishedAt = Date.now()
-    // 定时对账大多数时候没有变化，静默处理；只有内容或文件数变了、或出错才留下记录。
-    const changed = scanStatus.files !== previous.files || scanStatus.works !== previous.works
-    if (manual || changed || scanStatus.errors.length) {
-      const summary = `完成 · ${scanStatus.works} 组作品 / ${scanStatus.files} 个文件 · 用时 ${formatDuration(Date.now() - started)}`
-      if (scanStatus.errors.length) logWarn('扫描', `${summary} · ${scanStatus.errors.length} 处需要检查`)
-      else logInfo('扫描', summary)
-    }
+    const summary = `完成 · ${scanStatus.works} 组作品 / ${scanStatus.files} 个文件 · 用时 ${formatDuration(Date.now() - started)}`
+    if (scanStatus.errors.length) logWarn('扫描', `${summary} · ${scanStatus.errors.length} 处需要检查`)
+    else logInfo('扫描', summary)
   }
 }

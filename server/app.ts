@@ -140,7 +140,7 @@ export async function createApp(logging = true) {
     if (scanStatus.running) return reply.code(409).send({ message: '扫描完成后再修改目录' })
     saveSources([...sources, source])
     logInfo('目录', `新增「${source.name}」· ${source.path}`)
-    void scanLibrary().catch(onScanFailed)
+    void scanLibrary({ sourceIds: [source.id], reason: 'source-change' }).catch(onScanFailed)
     return reply.code(201).send(source)
   })
   app.put<{ Params: { id: string }; Body: Omit<Source, 'id'> }>('/api/sources/:id', { bodyLimit: 256 * 1024, schema: { body: sourceBody } }, async (request, reply) => {
@@ -151,7 +151,7 @@ export async function createApp(logging = true) {
     if (scanStatus.running) return reply.code(409).send({ message: '扫描完成后再修改目录' })
     saveSources(sources.map(s => s.id === existing.id ? source : s))
     logInfo('目录', `更新「${source.name}」· ${source.path}`)
-    void scanLibrary().catch(onScanFailed)
+    void scanLibrary({ sourceIds: [source.id], reason: 'source-change' }).catch(onScanFailed)
     return source
   })
   app.delete<{ Params: { id: string } }>('/api/sources/:id', async (request, reply) => {

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import type { DirectoryEntry, LibraryStatus, Source } from '../../shared/types'
+import SourceEditorDialog from './SourceEditorDialog.vue'
 import SourceRuleEditor from './SourceRuleEditor.vue'
 import { customRules, sourcePreset } from '../../shared/source-presets'
 import Icon from './Icon.vue'
@@ -32,7 +33,7 @@ function edit(source?: Source) {
   rules.value = source?.rules ? JSON.parse(JSON.stringify(source.rules)) : source && source.kind !== 'custom' ? sourcePreset(source.kind) : customRules()
   previewErrors.value = false; acceptPreviewErrors.value = false; invalidRules.value = false
   error.value = ''; deleting.value = null; formVisible.value = true
-  if (!source) pickerVisible.value = true
+  pickerVisible.value = false
 }
 function chooseFolder(directory: DirectoryEntry) {
   folder.value = directory.path
@@ -71,15 +72,8 @@ async function remove(id: string) {
           <div class="source-item-main"><span class="source-symbol"><Icon name="folder" /></span><div class="source-text"><h4>{{ source.name }} <span class="tiny-badge">{{ source.rules?.preset ? `${source.rules.preset} 预设` : '自定义规则' }}</span></h4><p :title="source.path">{{ source.path }}</p><span class="source-meta" :class="{ 'error-text': !source.online }">{{ source.online ? `${source.works} 组作品` : '目录离线 · 已保留索引' }}</span></div><button class="icon-button" :disabled="busy" :aria-label="`编辑 ${source.name}`" @click="edit(source)"><Icon name="edit" :size="20" /></button><button class="icon-button" :disabled="busy" :aria-label="`移除 ${source.name}`" @click="deleting = source.id"><Icon name="delete" :size="20" /></button></div>
           <div v-if="deleting === source.id" class="delete-confirm"><p>移除这个目录及它的收藏记录？原始文件会保留。</p><div><button class="button text small" @click="deleting = null">取消</button><button class="button danger small" :disabled="busy" @click="remove(source.id)">移除目录</button></div></div>
         </div>
-        <form v-if="formVisible" class="source-form" @submit.prevent="save">
-          <h4>{{ editing ? '编辑媒体目录' : '添加媒体目录' }}</h4>
-          <label class="field">目录名称<input v-model="name" required maxlength="60" placeholder="例如：我的插画收藏" autofocus /></label>
-          <div class="field folder-field"><span id="media-folder-label">媒体文件夹</span><button type="button" class="folder-choice" :disabled="busy" aria-labelledby="media-folder-label selected-folder-path" @click="pickerVisible = true"><Icon name="folder-open" :size="23" /><span id="selected-folder-path" :class="{ 'folder-placeholder': !folder }">{{ folder || '点击浏览并选择文件夹' }}</span><span class="folder-choice-action">{{ folder ? '更改' : '浏览' }}<Icon name="right" :size="17" /></span></button><span>选择这台电脑上的文件夹，里面的媒体会自动整理。</span></div>
-          <SourceRuleEditor v-model="rules" :folder="folder" :name="name" :disabled="!!busy" @busy="previewBusy = $event" @invalid="invalidRules = $event" @preview-errors="previewErrors = $event; acceptPreviewErrors = false" />
-          <label v-if="previewErrors" class="helper"><input v-model="acceptPreviewErrors" type="checkbox" />预览存在错误，仍然保存（失败的元信息将使用默认值）</label>
-          <div class="form-actions"><button type="button" class="button text" @click="formVisible = false">取消</button><button class="button filled" :disabled="busy || invalidRules || !folder || (previewErrors && !acceptPreviewErrors)"><Icon name="check" :size="18" />{{ saving ? '正在保存…' : '保存并扫描' }}</button></div>
-        </form>
-        <p v-if="error" class="inline-error" role="alert"><Icon name="warning" :size="20" />{{ error }}</p>
+
+        <p v-if="error && !formVisible" class="inline-error" role="alert"><Icon name="warning" :size="20" />{{ error }}</p>
         <p v-if="status?.scan.running" class="helper"><Icon name="refresh" class="spinning" :size="16" />{{ status.scan.phase }} · {{ status.scan.files }} 个文件</p>
       </section>
       <section class="settings-section"><div class="section-heading"><div><h3>在其他设备上访问</h3><p>同一 Wi-Fi 下，在浏览器中打开以下地址。</p></div><Icon name="lan" /></div><div class="network-addresses"><code v-for="address in status?.addresses" :key="address">{{ address }}</code><p v-if="!status?.addresses.length">暂未检测到局域网地址。</p></div><p class="helper">保持这台电脑和服务运行。首次连接时，允许 Windows 防火墙的专用网络访问。</p><p class="helper"><Icon :name="status?.publicAccess ? 'warning' : 'success'" :size="16" />{{ status?.publicAccess ? '当前允许公网地址访问，请只在可信网络中开放端口。' : '默认只服务局域网与保留地址。需要公网访问时，把环境变量 ALLOW_PUBLIC_ACCESS 设为 1 再重启服务。' }}</p></section>
@@ -89,5 +83,15 @@ async function remove(id: string) {
       <footer class="settings-footer"><Icon name="leaf" :size="18" />拾光 · 让喜欢的，留在身边。<span>v0.1.0</span></footer>
     </div>
   </main>
+  <SourceEditorDialog v-if="formVisible" :title="editing ? '编辑媒体来源' : '添加媒体来源'" :busy="saving || previewBusy" @close="formVisible = false; pickerVisible = false">
+        <form class="source-form" @submit.prevent="save">
+          <label class="field">目录名称<input v-model="name" required maxlength="60" placeholder="例如：我的插画收藏" autofocus /></label>
+          <div class="field folder-field"><span id="media-folder-label">媒体文件夹</span><button type="button" class="folder-choice" :disabled="busy" aria-labelledby="media-folder-label selected-folder-path" @click="pickerVisible = true"><Icon name="folder-open" :size="23" /><span id="selected-folder-path" :class="{ 'folder-placeholder': !folder }">{{ folder || '点击浏览并选择文件夹' }}</span><span class="folder-choice-action">{{ folder ? '更改' : '浏览' }}<Icon name="right" :size="17" /></span></button><span>选择这台电脑上的文件夹，里面的媒体会自动整理。</span></div>
+          <SourceRuleEditor v-model="rules" :folder="folder" :name="name" :disabled="!!busy" @busy="previewBusy = $event" @invalid="invalidRules = $event" @preview-errors="previewErrors = $event; acceptPreviewErrors = false" />
+          <label v-if="previewErrors" class="helper"><input v-model="acceptPreviewErrors" type="checkbox" />预览存在错误，仍然保存（失败的元信息将使用默认值）</label>
+          <p v-if="error" class="inline-error" role="alert">{{ error }}</p>
+          <div class="form-actions"><button type="button" class="button text" :disabled="saving || previewBusy" @click="formVisible = false">取消</button><button class="button filled" :disabled="busy || invalidRules || !folder || (previewErrors && !acceptPreviewErrors)"><Icon name="check" :size="18" />{{ saving ? '正在保存…' : '保存并扫描' }}</button></div>
+        </form>
+  </SourceEditorDialog>
   <FolderPicker v-if="pickerVisible" :initial-path="folder" :shortcuts="shortcuts" @select="chooseFolder" @close="pickerVisible = false" />
 </template>

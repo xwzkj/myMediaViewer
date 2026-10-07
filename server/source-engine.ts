@@ -1,3 +1,4 @@
+import type { Stats } from 'node:fs'
 import { readdir, lstat, realpath, open } from 'node:fs/promises'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
@@ -51,16 +52,30 @@ export async function readSnapshot(root: string, entry: Entry): Promise<string> 
     return decodeText(buffer.subarray(0, offset))
   } finally { await handle.close() }
 }
-export async function collectGroups(source: Source, limit = Infinity) {
+export async function collectGroups(source: Source, limit = Infinity, progress?: (matched: number) => void) {
   const rules = rulesFor(source), root = path.resolve(source.path)
   await safePath(root, root)
   const groups = new Map<string, Group>(), errors: string[] = []
   let enumerated = 0, matched = 0, truncated = false
+  const natural = new Intl.Collator('en', { numeric: true }).compare
   let batch: string[] = []
   const flush = async () => {
     if (!batch.length) return
     const files = batch; batch = []
-    const results = await sandbox<Array<{ metadata: boolean; captures: Record<string, string> } | null>>({ type: 'match', rules, names: files.map(f => path.basename(f)) })
+    const results = await sandbox<Array<{ metadata: boolean; captures: Record<string, string> } | null>>({ type: 'match', rules, names: files.map(f => path.relative(root, f).split(path.sep).join('/')) })
+    // Keep every path check, but overlap filesystem calls with bounded concurrency.
+    const inspected = new Map<number, Stats | Error>()
+    let cursor = 0
+    await Promise.all(Array.from({length: Math.min(16, files.length)}, async () => {
+      while (cursor < files.length) {
+        const i = cursor++, result = results[i]
+        if (!result) continue
+        const ext = path.extname(files[i]).slice(1).toLowerCase()
+        if (!result.metadata && !images.has(ext) && !videos.has(ext) && ext !== 'gif') continue
+        try { await safePath(root, files[i]); inspected.set(i, await lstat(files[i])) }
+        catch (error) { inspected.set(i, error as Error) }
+      }
+    }))
     for (let i = 0; i < files.length; i++) {
       const result = results[i]; if (!result) continue
       const file = files[i], filename = path.basename(file), extension = path.extname(filename).slice(1).toLowerCase()
@@ -74,8 +89,9 @@ export async function collectGroups(source: Source, limit = Infinity) {
           if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error(`${key} 必须为非负安全整数`)
           return Number(value)
         }
-        await safePath(root, file)
-        const info = await lstat(file)
+        const info = inspected.get(i)
+        if (info instanceof Error) throw info
+        if (!info) continue
         if (!info.isFile()) continue
         const relativePath = path.relative(root, file).split(path.sep).join('/')
         const directory = rules.scope === 'directory' ? path.posix.dirname(relativePath) : ''
@@ -87,11 +103,12 @@ export async function collectGroups(source: Source, limit = Infinity) {
         groups.set(key, group); matched++
       } catch (e) { if (errors.length < 100) errors.push(`${filename}: ${(e as Error).message}`) }
     }
+    progress?.(matched)
   }
   const walk = async (folder: string): Promise<void> => {
     await safePath(root, folder)
     const entries = await readdir(folder, { withFileTypes: true })
-    entries.sort((a,b) => a.name.localeCompare(b.name, 'en', { numeric: true }))
+    entries.sort((a,b) => natural(a.name, b.name))
     for (const entry of entries) {
       if (truncated) return
       if (entry.isSymbolicLink()) continue
@@ -111,12 +128,12 @@ export function groupWorkId(source: Source, group: Group): string {
   return rulesFor(source).scope === 'source' ? `${source.id}:${group.id}`
     : `v2:${JSON.stringify([source.id, group.directory, group.id])}`
 }
-export function groupStamp(source: Source, group: Group): string {
-  return createHash('sha256').update(JSON.stringify([2, rulesFor(source), group.id, group.directory,
-    group.entries.map(e => [e.relativePath, e.identity, e.captures])])).digest('hex')
+export function groupStamp(source: Source, group: Group, rulesJSON = JSON.stringify(rulesFor(source))): string {
+  return createHash('sha256').update('[3,' + rulesJSON + ',' + JSON.stringify(group.id) + ',' + JSON.stringify(group.directory) + ',' +
+    JSON.stringify(group.entries.map(e => [e.relativePath, e.identity, e.captures])) + ']').digest('hex')
 }
 function publicFile(e: Entry): ScriptFile {
-  return { filename: e.filename, relativePath: e.relativePath, extension: e.extension, size: e.size, modified: e.modified, captures: e.captures, page: e.page, sequence: e.sequence }
+  return { filename: e.filename, relativePath: e.relativePath, directory: e.relativePath.includes('/') ? e.relativePath.slice(0, e.relativePath.lastIndexOf('/')) : '', directoryName: e.relativePath.split('/').at(-2) ?? '', extension: e.extension, size: e.size, modified: e.modified, captures: e.captures, page: e.page, sequence: e.sequence }
 }
 export async function extractGroup(source: Source, group: Group): Promise<MetadataFields> {
   const files = group.entries.filter(e => e.metadata)
@@ -131,7 +148,7 @@ export async function previewSource(source: Source): Promise<SourcePreview> {
   const collected = await collectGroups(source, 5000)
   const result: SourcePreview = { enumerated: collected.enumerated, truncated: collected.truncated || collected.groups.length > 20, errors: collected.errors, groups: [] }
   for (const group of collected.groups.slice(0, 20)) {
-    const row: SourcePreview['groups'][number] = { id: group.id, directory: group.directory,
+    const row: SourcePreview['groups'][number] = { id: group.id, directory: group.directory, captures: group.entries.map(e => ({relativePath: e.relativePath, metadata: e.metadata, captures: e.captures})),
       media: group.entries.filter(e => !e.metadata).map(e => e.relativePath), metadata: group.entries.filter(e => e.metadata).map(e => e.relativePath) }
     if (result.groups.length < 5) {
       try { row.result = await extractGroup(source, group) }
