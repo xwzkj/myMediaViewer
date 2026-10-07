@@ -12,6 +12,9 @@ import { refreshSearch, searchWorks, suggestTags } from './search.js'
 import { scanLibrary, scanStatus, onScan, sourceOnline } from './scanner.js'
 import { accessibleAsset, sendMedia, thumbnail, detectFFmpeg, ffmpegAvailable, convert, conversionStatus, conversionPath } from './media.js'
 import type { Source, LibraryStatus, AiTranslateFields } from '../shared/types.js'
+import { sourcePreset } from '../shared/source-presets.js'
+import { validateRules } from './source-sandbox.js'
+import { previewSource } from './source-engine.js'
 import { listDirectories } from './directories.js'
 import { getAiSettings, saveAiSettings, testAiConnection, listAiModels, translateFields, clearTranslationCache } from './ai.js'
 import { getAutoMangaTranslation, getMangaJob, getMangaModelStatus, mangaBaseImagePath, startMangaTranslation } from './ai/manga/service.js'
@@ -100,10 +103,10 @@ export async function createApp(logging = true) {
   })
 
   const sourceBody = {
-    type: 'object', additionalProperties: false, required: ['name', 'path', 'kind'],
-    properties: { name: { type: 'string', minLength: 1, maxLength: 60 }, path: { type: 'string', minLength: 1, maxLength: 2048 }, kind: { type: 'string', enum: ['pixiv', 'telegram'] } },
+    type: 'object', additionalProperties: false, required: ['name', 'path'],
+    properties: { name: { type: 'string', minLength: 1, maxLength: 60 }, path: { type: 'string', minLength: 1, maxLength: 2048 }, kind: { type: 'string', enum: ['pixiv', 'telegram', 'custom'] }, rules: { type: 'object', additionalProperties: true } },
   } as const
-  async function validateSource(body: Omit<Source, 'id'>, except?: string) {
+  async function validateSource(body: Omit<Source, 'id'>, except?: string, preview = false) {
     const raw = body.path.trim().replace(/^"|"$/g, '')
     if (!path.isAbsolute(raw)) throw Object.assign(new Error('请输入服务器上的完整目录路径'), { statusCode: 400 })
     let resolved: string
@@ -112,13 +115,26 @@ export async function createApp(logging = true) {
       if (!(await stat(resolved)).isDirectory()) throw new Error()
     } catch { throw Object.assign(new Error('目录不存在或服务器没有读取权限'), { statusCode: 400 }) }
     const canonical = (p: string) => process.platform === 'win32' ? p.toLowerCase() : p
-    if (sources.some(s => s.id !== except && canonical(path.resolve(s.path)) === canonical(resolved))) {
+    if (!preview && sources.some(s => s.id !== except && canonical(path.resolve(s.path)) === canonical(resolved))) {
       throw Object.assign(new Error('这个目录已经在媒体库中'), { statusCode: 409 })
     }
     if (!body.name.trim()) throw Object.assign(new Error('请输入目录名称'), { statusCode: 400 })
-    return { name: body.name.trim(), path: resolved, kind: body.kind }
+    const rules = body.rules ?? (body.kind === 'pixiv' || body.kind === 'telegram' ? sourcePreset(body.kind) : undefined)
+    try { await validateRules(rules) } catch (error) { throw Object.assign(new Error((error as Error).message), { statusCode: 400 }) }
+    return { name: body.name.trim(), path: resolved, kind: body.rules ? 'custom' as const : body.kind, rules }
+
   }
-  app.post<{ Body: Omit<Source, 'id'> }>('/api/sources', { schema: { body: sourceBody } }, async (request, reply) => {
+  app.get('/api/source-presets', async () => (['pixiv', 'telegram'] as const).map(id => ({ id, name: id === 'pixiv' ? 'Pixiv' : 'Telegram', rules: sourcePreset(id) })))
+  let previewRunning = false
+  app.post<{ Body: Omit<Source, 'id'> }>('/api/sources/preview', { bodyLimit: 256 * 1024, schema: { body: sourceBody } }, async (request, reply) => {
+    if (previewRunning || scanStatus.running) return reply.code(409).send({ message: '正在预览或扫描，请稍后重试' })
+    previewRunning = true
+    try {
+      const source = { ...await validateSource(request.body, undefined, true), id: 'preview' }
+      return await previewSource(source)
+    } finally { previewRunning = false }
+  })
+  app.post<{ Body: Omit<Source, 'id'> }>('/api/sources', { bodyLimit: 256 * 1024, schema: { body: sourceBody } }, async (request, reply) => {
     if (scanStatus.running) return reply.code(409).send({ message: '扫描完成后再修改目录' })
     const source = { ...await validateSource(request.body), id: randomUUID() }
     if (scanStatus.running) return reply.code(409).send({ message: '扫描完成后再修改目录' })
@@ -127,7 +143,7 @@ export async function createApp(logging = true) {
     void scanLibrary().catch(onScanFailed)
     return reply.code(201).send(source)
   })
-  app.put<{ Params: { id: string }; Body: Omit<Source, 'id'> }>('/api/sources/:id', { schema: { body: sourceBody } }, async (request, reply) => {
+  app.put<{ Params: { id: string }; Body: Omit<Source, 'id'> }>('/api/sources/:id', { bodyLimit: 256 * 1024, schema: { body: sourceBody } }, async (request, reply) => {
     if (scanStatus.running) return reply.code(409).send({ message: '扫描完成后再修改目录' })
     const existing = sources.find(s => s.id === request.params.id)
     if (!existing) return reply.code(404).send({ message: '目录不存在' })
@@ -145,6 +161,7 @@ export async function createApp(logging = true) {
     saveSources(sources.filter(s => s.id !== request.params.id))
     db.exec('BEGIN')
     try {
+      db.prepare('DELETE FROM group_metadata_cache WHERE key IN (SELECT id FROM works WHERE source_id = ?)').run(request.params.id)
       db.prepare('DELETE FROM assets WHERE work_id IN (SELECT id FROM works WHERE source_id = ?)').run(request.params.id)
       db.prepare('DELETE FROM favorites WHERE work_id IN (SELECT id FROM works WHERE source_id = ?)').run(request.params.id)
       db.prepare('DELETE FROM works WHERE source_id = ?').run(request.params.id)

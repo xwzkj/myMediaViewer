@@ -1,6 +1,24 @@
-export type SourceKind = 'pixiv' | 'telegram'
+export type SourceKind = 'pixiv' | 'telegram' | 'custom'
 export type MediaKind = 'image' | 'video' | 'animation'
-export interface Source { id: string; name: string; kind: SourceKind; path: string }
+export interface FileRule { mode: 'template' | 'regex'; pattern: string; caseSensitive: boolean; defaultPage?: number }
+export interface SourceRules {
+  version: 1; media: FileRule; metadata: FileRule[];
+  scope: 'source' | 'directory'; duplicates: 'all' | 'page';
+  typeOverrides: Record<string, MediaKind>; script: string;
+  preset?: 'pixiv' | 'telegram'
+}
+// kind is retained for API compatibility/display only, never for scanning.
+export interface Source { id: string; name: string; kind: SourceKind; path: string; rules?: SourceRules }
+export interface MetadataFields { title: string; author: string; description: string; tags: string[]; date: string; originalUrl: string }
+export interface ScriptFile {
+  filename: string; relativePath: string; extension: string; size: number; modified: number;
+  captures: Record<string, string>; page?: number; sequence?: number
+}
+export interface ScriptInput { id: string; directory: string; media: ScriptFile[]; files: Array<ScriptFile & { text: string }> }
+export interface SourcePreview {
+  enumerated: number; truncated: boolean; errors: string[];
+  groups: Array<{ id: string; directory: string; media: string[]; metadata: string[]; result?: MetadataFields; error?: string }>
+}
 export interface Asset {
   id: string; workId: string; filename: string; page: number; kind: MediaKind;
   extension: string; size: number; modified: number; url: string; thumbnail: string

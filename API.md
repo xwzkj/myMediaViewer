@@ -5,7 +5,7 @@
 ## 1. 通用约定
 
 - 请求与响应使用 JSON，媒体下载接口返回二进制。发送 JSON 时设置 `Content-Type: application/json`。
-- 请求体最大为 16,384 字节（16 KiB），超出返回 413；图片翻译提交媒体 ID，不上传图片。
+- 默认请求体最大为 16,384 字节（16 KiB），来源新增/编辑/预览接口为 256 KiB，超出返回 413；图片翻译提交媒体 ID，不上传图片。
 - `id`、`assetId`、缓存 `key` 均应作为不透明标识使用。放入 URL 路径时用 `encodeURIComponent` 编码。
 - 时间戳字段（如 `modified`、`updated`、`createdAt`、`startedAt`）为 Unix 毫秒；`elapsed`、`timeoutMs` 的单位也是毫秒。作品 `date` 是日期字符串，不保证总带有时分秒。
 - 文档中的示例 ID 为占位值，实际调用先从目录、作品或任务响应中取得 ID。
@@ -60,6 +60,8 @@
 | GET | `/api/status` | 媒体库、扫描及网络状态 |
 | POST | `/api/scan` | 触发扫描 |
 | GET | `/api/directories` | 浏览服务端目录 |
+| GET | `/api/source-presets` | 获取可编辑 Pixiv / Telegram 预设 |
+| POST | `/api/sources/preview` | 只读真实文件预览 |
 | POST | `/api/sources` | 添加媒体来源 |
 | PUT | `/api/sources/:id` | 修改媒体来源 |
 | DELETE | `/api/sources/:id` | 移除媒体来源 |
@@ -91,7 +93,8 @@
 | --- | --- | --- |
 | id | string | 服务端生成的 UUID |
 | name | string | 显示名称 |
-| kind | `pixiv` / `telegram` | 文件命名与分组规则 |
+| kind | `pixiv` / `telegram` / `custom` | 兼容展示字段，不驱动扫描 |
+| rules | SourceRules | 版本化规则与元信息脚本（见下文） |
 | path | string | 服务端实际目录的绝对路径 |
 
 ### 3.2 Work：作品列表项
@@ -100,12 +103,12 @@
 | --- | --- | --- |
 | id | string | 作品标识 |
 | sourceId / sourceName | string | 所属媒体来源 ID / 名称 |
-| sourceKind | `pixiv` / `telegram` | 来源类型 |
+| sourceKind | `pixiv` / `telegram` / `custom` | 兼容字段，界面显示 sourceName |
 | externalId | string | 从命名规则提取的外部作品编号 |
 | title / author / description | string | 标题、作者、简介，可能为空或使用回退标题 |
 | tags | string[] | 标签 |
 | date | string | 发布日期，缺失元数据时由扫描器推导 |
-| collected | number | 文件名中的收藏编号或消息号，不是时间戳 |
+| collected | number | 最大 sequence；没有 sequence 时为文件修改时间戳 |
 | updated | number | 相关文件最新修改时间 |
 | count | number | 分组中用于展示的媒体数量 |
 | kind | `image` / `video` / `animation` | 作品媒体类型 |
@@ -204,7 +207,7 @@
 { "name": "插画", "path": "E:\\Media\\Pixiv", "kind": "pixiv" }
 ```
 
-三个字段均必填：`name` 长度 1–60，`path` 长度 1–2048，`kind` 为 `pixiv` 或 `telegram`。名称去除首尾空格后不能为空；路径必须为服务端可访问的绝对目录，服务端解析真实路径。
+`name` 和 `path` 必填，长度分别为 1–60、1–2048。推荐提供 `rules`；兼容旧请求的 `kind: pixiv/telegram`，服务端会转换成对应规则和脚本文本。两者都有时以 `rules` 为准，返回 `kind: custom`。名称去除首尾空格后不能为空；路径必须为服务端可访问的绝对目录，服务端解析真实路径。
 
 成功返回 201 和完整 Source，并自动触发扫描。错误包括 400（路径、名称不合法）、409（重复目录或扫描中）。Windows 下目录重复比较忽略大小写。
 
@@ -225,6 +228,78 @@
 删除来源配置以及该来源的作品索引、媒体索引、收藏记录，不删除原始媒体文件。扫描中返回 409，不存在返回 404。
 
 来源列表通过 GET `/api/status` 的 `sources` 获取；没有单独的 GET `/api/sources`。
+
+
+### 4.7 SourceRules 与元信息脚本
+
+新增/编辑来源的 `rules` 结构如下（下面是 TypeScript 示意，不是额外路由）：
+
+```ts
+interface FileRule {
+  mode: 'template' | 'regex';
+  pattern: string;               // 最多 4096 字符，必须捕获 id
+  caseSensitive: boolean;
+  defaultPage?: number;          // 媒体缺失页码的兼容默认值，不填则不折叠
+}
+interface SourceRules {
+  version: 1;
+  media: FileRule;
+  metadata: FileRule[];          // 0–16 条，重复命中只读一次
+  scope: 'source' | 'directory';
+  duplicates: 'all' | 'page';
+  typeOverrides: Record<string, 'image' | 'video' | 'animation'>;
+  script: string;                // 最多 128 KiB
+  preset?: 'pixiv' | 'telegram'; // 仅说明配置来源，不影响执行
+}
+```
+
+模板 `{id}[_p{page}].{ext}`；反斜杠转义特殊字符，中括号为可选段。高级正则使用命名组 `(?<id>...)`，统一完整匹配，只支持大小写开关。`page`、`sequence` 必须为非负安全整数；其他捕获字段透传。规则匹配文件名，不匹配路径，元文件优先。媒体支持 jpg/jpeg/png/webp/avif/bmp/gif/mp4/mov/webm/mkv/m4v/avi。
+
+脚本 `export async function extract(input)` 的输入是深度冻结的 JSON：
+
+```ts
+interface ScriptFile {
+  filename: string; relativePath: string; extension: string;
+  size: number; modified: number; captures: Record<string, string>;
+  page?: number; sequence?: number;
+}
+interface ScriptInput {
+  id: string; directory: string;
+  media: ScriptFile[];
+  files: (ScriptFile & { text: string })[];
+}
+```
+
+全来源分组时 `directory` 为空。只提供本组匹配元文件的内容，不提供文件访问 API、宿主绝对路径或网络。返回 `title/author/description/date/originalUrl` 字符串和 `tags: string[]`，均可省略，其余字段丢弃；标题/作者/日期最多 2000 字符、简介 100000、URL 4096、标签最多 1000 个且单个最多 200 字符。日期须可解析，URL 限 HTTP(S)。错误和超限不影响媒体入库。
+
+限制及迁移方式参见 README「沙箱与限制」。配置保存时在沙箱内校验模块与 extract 入口，不运行 extract；顶层代码也受时间/内存限制，不可联网或导入模块。
+
+### 4.8 GET /api/source-presets
+
+返回数组 `[{ id: 'pixiv', name: 'Pixiv', rules: SourceRules }, ...]`，含 Telegram 预设。预设是完整配置快照，用户修改后直接提交 `rules`，运行时不再依据预设标识分派。
+
+### 4.9 POST /api/sources/preview
+
+请求体与新增来源相同，允许已存在的目录。200 返回：
+
+```ts
+interface SourcePreview {
+  enumerated: number;
+  truncated: boolean;
+  errors: string[];
+  groups: {
+    id: string; directory: string;
+    media: string[]; metadata: string[]; // 来源内相对路径
+    result?: { title: string; author: string; description: string;
+      tags: string[]; date: string; originalUrl: string };
+    error?: string;
+  }[];
+}
+```
+
+最多枚举 5000 个文件、返回 20 组、执行前 5 组。后续组无 `result`，某组提取失败时有 `error` 和空元信息结果。预览只读，不写配置/缓存/索引。无效配置返回 400；正在扫描或已有预览返回 409。仅为样本，不承诺未预览文件可以成功处理。
+
+全来源作品 ID 保持 `${sourceId}:${id}`；子目录隔离 ID 为 `v2:` 加 `[sourceId, directory, id]` 的 JSON 编码。客户端应将 ID 视为不透明字符串，并在 URL 路径中编码。改变分组 ID/范围可能改变作品身份，收藏不做猜测迁移。
 
 ## 5. 作品与搜索
 

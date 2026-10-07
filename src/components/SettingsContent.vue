@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import type { DirectoryEntry, LibraryStatus, Source } from '../../shared/types'
+import SourceRuleEditor from './SourceRuleEditor.vue'
+import { customRules, sourcePreset } from '../../shared/source-presets'
 import Icon from './Icon.vue'
 import FolderPicker from './FolderPicker.vue'
 import AiSettingsPanel from './AiSettingsPanel.vue'
@@ -12,18 +14,23 @@ const editing = ref<string | null>(null)
 const formVisible = ref(false)
 const name = ref('')
 const folder = ref('')
-const kind = ref<'pixiv' | 'telegram'>('pixiv')
+const rules = ref(customRules())
+const previewErrors = ref(false)
+const acceptPreviewErrors = ref(false)
+const previewBusy = ref(false)
+const invalidRules = ref(false)
 const error = ref('')
 const saving = ref(false)
 const deleting = ref<string | null>(null)
 const pickerVisible = ref(false)
-const busy = computed(() => saving.value || props.status?.scan.running)
+const busy = computed(() => saving.value || previewBusy.value || props.status?.scan.running)
 const shortcuts = computed(() => props.status?.sources.map(source => ({ name: source.name, path: source.path })) || [])
 function edit(source?: Source) {
   editing.value = source?.id || null
   name.value = source?.name || ''
   folder.value = source?.path || ''
-  kind.value = source?.kind || 'pixiv'
+  rules.value = source?.rules ? JSON.parse(JSON.stringify(source.rules)) : source && source.kind !== 'custom' ? sourcePreset(source.kind) : customRules()
+  previewErrors.value = false; acceptPreviewErrors.value = false; invalidRules.value = false
   error.value = ''; deleting.value = null; formVisible.value = true
   if (!source) pickerVisible.value = true
 }
@@ -33,10 +40,12 @@ function chooseFolder(directory: DirectoryEntry) {
   error.value = ''
 }
 async function save() {
+  if (previewBusy.value || invalidRules.value) return
   if (!folder.value) { error.value = '请先选择一个媒体文件夹'; pickerVisible.value = true; return }
+  if (previewErrors.value && !acceptPreviewErrors.value) { error.value = '预览存在错误，请修复或勾选仍然保存'; return }
   saving.value = true; error.value = ''
   try {
-    await api(`/sources${editing.value ? `/${editing.value}` : ''}`, { method: editing.value ? 'PUT' : 'POST', body: JSON.stringify({ name: name.value, path: folder.value, kind: kind.value }) })
+    await api(`/sources${editing.value ? `/${editing.value}` : ''}`, { method: editing.value ? 'PUT' : 'POST', body: JSON.stringify({ name: name.value, path: folder.value, rules: rules.value }) })
     formVisible.value = false; emit('changed'); emit('notice', '目录已保存，正在整理作品')
   } catch (e) { error.value = (e as Error).message }
   finally { saving.value = false }
@@ -59,15 +68,16 @@ async function remove(id: string) {
         <div class="section-heading"><div><h3>媒体目录</h3><p>连接文件夹，让散落的收藏井然有序。</p></div><button class="button tonal small" @click="edit()" :disabled="busy"><Icon name="plus" :size="18" />添加目录</button></div>
         <div v-if="!status?.sources.length && !formVisible" class="directory-empty"><Icon name="folder-plus" :size="40" /><p>还没有添加媒体目录</p><span>添加运行服务的电脑上的文件夹即可开始。</span></div>
         <div v-for="source in status?.sources" :key="source.id" class="source-item">
-          <div class="source-item-main"><span class="source-symbol"><Icon name="folder" /></span><div class="source-text"><h4>{{ source.name }} <span class="tiny-badge">{{ source.kind === 'pixiv' ? 'Pixiv' : 'Telegram' }}</span></h4><p :title="source.path">{{ source.path }}</p><span class="source-meta" :class="{ 'error-text': !source.online }">{{ source.online ? `${source.works} 组作品` : '目录离线 · 已保留索引' }}</span></div><button class="icon-button" :disabled="busy" :aria-label="`编辑 ${source.name}`" @click="edit(source)"><Icon name="edit" :size="20" /></button><button class="icon-button" :disabled="busy" :aria-label="`移除 ${source.name}`" @click="deleting = source.id"><Icon name="delete" :size="20" /></button></div>
+          <div class="source-item-main"><span class="source-symbol"><Icon name="folder" /></span><div class="source-text"><h4>{{ source.name }} <span class="tiny-badge">{{ source.rules?.preset ? `${source.rules.preset} 预设` : '自定义规则' }}</span></h4><p :title="source.path">{{ source.path }}</p><span class="source-meta" :class="{ 'error-text': !source.online }">{{ source.online ? `${source.works} 组作品` : '目录离线 · 已保留索引' }}</span></div><button class="icon-button" :disabled="busy" :aria-label="`编辑 ${source.name}`" @click="edit(source)"><Icon name="edit" :size="20" /></button><button class="icon-button" :disabled="busy" :aria-label="`移除 ${source.name}`" @click="deleting = source.id"><Icon name="delete" :size="20" /></button></div>
           <div v-if="deleting === source.id" class="delete-confirm"><p>移除这个目录及它的收藏记录？原始文件会保留。</p><div><button class="button text small" @click="deleting = null">取消</button><button class="button danger small" :disabled="busy" @click="remove(source.id)">移除目录</button></div></div>
         </div>
         <form v-if="formVisible" class="source-form" @submit.prevent="save">
           <h4>{{ editing ? '编辑媒体目录' : '添加媒体目录' }}</h4>
           <label class="field">目录名称<input v-model="name" required maxlength="60" placeholder="例如：我的插画收藏" autofocus /></label>
           <div class="field folder-field"><span id="media-folder-label">媒体文件夹</span><button type="button" class="folder-choice" :disabled="busy" aria-labelledby="media-folder-label selected-folder-path" @click="pickerVisible = true"><Icon name="folder-open" :size="23" /><span id="selected-folder-path" :class="{ 'folder-placeholder': !folder }">{{ folder || '点击浏览并选择文件夹' }}</span><span class="folder-choice-action">{{ folder ? '更改' : '浏览' }}<Icon name="right" :size="17" /></span></button><span>选择这台电脑上的文件夹，里面的媒体会自动整理。</span></div>
-          <fieldset class="rule-options"><legend>文件分组规则</legend><label :class="{ active: kind === 'pixiv' }"><input v-model="kind" type="radio" value="pixiv" /><strong>Pixiv</strong><small>前缀-作品ID_p0.jpg<br />读取 -meta.txt 标题和标签</small></label><label :class="{ active: kind === 'telegram' }"><input v-model="kind" type="radio" value="telegram" /><strong>Telegram</strong><small>编号_年月_p1.mp4<br />读取同名 .txt 描述</small></label></fieldset>
-          <div class="form-actions"><button type="button" class="button text" @click="formVisible = false">取消</button><button class="button filled" :disabled="busy || !folder"><Icon name="check" :size="18" />{{ saving ? '正在保存…' : '保存并扫描' }}</button></div>
+          <SourceRuleEditor v-model="rules" :folder="folder" :name="name" :disabled="!!busy" @busy="previewBusy = $event" @invalid="invalidRules = $event" @preview-errors="previewErrors = $event; acceptPreviewErrors = false" />
+          <label v-if="previewErrors" class="helper"><input v-model="acceptPreviewErrors" type="checkbox" />预览存在错误，仍然保存（失败的元信息将使用默认值）</label>
+          <div class="form-actions"><button type="button" class="button text" @click="formVisible = false">取消</button><button class="button filled" :disabled="busy || invalidRules || !folder || (previewErrors && !acceptPreviewErrors)"><Icon name="check" :size="18" />{{ saving ? '正在保存…' : '保存并扫描' }}</button></div>
         </form>
         <p v-if="error" class="inline-error" role="alert"><Icon name="warning" :size="20" />{{ error }}</p>
         <p v-if="status?.scan.running" class="helper"><Icon name="refresh" class="spinning" :size="16" />{{ status.scan.phase }} · {{ status.scan.files }} 个文件</p>
