@@ -4,14 +4,19 @@ import type { AiTranslateFields, AiTranslateResult, MangaJob, MangaPageResult, W
 import { Viewer } from 'v-viewer'
 import { api, formatSize, kindLabel } from '../api'
 import Icon from './Icon.vue'
+import { nearbyImages, createViewerImageCache, revealThumbnail, nextTranslationDisplay, metadataVisibility } from '../viewer-media'
 import { drawMangaRegion } from '../manga-layout'
 import { vReleaseVideo, releaseVideos } from '../video-lifecycle'
 import type { Notice, NoticeAction } from '../use-notice'
 
-const props = defineProps<{ work: Work }>()
+const props = defineProps<{ work: Work; navigating?: boolean }>()
 const emit = defineEmits<{ close: []; favorite: [work: Work]; notice: [message: string, action?: NoticeAction, tone?: Notice['tone']]; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
 const root = ref<HTMLElement>()
 const stage = ref<HTMLElement>()
+const filmstrip = ref<HTMLElement>()
+const images = createViewerImageCache()
+let loadVersion = 0
+let drawVersion = 0
 const video = ref<HTMLVideoElement>()
 onBeforeUnmount(() => { if (root.value) releaseVideos(root.value) })
 const detail = ref<WorkDetail | null>(null)
@@ -37,9 +42,8 @@ type TranslationDisplay = 'source' | 'translated' | 'both'
 const translation = ref<AiTranslateResult | null>(null)
 const translating = ref(false)
 const translationError = ref('')
-const translationDisplay = ref<TranslationDisplay>('both')
+const translationDisplay = ref<TranslationDisplay>('translated')
 const translationDisplayLabels: Record<TranslationDisplay, string> = { source: '仅原文', translated: '仅译文', both: '原文 + 译文' }
-const translationDisplayOrder: TranslationDisplay[] = ['both', 'translated', 'source']
 let timer: ReturnType<typeof setInterval> | undefined
 let conversionTimer: ReturnType<typeof setTimeout> | undefined
 let disposed = false
@@ -62,17 +66,22 @@ const mangaFailures = computed(() => {
 const mediaUrl = computed(() => compatible.value ? `/api/assets/${asset.value?.id}/compatible` : asset.value?.url)
 
 async function load() {
+  const version = ++loadVersion
+  const workId = props.work.id
   detail.value = null
   error.value = ''
   try {
-    detail.value = await api<WorkDetail>(`/works/${encodeURIComponent(props.work.id)}`)
-    if (startAtLast) index.value = Math.max(0, (detail.value?.assets.length || 1) - 1)
-  } catch (e) { error.value = (e as Error).message }
-  startAtLast = false
+    const value = await api<WorkDetail>(`/works/${encodeURIComponent(workId)}`)
+    if (disposed || version !== loadVersion || workId !== props.work.id) return
+    index.value = 0
+    detail.value = value
+  } catch (e) { if (!disposed && version === loadVersion) error.value = (e as Error).message }
 }
 // 切换分 P / 作品时丢弃旧图翻译状态，后台任务即使稍后完成也不会覆盖当前页面。
 function resetManga() {
   mangaToken++
+  drawVersion++
+  images.clear()
   clearTimeout(mangaTimer)
   mangaTimer = undefined
   mangaJob.value = null
@@ -87,8 +96,8 @@ onMounted(async () => {
   timer = setInterval(() => { if (slideshow.value && !isVideo.value && !previewing.value) next(1, true) }, 4500)
 })
 // 滑动切换到别的作品后重新取详情，并回到第一张。
-watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; translation.value = null; translationError.value = ''; translationDisplay.value = 'both'; resetManga(); void load() })
-onUnmounted(() => { disposed = true; destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); clearTimeout(mangaTimer) })
+watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; translation.value = null; translationError.value = ''; translationDisplay.value = 'translated'; resetManga(); void load() })
+onUnmounted(() => { disposed = true; loadVersion++; drawVersion++; images.clear(); destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); clearTimeout(mangaTimer) })
 watch(index, async () => {
   destroyPreview()
   mediaError.value = false
@@ -102,22 +111,37 @@ watch(index, async () => {
   mangaMode.value = mangaResult.value ? 'translated' : 'source'
   if (mangaResult.value) void drawMangaResult()
 })
-// 每次换图撤销上一次查询；手动翻译开始后也不让旧缓存覆盖新结果。
+// Warm current/adjacent original images and translated bases with the same bounded cache.
+watch(() => {
+  const nearby = nearbyImages(detail.value?.assets || [], index.value)
+  return nearby.flatMap(item => {
+    const translated = mangaResults.value[item.id]
+    return [{key: item.url, url: item.url}, ...(translated?.regions.length ? [{key: translated.key + ':' + translated.baseUrl, url: translated.baseUrl}] : [])]
+  })
+}, urls => { for (const item of urls) void images.load(item.key,item.url).catch(()=>{}) }, {immediate:true})
+watch([() => asset.value?.id, filmstrip], async () => {
+  await nextTick()
+  const selected = filmstrip.value?.querySelector<HTMLElement>('button.active')
+  if (filmstrip.value && selected) revealThumbnail(filmstrip.value, selected, !window.matchMedia('(prefers-reduced-motion: reduce)').matches)
+}, {flush:'post'})
+// Cache lookup only: warming a translated neighbour must never start OCR/translation.
 watch(() => asset.value?.id, async (assetId, _previous, onCleanup) => {
-  if (!assetId || !canTranslateManga.value || mangaResults.value[assetId]) return
+  if (!assetId) return
   const controller = new AbortController()
   onCleanup(() => controller.abort())
   const token = mangaToken
-  try {
-    const { result } = await api<{ result: MangaPageResult | null }>(`/ai/manga/auto/${encodeURIComponent(assetId)}`, { signal: controller.signal })
-    if (controller.signal.aborted || disposed || token !== mangaToken || asset.value?.id !== assetId || mangaBusy.value || mangaResults.value[assetId]) return
-    if (result?.regions.length) {
-      mangaResults.value[assetId] = result
-      mangaMode.value = 'translated'
-    }
-  } catch {
-    // 缓存查询失败仍可看原图、手动翻译，不打断浏览。
-  }
+  const workId = props.work.id
+  await Promise.all(nearbyImages(detail.value?.assets || [], index.value).map(async item => {
+    if (item.kind !== 'image' || item.extension === 'gif' || mangaResults.value[item.id]) return
+    try {
+      const { result } = await api<{ result: MangaPageResult | null }>(`/ai/manga/auto/${encodeURIComponent(item.id)}`, { signal: controller.signal })
+      if (controller.signal.aborted || disposed || token !== mangaToken || workId !== props.work.id || mangaBusy.value || mangaResults.value[item.id]) return
+      if (result?.regions.length) {
+        mangaResults.value[item.id] = result
+        if (asset.value?.id === item.id) mangaMode.value = 'translated'
+      }
+    } catch { /* Optional warmup must not block reading the original. */ }
+  }))
 })
 // v-if 切换会让 canvas 重新挂载；只要译图、显示模式或 canvas 实例变化，就重新绘制一次。
 watch([mangaMode, () => mangaResult.value?.key, () => mangaCanvas.value], async ([mode, key, canvas]) => {
@@ -138,8 +162,9 @@ const translatable = computed<AiTranslateFields>(() => {
 })
 const hasTranslatable = computed(() => Object.keys(translatable.value).length > 0)
 // 原文与译文的可见性：仅原文 / 仅译文 / 两者都显示。
-const sourceVisible = computed(() => translationDisplay.value !== 'translated')
-const translatedVisible = computed(() => translationDisplay.value !== 'source' && Boolean(translation.value))
+const metadataDisplay = computed(() => metadataVisibility(translationDisplay.value, Boolean(translation.value)))
+const sourceVisible = computed(() => metadataDisplay.value.source)
+const translatedVisible = computed(() => metadataDisplay.value.translated)
 const displayLabel = computed(() => translationDisplayLabels[translationDisplay.value])
 // 标签成对渲染：无论显示哪种语言，点击都用原文标签去搜索。
 // 译文标签按位置对应原文；模型少给或漏给时回退到原文，避免出现空标签。
@@ -153,9 +178,9 @@ const tagRows = computed(() => props.work.tags.map((original, i) => {
     secondary: sourceVisible.value && translatedVisible.value && distinct ? translated : null,
   }
 }))
-// 分 P 到头后继续滑动就切换作品：往后进入下一组的第 1 页，往回停在上一组的最后一页。
+// 分 P 到头后继续切换作品；两个方向都从新作品的第一张开始。
 function goWork(direction: number, auto = false) {
-  startAtLast = direction < 0
+  if (props.navigating) return
   slide.value = direction
   emit('navigate', direction, auto)
 }
@@ -179,8 +204,6 @@ let suppressClick = false
 let preview: InstanceType<typeof Viewer> | undefined
 let previewToken: HTMLDivElement | undefined
 let previewDestroying = false
-// 往回切换作品时，载入完成后停在最后一页。
-let startAtLast = false
 function gestureMode(target: EventTarget | null): 'page' | 'work' | 'ignore' {
   if (!(target instanceof Element)) return 'ignore'
   // viewer.js 浮层里的手势交给它自己处理。
@@ -341,7 +364,7 @@ async function translate(force = false) {
     // 翻译期间用户可能已经切到别的作品，丢弃过期的结果。
     if (disposed || workId !== props.work.id) return
     translation.value = result
-    if (translationDisplay.value === 'source') translationDisplay.value = 'both'
+    translationDisplay.value = 'translated'
     if (result.cached) {
       emit('notice', `已显示缓存的译文（${result.model}）`, { label: '重新翻译', handler: () => void translate(true) })
     } else {
@@ -430,18 +453,17 @@ async function drawMangaResult() {
   const result = mangaResult.value
   const canvas = mangaCanvas.value
   if (!result || !canvas || !result.width || !result.height) return
-  const image = new Image()
-  image.decoding = 'async'
-  image.src = result.baseUrl
+  const version = ++drawVersion
+  const workId = props.work.id
+  const assetId = asset.value?.id
+  let image: HTMLImageElement
   try {
-    await new Promise<void>((resolve, reject) => {
-      image.onload = () => resolve()
-      image.onerror = () => reject(new Error('译图底图加载失败'))
-    })
+    image = await images.load(result.key + ':' + result.baseUrl, result.baseUrl)
   } catch (e) {
-    mangaError.value = (e as Error).message
+    if (!disposed && version === drawVersion && asset.value?.id === assetId) mangaError.value = (e as Error).message
     return
   }
+  if (disposed || version !== drawVersion || props.work.id !== workId || asset.value?.id !== assetId || mangaCanvas.value !== canvas || mangaResult.value?.key !== result.key || mangaMode.value !== 'translated') return
   canvas.width = result.width
   canvas.height = result.height
   const ctx = canvas.getContext('2d')
@@ -451,10 +473,9 @@ async function drawMangaResult() {
   for (const region of result.regions) drawMangaRegion(ctx, region)
 }
 
-// 点击按钮在“原文 + 译文 / 仅原文 / 仅译文”之间循环。
+// 点击按钮在“仅译文 → 原文 + 译文 → 仅原文”之间循环。
 function cycleTranslationDisplay() {
-  const at = translationDisplayOrder.indexOf(translationDisplay.value)
-  translationDisplay.value = translationDisplayOrder[(at + 1) % translationDisplayOrder.length]
+  translationDisplay.value = nextTranslationDisplay(translationDisplay.value)
 }
 async function makeCompatible() {
   if (!asset.value) return
@@ -499,9 +520,14 @@ function closeRoot() {
           <button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow previous" aria-label="上一张" @click="next(-1)"><Icon name="left" :size="32" /></button><button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow next" aria-label="下一张" @click="next(1)"><Icon name="right" :size="32" /></button>
         </div>
         <div class="viewer-controls"><span>{{ asset ? `${kindLabel(asset.kind)} · ${formatSize(asset.size)}` : '' }}</span><div><button class="icon-button" :class="{ selected: work.favorite }" :aria-label="work.favorite ? '取消收藏' : '收藏作品'" :aria-pressed="work.favorite" @click="emit('favorite', work)"><Icon :name="work.favorite ? 'heart-filled' : 'heart'" :size="20" /></button><button class="icon-button" :aria-label="slideshow ? '停止自动翻页' : '自动翻页'" :aria-pressed="slideshow" @click="slideshow = !slideshow"><Icon :name="slideshow ? 'pause' : 'play'" :size="22" /></button><button class="icon-button" aria-label="全屏" @click="fullscreen"><Icon name="fullscreen" :size="22" /></button><button class="icon-button" aria-label="返回上一页" @click="closeRoot"><Icon name="left" :size="22" /></button></div></div>
-        <div v-if="(detail?.assets.length || 0) > 1" class="filmstrip"><button v-for="(item, i) in detail?.assets" :key="item.id" :class="{ active: index === i }" :aria-label="`第 ${i + 1} 项`" :aria-pressed="index === i" @click="selectPage(i)"><img :src="item.thumbnail" loading="lazy" alt="" /><span>{{ i + 1 }}</span></button></div>
+        <div v-if="(detail?.assets.length || 0) > 1" ref="filmstrip" class="filmstrip"><button v-for="(item, i) in detail?.assets" :key="item.id" :class="{ active: index === i }" :aria-label="`第 ${i + 1} 项`" :aria-pressed="index === i" @click="selectPage(i)"><img :src="item.thumbnail" loading="lazy" alt="" /><span>{{ i + 1 }}</span></button></div>
       </div>
-            <aside class="work-info"><Transition name="info-fade" mode="out-in"><div :key="work.id">
+            <aside class="work-info">
+        <nav class="work-navigation" aria-label="切换作品">
+          <button type="button" class="button tonal small" :disabled="navigating" @click="goWork(-1)"><Icon name="left" :size="20" />上一个作品</button>
+          <button type="button" class="button tonal small" :disabled="navigating" @click="goWork(1)">下一个作品<Icon name="right" :size="20" /></button>
+        </nav>
+        <Transition name="info-fade" mode="out-in"><div :key="work.id">
         <span class="eyebrow">ABOUT THIS WORK</span>
         <div class="translated-block">
           <div v-if="sourceVisible" class="text-line">

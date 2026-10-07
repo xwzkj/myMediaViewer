@@ -247,3 +247,5 @@
 .source-rule-editor .helper { display: block; line-height: 1.8; }
 .source-rule-editor h4 { margin: 0; }
 .input-contract { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.8 Consolas, monospace; background: var(--surface-low); border-radius: 8px; padding: 12px; margin-top: 12px; color: var(--text); }
+ .work-navigation { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: center; gap: 8px; padding: 0 0 16px; margin-bottom: 18px; border-bottom: 1px solid var(--outline); }
+.work-navigation .button { min-width: 0; padding-inline: 8px; justify-content: center; }
