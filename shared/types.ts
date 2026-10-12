@@ -1,5 +1,7 @@
 export type SourceKind = 'pixiv' | 'telegram' | 'custom'
 export type MediaKind = 'image' | 'video' | 'animation'
+export type WorkOrigin = 'local' | 'pixiv'
+export type PixivBookmarkRestrict = 'public' | 'private'
 export interface FileRule { mode: 'template' | 'regex'; pattern: string; caseSensitive: boolean; defaultPage?: number; target?: 'filename' | 'relativePath' | 'directory' | 'directoryName' }
 export interface SourceRules {
   version: 1; media: FileRule; metadata: FileRule[];
@@ -22,7 +24,13 @@ export interface SourcePreview {
 export interface Asset {
   id: string; workId: string; filename: string; page: number; kind: MediaKind;
   extension: string; size: number; modified: number; url: string; thumbnail: string
+  /** local: 由媒体库扫描得到；pixiv: 由服务端代理并按需缓存。 */
+  origin?: WorkOrigin
+  /** Pixiv 作品 ID；本地资源也可携带，用于与云端收藏合并。 */
+  illustId?: string
 }
+export interface WorkMembership { id: string; name: string; kind: SourceKind; origin: WorkOrigin }
+export interface CloudBookmarkState { bookmarked: boolean; restrict: PixivBookmarkRestrict }
 export interface Work {
   id: string; sourceId: string; sourceName: string; sourceKind: SourceKind; externalId: string;
   title: string; author: string; description: string; tags: string[]; date: string;
@@ -30,6 +38,16 @@ export interface Work {
   collected: number;
   updated: number; count: number; kind: MediaKind; favorite: boolean; cover: string;
   approximate?: boolean
+  /** 缺省按 local 处理，兼容旧 API 数据。 */
+  origin?: WorkOrigin
+  /** 该条目是否拥有可直接播放的本地媒体。 */
+  hasLocal?: boolean
+  /** Pixiv 作品 ID；存在时可使用云端收藏与云推荐。 */
+  pixivId?: string
+  /** 该条目所属的全部本地/虚拟来源；首个为主要来源。 */
+  memberships?: WorkMembership[]
+  /** null 表示状态未知；undefined 表示该作品不支持云收藏。 */
+  cloudBookmark?: CloudBookmarkState | null
 }
 export interface WorkDetail extends Work { assets: Asset[]; originalUrl: string }
 export interface ScanStatus {
@@ -42,6 +60,51 @@ export interface LibraryStatus {
   scan: ScanStatus; ffmpeg: boolean; addresses: string[]; publicAccess: boolean
 }
 export interface WorksResponse { items: Work[]; total: number; page: number; pages: number; elapsed: number }
+export interface PixivAccount {
+  id: string; name: string; account: string; premium: boolean; avatarUrl?: string
+}
+export interface PixivSettings {
+  localMode: boolean
+  configured: boolean
+  account: PixivAccount | null
+  defaultBookmarkRestrict: PixivBookmarkRestrict
+  autoBookmarkTags: boolean
+  cacheLimitMb: number
+}
+export interface PixivMirrorStatus {
+  restrict: PixivBookmarkRestrict
+  started: boolean
+  phase: 'idle' | 'backfilling' | 'maintaining' | 'ready' | 'error'
+  pages: number
+  items: number
+  lastSynced: number | null
+  lastFullSweep: number | null
+  error: string
+}
+export interface PixivCacheStatus {
+  bytes: number
+  files: number
+  limitBytes: number
+}
+export interface PixivStatus {
+  settings: PixivSettings
+  cache: PixivCacheStatus
+  mirrors: Record<PixivBookmarkRestrict, PixivMirrorStatus>
+}
+export interface PixivSearchResponse {
+  items: Work[]
+  nextCursor: string | null
+  elapsed: number
+}
+export interface PixivSearchSuggestionsResponse {
+  items: Array<{ name: string; translatedName: string }>
+}
+export interface PixivBookmarkUpdateResult {
+  bookmarked: boolean
+  restrict: PixivBookmarkRestrict
+  tagsApplied: boolean
+  warning?: string
+}
 export interface TagSuggestion { name: string; count: number }
 export interface TagSuggestionsResponse { items: TagSuggestion[]; total: number }
 /**

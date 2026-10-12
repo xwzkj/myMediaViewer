@@ -84,6 +84,31 @@
 | POST | `/api/ai/manga/translate` | 创建漫画翻译任务 |
 | GET | `/api/ai/manga/jobs/:id` | 查询漫画任务 |
 | GET | `/api/ai/manga/cache/:key/base.png` | 漫画擦字底图 |
+| GET/PUT | `/api/pixiv/settings` | 读取或保存 Pixiv 本地模式、账号与缓存设置 |
+| DELETE | `/api/pixiv/account` | 断开 Pixiv 账号，保留本地缓存与镜像 |
+| GET | `/api/pixiv/status` | Pixiv 账号、收藏镜像与缓存状态 |
+| POST | `/api/pixiv/cache/clear` | 按天数或全部清理云端资源缓存 |
+| POST | `/api/pixiv/mirror/:restrict` | 启动公开或私密收藏镜像 |
+| GET | `/api/pixiv/search` | Pixiv 云搜索，sort 支持热度预览/最新/最早 |
+| GET | `/api/pixiv/suggestions` | Pixiv 标签搜索建议 |
+| GET | `/api/pixiv/works/:id` | Pixiv 云端作品详情 |
+| GET | `/api/pixiv/works/:id/related` | Pixiv 云端相关作品 |
+| PUT | `/api/pixiv/works/:id/bookmark` | 添加或取消 Pixiv 云端收藏 |
+| GET | `/api/pixiv/assets/:illustId/:page/:variant` | 云端预览图或原图，由服务端代理并缓存 |
+| GET | `/api/pixiv/ugoira/:illustId/:variant` | 云端 Ugoira 动画资源 |
+| GET | `/api/works/:id/related` | 本地相关作品推荐 |
+
+Pixiv 云接口沿用现有返回结构。设置接口只返回账号概要，不返回 token；提交非空 `refreshToken` 时先向 OAuth 验证，验证失败不覆盖原账号。未登录及断开账号时强制开启本地模式，成功登录后自动关闭；已登录时允许手动切换。本地模式下云接口返回 403；`/api/pixiv/cache/clear` 仍然可用。
+
+`/api/pixiv/search` 接受 `q`、`sort=popular_preview|date_desc|date_asc`、`target` 和上次响应的 `nextCursor`（以 `cursor` 参数传回）。`target` 支持 `partial_match_for_tags`（默认，标签部分一致）、`exact_match_for_tags`（标签完全一致）、`title_and_caption`（标题、简介）、`keyword`（标签、标题、简介）。热度预览一般没有后续页。`nextCursor` 是服务端生成的不透明游标，只能用于同一查询、排序和匹配规则，相关作品游标只能用于同一作品。作品 ID 必须是正整数字符串；媒体 `page` 是从 0 开始的非负整数，`variant` 仅接受 `preview` / `original`，Ugoira 仅接受 `animation`。
+
+`/api/pixiv/suggestions?q=关键词` 返回 `{ items: [{ name, translatedName }] }`，最多 30 条，按账号缓存 5 分钟。客户端从输入末尾取上一个空白后的文本作为 `q`，点击建议仅替换这段文本，不执行搜索。
+
+`PUT /api/pixiv/works/:id/bookmark` 必须提交 `{ "bookmarked": true|false }`。收藏时统一采用设置中的 `defaultBookmarkRestrict=private|public`，请求不能单独指定可见性；切换可见性会更新对应镜像书架。自动标签去空白、去重，最多提交 10 个，先保留作品原标签，再用译文补足名额；详情展示与本地检索仍保留全部原文和译文。旧详情缓存会补取原标签元数据。附带标签的收藏请求仍被 Pixiv 以 400 拒绝时，重试一次不带标签的收藏，成功后返回 `warning`；认证、网络与限流错误不会触发此降级。关闭自动标签时不返回标签失败提示。
+
+Pixiv 请求失败时，后端输出请求地址、表单参数、HTTP 状态、上游错误响应（最多 4000 字符）和网络异常原因。OAuth、接口及资源 HTTP 错误都会记录；token、客户端密钥与认证信息会隐藏。
+
+收藏同步会合并同账号同书架的重复启动，并从保存的分页继续。只有完整拉取成功后才清理镜像中已消失的收藏，异常响应不会被当作空列表。作品详情按需补全多页，搜索和相关列表的封面可直接复用已有图片信息。远端请求设置超时，读取请求可重试临时故障；写入请求不会因网络中断自动重放。
 
 ## 3. 公共数据结构
 

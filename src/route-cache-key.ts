@@ -19,10 +19,11 @@ export function createSearchSessionId(): string {
 
 export function routeCacheKey(route: CacheRoute): string {
   const name = String(route.name || '')
-  if (name === 'search') {
+  if (name === 'search' || name === 'cloudSearch') {
     const sid = typeof route.query.sid === 'string' ? route.query.sid : ''
-    return `search:${sid || `direct:${queryKey(route)}`}`
+    return `${name}:${sid || `direct:${queryKey(route)}`}`
   }
+  if (name === 'cloudFavorites') return `cloudFavorites:${queryKey(route)}`
   if (name === 'source') return `source:${String(route.params.sourceId || '')}`
   if (name === 'favorites') return `favorites:${queryKey(route)}`
   return name

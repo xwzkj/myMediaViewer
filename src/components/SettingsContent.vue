@@ -7,6 +7,8 @@ import { customRules, sourcePreset } from '../../shared/source-presets'
 import Icon from './Icon.vue'
 import FolderPicker from './FolderPicker.vue'
 import AiSettingsPanel from './AiSettingsPanel.vue'
+import PixivSettingsPanel from './PixivSettingsPanel.vue'
+import ThemeSettings from './ThemeSettings.vue'
 import { api } from '../api'
 
 const props = defineProps<{ status: LibraryStatus | null }>()
@@ -65,6 +67,7 @@ async function remove(id: string) {
   <main class="settings-page" aria-labelledby="settings-title">
     <header class="settings-heading"><div><span class="eyebrow">MAKE IT YOURS</span><h2 id="settings-title">媒体库设置</h2></div><button class="icon-button" aria-label="返回上一页" @click="emit('close')"><Icon name="left" /></button></header>
     <div class="settings-body">
+      <ThemeSettings />
       <section>
         <div class="section-heading"><div><h3>媒体目录</h3><p>连接文件夹，让散落的收藏井然有序。</p></div><button class="button tonal small" @click="edit()" :disabled="busy"><Icon name="plus" :size="18" />添加目录</button></div>
         <div v-if="!status?.sources.length && !formVisible" class="directory-empty"><Icon name="folder-plus" :size="40" /><p>还没有添加媒体目录</p><span>添加运行服务的电脑上的文件夹即可开始。</span></div>
@@ -77,6 +80,7 @@ async function remove(id: string) {
         <p v-if="status?.scan.running" class="helper"><Icon name="refresh" class="spinning" :size="16" />{{ status.scan.phase }} · {{ status.scan.files }} 个文件</p>
       </section>
       <section class="settings-section"><div class="section-heading"><div><h3>在其他设备上访问</h3><p>同一 Wi-Fi 下，在浏览器中打开以下地址。</p></div><Icon name="lan" /></div><div class="network-addresses"><code v-for="address in status?.addresses" :key="address">{{ address }}</code><p v-if="!status?.addresses.length">暂未检测到局域网地址。</p></div><p class="helper">保持这台电脑和服务运行。首次连接时，允许 Windows 防火墙的专用网络访问。</p><p class="helper"><Icon :name="status?.publicAccess ? 'warning' : 'success'" :size="16" />{{ status?.publicAccess ? '当前允许公网地址访问，请只在可信网络中开放端口。' : '默认只服务局域网与保留地址。需要公网访问时，把环境变量 ALLOW_PUBLIC_ACCESS 设为 1 再重启服务。' }}</p></section>
+      <PixivSettingsPanel @notice="emit('notice', $event)" />
       <AiSettingsPanel @notice="emit('notice', $event)" />
       <section class="settings-section"><div class="section-heading"><div><h3>视频兼容性</h3><p>优先播放原文件，必要时生成兼容版本。</p></div><span class="status-chip" :class="{ unavailable: !status?.ffmpeg }"><Icon :name="status?.ffmpeg ? 'success' : 'warning'" :size="17" />{{ status?.ffmpeg ? 'FFmpeg 已就绪' : 'FFmpeg 未找到' }}</span></div><p v-if="!status?.ffmpeg" class="helper">将 FFmpeg 加入 PATH，或设置 FFMPEG_PATH 后重启服务，即可生成视频封面和兼容版本。</p></section>
       <section v-if="status?.scan.errors.length" class="settings-section"><h3>扫描提示</h3><ul class="scan-errors"><li v-for="item in status.scan.errors" :key="item">{{ item }}</li></ul></section>

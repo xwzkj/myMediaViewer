@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { ref, computed, onActivated, onDeactivated, onMounted, onUnmounted, watch, watchEffect, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import type { LibraryStatus, TagSuggestion, TagSuggestionsResponse, Work, WorksResponse } from '../../shared/types'
-import { activeSearchToken, replaceWithTag } from '../../shared/search-query'
+import type { LibraryStatus, PixivSearchResponse, PixivSearchSuggestionsResponse, PixivStatus, TagSuggestionsResponse, Work, WorksResponse } from '../../shared/types'
+import { activeSearchToken, replaceWithTag, replaceTrailingSearchToken, trailingSearchToken } from '../../shared/search-query'
+import { isPixivSearchTarget, pixivSearchTargets } from '../../shared/pixiv-search'
 import { api, formatNumber } from '../api'
 import { appEvents, type WorkReturnPayload } from '../events'
 import { createSearchSessionId, routeCacheKey } from '../route-cache-key'
 import { watchLibraryMemory } from '../library-memory'
 import { setLibraryLoader, syncLibrarySession } from '../library-session'
+import { migrateLegacyLibraryState, readLibraryState, writeLibraryState, type LibraryWorksState, type LocalSearchState, type SearchSource } from '../library-state'
 import Icon from '../components/Icon.vue'
 import AppNotice from '../components/AppNotice.vue'
 import { useNotice } from '../use-notice'
@@ -23,24 +25,32 @@ const pagePath = ref(routeCacheKey(route) === pageKey ? route.fullPath : '')
 const pendingWorkId = ref('')
 let pendingScrollToken = 0
 const status = ref<LibraryStatus | null>(null)
-// 记住上次看的是哪个来源、带哪些筛选、怎么排序，下次打开直接恢复。
-const savedState = ((): Record<string, unknown> => {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem('libraryState') || '{}')
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
-  } catch { return {} }
-})()
-const savedText = (value: unknown, allowed: string[], fallback: string) => typeof value === 'string' && allowed.includes(value) ? value : fallback
-const view = ref<'library' | 'favorites'>(savedState.view === 'favorites' ? 'favorites' : 'library')
-const source = ref(typeof savedState.source === 'string' ? savedState.source : '')
-const kind = ref(savedText(savedState.kind, ['', 'image', 'video'], ''))
+// 媒体库、本地搜索、云搜索分别记忆；搜索排序不得再覆盖媒体库排序。
+migrateLegacyLibraryState()
+const initialWorks = readLibraryState('works')
+const view = ref<'library' | 'favorites'>(initialWorks.view)
+const source = ref(initialWorks.source.startsWith('pixiv:') ? '' : initialWorks.source)
+const kind = ref(initialWorks.kind)
 const query = ref('')
-const sort = ref(savedText(savedState.sort, ['newest', 'oldest', 'title', 'random'], 'newest'))
+const submittedQuery = ref('')
+const sort = ref<'newest' | 'oldest' | 'title' | 'random' | 'relevance'>(initialWorks.sort)
 // 随机顺序用 seed 固定这一次的乱序结果，翻页不会重复或漏作品；换一批就换一个 seed。
-const seed = ref(typeof savedState.seed === 'string' ? savedState.seed : String(Date.now()))
+const seed = ref(initialWorks.seed || String(Date.now()))
 // 排序依据：收藏时间（文件名开头的 bmk_id）或发布时间，默认按收藏顺序。
-const order = ref<'collected' | 'published'>(savedText(savedState.order, ['collected', 'published'], localStorage.getItem('orderBy') === 'published' ? 'published' : 'collected') as 'collected' | 'published')
-const fuzzy = ref(savedState.fuzzy === true)
+const order = ref(initialWorks.order)
+const fuzzy = ref(initialWorks.fuzzy)
+const searchSource = ref<SearchSource>('local')
+const cloudSort = ref(readLibraryState('cloudSearch').sort)
+const cloudTarget = ref(readLibraryState('cloudSearch').target)
+const cloudTargetLabel = computed(() => pixivSearchTargets.find(target => target.value === cloudTarget.value)!.label)
+const cloudFavoritesRestrict = ref(readLibraryState('cloudFavorites').restrict)
+const cloudNextCursor = ref<string | null>(null)
+const cloudResult = ref<PixivSearchResponse>({ items: [], nextCursor: null, elapsed: 0 })
+const pixivStatus = ref<PixivStatus | null>(null)
+const cloudEnabled = computed(() => Boolean(pixivStatus.value?.settings.configured && !pixivStatus.value.settings.localMode))
+const cloudSearchMode = computed(() => route.name === 'cloudSearch')
+const localSearchMode = computed(() => route.name === 'search')
+const cloudFavoritesMode = computed(() => route.name === 'cloudFavorites')
 const result = ref<WorksResponse>({ items: [], total: 0, page: 1, pages: 1, elapsed: 0 })
 const loading = ref(true)
 // 滚动到底部时逐页追加，不再分页浏览。
@@ -49,15 +59,13 @@ const moreFailed = ref(false)
 const sentinel = ref<HTMLElement>()
 const error = ref('')
 const { toast, notice, dismiss, runAction } = useNotice()
-const dark = ref(localStorage.getItem('theme') === 'dark')
 const busyFavorites = new Set<string>()
-const suggestions = ref<TagSuggestion[]>([])
+const suggestions = ref<Array<{ name: string; count?: number; translatedName?: string }>>([])
 const suggestionTotal = ref(0)
 const suggestionOpen = ref(false)
 const suggestionIndex = ref(-1)
 const searchInput = ref<HTMLInputElement>()
 let poll: ReturnType<typeof setInterval>
-let debounce: ReturnType<typeof setTimeout>
 let controller: AbortController | undefined
 let destroyed = false
 let refreshInProgress = false
@@ -65,9 +73,23 @@ let caret = 0
 let suggestionTimer: ReturnType<typeof setTimeout>
 let blurTimer: ReturnType<typeof setTimeout>
 let suggestionController: AbortController | undefined
+let loadQueued = false
+const pageCache = new Map<string, WorksResponse>()
+
+// 路由变化会同时触发 route、筛选和来源监听。合并同一轮更新，避免切换来源时
+// 先发起旧查询、再被新查询中止，造成明显的等待和闪烁。
+function queueLoadWorks(): void {
+  if (loadQueued) return
+  loadQueued = true
+  queueMicrotask(() => {
+    loadQueued = false
+    if (!destroyed && routeCacheKey(route) === pageKey) loadWorks()
+  })
+}
 
 const suggestionsVisible = computed(() => suggestionOpen.value && suggestions.value.length > 0)
 const currentSource = computed(() => status.value?.sources.find(s => s.id === source.value))
+const sourceOptions = computed(() => status.value?.sources || [])
 // 顶部工具条吸顶后才显示分隔线，滚动时和内容区分开。
 const scrolled = ref(false)
 function trackScroll() { scrolled.value = window.scrollY > 4 }
@@ -75,7 +97,7 @@ function trackScroll() { scrolled.value = window.scrollY > 4 }
 const menuOpen = ref(false)
 const menu = ref<HTMLElement>()
 const menuButton = ref<HTMLElement>()
-const filtersActive = computed(() => Boolean(kind.value || source.value || fuzzy.value))
+const filtersActive = computed(() => cloudSearchMode.value ? cloudTarget.value !== 'partial_match_for_tags' : Boolean(kind.value || source.value || fuzzy.value))
 function closeMenu(event: PointerEvent | KeyboardEvent) {
   if (event instanceof KeyboardEvent) { if (event.key === 'Escape') menuOpen.value = false; return }
   if (!menuOpen.value) return
@@ -86,13 +108,12 @@ function closeMenu(event: PointerEvent | KeyboardEvent) {
 const mixedSources = computed(() => !source.value && (status.value?.sources.length || 0) > 1)
 const effectiveOrder = computed(() => mixedSources.value ? 'published' : order.value)
 const timeSortDisabled = computed(() => mixedSources.value || sort.value === 'title' || sort.value === 'relevance' || sort.value === 'random')
-const title = computed(() => query.value.trim() ? '发现你心中的那一张' : view.value === 'favorites' ? '把喜欢，留在身边。' : currentSource.value ? currentSource.value.name : '每一份喜欢，都值得珍藏。')
-const caption = computed(() => query.value.trim() ? `正在整个描述、标题、作者与标签中寻找「${query.value.trim()}」` : view.value === 'favorites' ? '那些让你停下来的瞬间，都在这里。' : '让散落在文件夹里的灵感，在这里重新相遇。')
-const hasLibrary = computed(() => !!status.value?.sources.length)
+const title = computed(() => submittedQuery.value ? '发现你心中的那一张' : view.value === 'favorites' ? '把喜欢，留在身边。' : currentSource.value ? currentSource.value.name : '每一份喜欢，都值得珍藏。')
+const caption = computed(() => submittedQuery.value ? cloudSearchMode.value ? `按${cloudTargetLabel.value}寻找「${submittedQuery.value}」` : `正在整个描述、标题、作者与标签中寻找「${submittedQuery.value}」` : view.value === 'favorites' ? '那些让你停下来的瞬间，都在这里。' : '让散落在文件夹里的灵感，在这里重新相遇。')
+const hasLibrary = computed(() => Boolean(cloudSearchMode.value || cloudFavoritesMode.value || status.value?.sources.length || (cloudEnabled.value && ((pixivStatus.value?.mirrors.public.items || 0) > 0 || (pixivStatus.value?.mirrors.private.items || 0) > 0))))
 // 视频与动图合并成一个筛选，动图在后端按 animation 归类，这里用逗号列表一起取。
-const filters = computed(() => [{ id: '', label: '全部', icon: 'gallery', count: status.value?.works || 0 }, { id: 'image', label: '图片', icon: 'image', count: status.value?.images || 0 }, { id: 'video', label: '视频', icon: 'video', count: (status.value?.videos || 0) + (status.value?.animations || 0) }])
+const filters = computed<Array<{ id: '' | 'image' | 'video'; label: string; icon: string; count: number }>>(() => [{ id: '', label: '全部', icon: 'gallery', count: status.value?.works || 0 }, { id: 'image', label: '图片', icon: 'image', count: status.value?.images || 0 }, { id: 'video', label: '视频', icon: 'video', count: (status.value?.videos || 0) + (status.value?.animations || 0) }])
 
-watch(dark, value => { document.documentElement.dataset.theme = value ? 'dark' : 'light'; localStorage.setItem('theme', value ? 'dark' : 'light') }, { immediate: true })
 // 后台刷新只替换第一页，其余已加载的作品按 id 合并保留，避免打断滚动位置。
 function mergeFirstPage(fresh: WorksResponse) {
   const current = result.value
@@ -108,11 +129,22 @@ async function loadPage(target: number, silent = false) {
   loadingMore.value = false
   moreFailed.value = false
   if (target <= 1) { if (!silent) loading.value = true; error.value = '' } else loadingMore.value = true
-  const params = new URLSearchParams({ q: query.value, source: source.value, kind: kind.value === 'video' ? 'video,animation' : kind.value, favorites: String(view.value === 'favorites'), page: String(target), sort: sort.value, fuzzy: String(fuzzy.value), by: effectiveOrder.value, seed: seed.value })
+  const params = new URLSearchParams({ q: submittedQuery.value, source: source.value, kind: kind.value === 'video' ? 'video,animation' : kind.value, favorites: String(view.value === 'favorites'), page: String(target), sort: sort.value, fuzzy: String(fuzzy.value), by: effectiveOrder.value, seed: seed.value })
+  const cacheKey = params.toString()
+  if (target === 1 && !silent) {
+    const cached = pageCache.get(cacheKey)
+    if (cached) {
+      result.value = cached
+      loading.value = false
+      // 后台静默校验，来源切换先显示已有结果，不再被骨架屏阻塞。
+      void loadPage(1, true)
+      return
+    }
+  }
   try {
     const response = await api<WorksResponse>(`/works?${params}`, { signal: active.signal })
     if (controller !== active) return
-    if (target <= 1) { if (silent) mergeFirstPage(response); else result.value = response }
+    if (target <= 1) { pageCache.set(cacheKey, response); if (silent) mergeFirstPage(response); else result.value = response }
     else result.value = { ...response, items: [...result.value.items, ...response.items] }
     syncLibrarySession(pageKey, target <= 1 ? result.value : response, target > 1)
   } catch (e) {
@@ -123,10 +155,48 @@ async function loadPage(target: number, silent = false) {
     if (controller === active) { loading.value = false; loadingMore.value = false }
   }
 }
-function loadWorks() { void loadPage(1) }
+async function loadCloudPage(reset = false) {
+  controller?.abort()
+  const active = new AbortController()
+  controller = active
+  if (reset) { loading.value = true; loadingMore.value = false; cloudNextCursor.value = null; result.value = { items: [], total: 0, page: 1, pages: 1, elapsed: 0 } }
+  else loadingMore.value = true
+  error.value = ''
+  moreFailed.value = false
+  const params = new URLSearchParams({ q: submittedQuery.value, sort: cloudSort.value, target: cloudTarget.value })
+  if (!reset && cloudNextCursor.value) params.set('cursor', cloudNextCursor.value)
+  try {
+    const response = await api<PixivSearchResponse>(`/pixiv/search?${params}`, { signal: active.signal })
+    if (controller !== active) return
+    cloudResult.value = response
+    cloudNextCursor.value = response.nextCursor
+    result.value = {
+      items: reset ? response.items : [...result.value.items, ...response.items],
+      total: (reset ? 0 : result.value.total) + response.items.length,
+      page: reset ? 1 : result.value.page + 1,
+      pages: response.nextCursor ? 999999 : (reset ? 1 : result.value.pages),
+      elapsed: response.elapsed,
+    }
+    syncLibrarySession(pageKey, result.value, !reset)
+  } catch (e) {
+    if (active.signal.aborted) return
+    error.value = (e as Error).message
+  } finally {
+    if (controller === active) { loading.value = false; loadingMore.value = false }
+  }
+}
+function loadWorks() {
+  if (route.name === 'cloudSearch') void loadCloudPage(true)
+  else void loadPage(1)
+}
 async function loadMore(force = false) {
   if (force) moreFailed.value = false
   if (loading.value || loadingMore.value || moreFailed.value) return
+  if (route.name === 'cloudSearch') {
+    if (!cloudNextCursor.value) return
+    await loadCloudPage(false)
+    return
+  }
   if (result.value.page >= result.value.pages) return
   await loadPage(result.value.page + 1)
 }
@@ -135,19 +205,35 @@ async function refreshStatus() {
   refreshInProgress = true
   try {
     const previous = status.value?.scan.finishedAt
-    const next = await api<LibraryStatus>('/status')
+    const [next, nextPixiv] = await Promise.all([
+      api<LibraryStatus>('/status'),
+      cloudFavoritesMode.value ? api<PixivStatus>('/pixiv/status').catch(() => null) : Promise.resolve(null),
+    ])
     if (destroyed) return
+    const previousMirrorItems = pixivStatus.value?.mirrors[cloudFavoritesRestrict.value]?.items || 0
     status.value = next
-    if (source.value && !next.sources.some(s => s.id === source.value)) {
+    if (nextPixiv) pixivStatus.value = nextPixiv
+    if (source.value && !source.value.startsWith('pixiv:') && !next.sources.some(s => s.id === source.value)) {
     source.value = ''
     if (route.name === 'source') void router.replace({ name: 'library' })
   }
-    if (previous !== undefined && previous !== next.scan.finishedAt) void loadPage(1, true)
+    if (previous !== undefined && previous !== next.scan.finishedAt) void loadWorks()
+    if (nextPixiv && cloudFavoritesMode.value && nextPixiv.mirrors[cloudFavoritesRestrict.value].items !== previousMirrorItems) void loadWorks()
   } catch (e) { if (!status.value) error.value = (e as Error).message }
   finally { refreshInProgress = false }
 }
 async function scan() {
   try { await api('/scan', { method: 'POST' }); await refreshStatus(); notice('正在检查目录中的新增和修改') }
+  catch (e) { notice((e as Error).message) }
+}
+async function refreshPixivStatus() {
+  try {
+    pixivStatus.value = await api<PixivStatus>('/pixiv/status')
+  } catch { pixivStatus.value = null }
+}
+async function startCloudMirror(restrict: 'public' | 'private') {
+  if (!cloudEnabled.value) return
+  try { await api(`/pixiv/mirror/${restrict}`, { method: 'POST' }) }
   catch (e) { notice((e as Error).message) }
 }
 async function toggleFavorite(work: Work) {
@@ -164,27 +250,52 @@ async function toggleFavorite(work: Work) {
   } catch (e) { notice((e as Error).message) }
   finally { busyFavorites.delete(work.id) }
 }
-function closeSuggestions() { suggestionOpen.value = false; suggestionIndex.value = -1 }
+async function toggleCloudFavorite(work: Work) {
+  const illustId = work.pixivId || work.externalId
+  if (!illustId || !cloudEnabled.value) return
+  const busyKey = `cloud:${illustId}`
+  if (busyFavorites.has(busyKey)) return
+  busyFavorites.add(busyKey)
+  const next = !(work.cloudBookmark?.bookmarked === true)
+  try {
+    const response = await api<import('../../shared/types').PixivBookmarkUpdateResult>(`/pixiv/works/${illustId}/bookmark`, { method: 'PUT', body: JSON.stringify({ bookmarked: next }) })
+    const update = (item: Work) => {
+      if ((item.pixivId || item.externalId) !== illustId) return
+      item.cloudBookmark = { bookmarked: response.bookmarked, restrict: response.restrict }
+    }
+    update(work)
+    for (const item of result.value.items) update(item)
+    notice(response.warning || (response.bookmarked ? '已加入 Pixiv 云端收藏' : '已取消 Pixiv 云端收藏'))
+  } catch (e) { notice((e as Error).message) }
+  finally { busyFavorites.delete(busyKey) }
+}
+function closeSuggestions() { clearTimeout(suggestionTimer); suggestionController?.abort(); suggestionController = undefined; suggestionOpen.value = false; suggestionIndex.value = -1 }
 function blurSuggestions() { clearTimeout(blurTimer); blurTimer = setTimeout(closeSuggestions, 160) }
-function queueSuggestions() { clearTimeout(suggestionTimer); suggestionTimer = setTimeout(loadSuggestions, 140) }
+function queueSuggestions() { closeSuggestions(); suggestions.value = []; suggestionTimer = setTimeout(loadSuggestions, 140) }
 async function loadSuggestions() {
   suggestionController?.abort()
   const active = new AbortController()
   suggestionController = active
-  const term = activeSearchToken(query.value, caret).value.trim().slice(0, 60)
+  const target = searchSource.value
+  const term = (target === 'cloud' ? trailingSearchToken(query.value) : activeSearchToken(query.value, caret)).value.trim().slice(0, 100)
+  const draft = query.value
+  if (target === 'cloud' && (!term || !cloudEnabled.value)) return
   try {
-    const response = await api<TagSuggestionsResponse>(`/tags?q=${encodeURIComponent(term)}`, { signal: active.signal })
-    if (suggestionController !== active || destroyed) return
+    const response = target === 'cloud'
+      ? await api<PixivSearchSuggestionsResponse>(`/pixiv/suggestions?q=${encodeURIComponent(term)}`, { signal: active.signal })
+      : await api<TagSuggestionsResponse>(`/tags?q=${encodeURIComponent(term)}`, { signal: active.signal })
+    if (suggestionController !== active || destroyed || query.value !== draft || searchSource.value !== target || document.activeElement !== searchInput.value) return
     suggestions.value = response.items
-    suggestionTotal.value = response.total
+    suggestionTotal.value = 'total' in response ? response.total : response.items.length
     suggestionIndex.value = -1
     suggestionOpen.value = response.items.length > 0
   } catch { /* 建议列表不可用时不影响正常搜索 */ }
 }
-function focusSearch() { caret = searchInput.value?.selectionStart ?? query.value.length; queueSuggestions() }
+function focusSearch() { clearTimeout(blurTimer); caret = searchInput.value?.selectionStart ?? query.value.length; queueSuggestions() }
 function updateCaret(event: Event) {
   const input = event.target as HTMLInputElement
   caret = input.selectionStart ?? input.value.length
+  if ((event as InputEvent).isComposing) { closeSuggestions(); return }
   queueSuggestions()
 }
 function searchKeyup(event: KeyboardEvent) {
@@ -202,22 +313,24 @@ function moveSuggestion(direction: number) {
 function commitSuggestion(position = suggestionIndex.value) {
   const item = suggestions.value[position]
   if (!item) return
-  const next = replaceWithTag(query.value, caret, item.name)
+  const next = searchSource.value === 'cloud' ? replaceTrailingSearchToken(query.value, item.name) : replaceWithTag(query.value, caret, item.name)
   query.value = next.query
   caret = next.caret
   closeSuggestions()
-  void nextTick(() => { searchInput.value?.focus(); searchInput.value?.setSelectionRange(caret, caret) })
+  void nextTick(() => { searchInput.value?.focus(); searchInput.value?.setSelectionRange(caret, caret); clearTimeout(suggestionTimer) })
 }
 function clearSearch() { query.value = ''; caret = 0; closeSuggestions(); searchInput.value?.focus() }
 function openSettings() {
   router.push({ name: 'settings', query: { from: route.fullPath } })
 }
 function openWork(work: Work) {
-  router.push({ name: 'work', params: { workId: work.id }, query: { from: route.fullPath, list: pageKey } })
+  const name = work.hasLocal === false ? 'cloudWork' : 'work'
+  const workId = name === 'cloudWork' ? (work.pixivId || work.externalId) : work.id
+  router.push({ name, params: { workId }, query: { from: route.fullPath, list: pageKey } })
 }
 function routeFilters(extra: Record<string, string> = {}) {
   const next: Record<string, string> = { ...extra }
-  if (source.value) next.source = source.value
+  if (source.value && !source.value.startsWith('pixiv:')) next.source = source.value
   if (kind.value) next.kind = kind.value
   if (fuzzy.value) next.fuzzy = 'true'
   if (sort.value && sort.value !== 'newest') next.sort = sort.value
@@ -225,47 +338,118 @@ function routeFilters(extra: Record<string, string> = {}) {
   if (seed.value) next.seed = seed.value
   return next
 }
-function searchTarget(value: string) {
-  const next = routeFilters({ q: value })
+function searchTarget(value: string, target: SearchSource = 'local') {
   const currentSid = typeof route.query.sid === 'string' ? route.query.sid : ''
-  next.sid = route.name === 'search' && currentSid ? currentSid : createSearchSessionId()
+  const sid = (route.name === 'search' || route.name === 'cloudSearch') && currentSid ? currentSid : createSearchSessionId()
+  if (target === 'cloud') return { name: 'cloudSearch' as const, query: { q: value, sort: cloudSort.value, target: cloudTarget.value, sid } }
+  const next = routeFilters({ q: value })
+  if (route.name !== 'search') next.sort = readLibraryState('localSearch').sort
+  next.sid = sid
   if (view.value === 'favorites') next.favorites = 'true'
   return { name: 'search' as const, query: next }
 }
+function submitSearch(event?: KeyboardEvent) {
+  if (event?.isComposing || event?.keyCode === 229) return
+  event?.preventDefault()
+  if (event && suggestionsVisible.value && suggestionIndex.value >= 0) { commitSuggestion(); return }
+  const value = query.value.trim()
+  closeSuggestions()
+  if (!value) {
+    if (localSearchMode.value || cloudSearchMode.value) void router.push(listTarget())
+    return
+  }
+  if (searchSource.value === 'cloud') {
+    if (!cloudEnabled.value) { notice('请先在设置中配置 Pixiv 账号并关闭本地模式'); return }
+  }
+  const target = searchTarget(value, searchSource.value)
+  if (router.resolve(target).fullPath === route.fullPath) queueLoadWorks()
+  else void router.push(target)
+}
+function switchSearchMode() {
+  const next: SearchSource = searchSource.value === 'local' ? 'cloud' : 'local'
+  if (next === 'cloud' && !cloudEnabled.value) { notice('请先在设置中配置 Pixiv 账号并关闭本地模式'); return }
+  searchSource.value = next
+  closeSuggestions()
+  searchInput.value?.focus()
+  queueSuggestions()
+}
 function listTarget() {
   if (view.value === 'favorites') return { name: 'favorites' as const, query: source.value ? { source: source.value } : {} }
+  if (source.value.startsWith('pixiv:')) return { name: 'library' as const, query: { source: source.value } }
   if (source.value) return { name: 'source' as const, params: { sourceId: source.value } }
   return { name: 'library' as const }
 }
 // 路由是页面身份的唯一来源；筛选和排序仍可沿用本地记忆，搜索词由 URL 保存。
+function applySubmittedQuery(value: string) {
+  if (submittedQuery.value !== value) query.value = value
+  submittedQuery.value = value
+}
 function applyRoute() {
   if (routeCacheKey(route) !== pageKey) return
   const name = String(route.name || '')
   pagePath.value = route.fullPath
-  view.value = name === 'favorites' || (name === 'search' && route.query.favorites === 'true') ? 'favorites' : 'library'
+  if (name === 'cloudSearch') {
+    const memory = readLibraryState('cloudSearch')
+    searchSource.value = 'cloud'
+    view.value = 'library'
+    source.value = ''
+    kind.value = ''
+    fuzzy.value = false
+    applySubmittedQuery(typeof route.query.q === 'string' ? route.query.q : '')
+    cloudSort.value = route.query.sort === 'popular_preview' || route.query.sort === 'date_desc' || route.query.sort === 'date_asc' ? route.query.sort : memory.sort
+    cloudTarget.value = isPixivSearchTarget(route.query.target) ? route.query.target : memory.target
+    return
+  }
+  if (name === 'cloudFavorites') {
+    searchSource.value = 'local'
+    view.value = 'library'
+    applySubmittedQuery('')
+    cloudFavoritesRestrict.value = route.query.restrict === 'private' ? 'private' : 'public'
+    source.value = `pixiv:${cloudFavoritesRestrict.value}`
+    return
+  }
+  if (name === 'search') {
+    const memory = readLibraryState('localSearch')
+    searchSource.value = 'local'
+    view.value = route.query.favorites === 'true' ? 'favorites' : 'library'
+    source.value = typeof route.query.source === 'string' ? route.query.source : memory.source
+    kind.value = route.query.kind === 'image' || route.query.kind === 'video' ? route.query.kind : memory.kind
+    fuzzy.value = route.query.fuzzy === 'true' || (route.query.fuzzy !== 'false' && memory.fuzzy)
+    sort.value = route.query.sort === 'newest' || route.query.sort === 'oldest' || route.query.sort === 'title' || route.query.sort === 'random' || route.query.sort === 'relevance'
+      ? route.query.sort : memory.sort
+    order.value = route.query.by === 'collected' || route.query.by === 'published' ? route.query.by : memory.order
+    seed.value = typeof route.query.seed === 'string' ? route.query.seed : (memory.seed || String(Date.now()))
+    applySubmittedQuery(typeof route.query.q === 'string' ? route.query.q : '')
+    return
+  }
+  const memory = readLibraryState('works')
+  searchSource.value = 'local'
+  view.value = name === 'favorites' ? 'favorites' : 'library'
   source.value = name === 'source'
     ? String(route.params.sourceId || '')
-    : typeof route.query.source === 'string' ? route.query.source : ''
-  const nextKind = route.query.kind
-  if (nextKind === 'image' || nextKind === 'video') kind.value = nextKind
-  else if (name === 'search') kind.value = ''
-  if (route.query.fuzzy === 'true') fuzzy.value = true
-  else if (name === 'search') fuzzy.value = false
-  const nextSort = route.query.sort
-  if (nextSort === 'oldest' || nextSort === 'title' || nextSort === 'random' || nextSort === 'relevance') sort.value = nextSort
-  if (route.query.by === 'published') order.value = 'published'
-  else if (route.query.by === 'collected') order.value = 'collected'
-  if (typeof route.query.seed === 'string') seed.value = route.query.seed
-  query.value = name === 'search' && typeof route.query.q === 'string' ? route.query.q : ''
+    : typeof route.query.source === 'string' ? route.query.source : memory.source
+  if (source.value.startsWith('pixiv:')) {
+    const restrict = source.value === 'pixiv:private' ? 'private' : 'public'
+    source.value = ''
+    void router.replace({ name: 'cloudFavorites', query: { restrict } })
+    return
+  }
+  kind.value = route.query.kind === 'image' || route.query.kind === 'video' ? route.query.kind : memory.kind
+  fuzzy.value = memory.fuzzy
+  sort.value = memory.sort
+  order.value = memory.order
+  seed.value = memory.seed || String(Date.now())
+  applySubmittedQuery('')
 }
 // 切换视图时保留筛选选项；只有显式传入来源才改动来源（传空字符串代表全部来源）。
 function navigate(next: 'library' | 'favorites', sourceId?: string) {
-  const nextSource = sourceId !== undefined ? sourceId : source.value
+  const nextSource = sourceId !== undefined ? sourceId : source.value.startsWith('pixiv:') ? '' : source.value
   if (next === 'favorites') {
     router.push({ name: 'favorites', query: nextSource ? { source: nextSource } : {} })
     return
   }
-  if (nextSource) router.push({ name: 'source', params: { sourceId: nextSource } })
+  if (nextSource.startsWith('pixiv:')) router.push({ name: 'library', query: { source: nextSource } })
+  else if (nextSource) router.push({ name: 'source', params: { sourceId: nextSource } })
   else router.push({ name: 'library' })
 }
 // 换一批：换一个随机种子，重新打乱这一批作品的顺序。
@@ -275,23 +459,39 @@ function resetFilters() {
   source.value = ''
   kind.value = ''
   fuzzy.value = false
-  if (route.name === 'search' || route.name === 'source') router.replace({ name: view.value === 'favorites' ? 'favorites' : 'library' })
+  if (route.name === 'search' || route.name === 'cloudSearch' || route.name === 'source' || route.name === 'cloudFavorites') router.replace({ name: view.value === 'favorites' ? 'favorites' : 'library' })
 }
 function retryLoadMore() { loadMore(true) }
-watch(() => route.fullPath, applyRoute, { immediate: true })
-watch([view, source, kind, sort, fuzzy, order, seed], () => void loadWorks())
-// 搜索词不保存，其余的来源 / 筛选 / 排序都写进 localStorage。
-// 搜索期间会临时切到相关度排序，这里记下用户原本选过的排序，清空搜索后还原。
-let preSearchSort = sort.value
+watch(() => route.fullPath, () => { applyRoute(); queueLoadWorks() }, { immediate: true })
+watch([view, source, kind, sort, fuzzy, order, seed, cloudSort], () => {
+  if (route.name === 'cloudSearch' || route.name === 'cloudFavorites') return
+  queueLoadWorks()
+})
 watchLibraryMemory(
-  () => ({
-    view: view.value, source: source.value, kind: kind.value, fuzzy: fuzzy.value, order: order.value, seed: seed.value,
-    sort: sort.value === 'relevance' ? preSearchSort : sort.value,
-  }),
+  () => ({ view: view.value, source: source.value, kind: kind.value, fuzzy: fuzzy.value, order: order.value, seed: seed.value, sort: sort.value }),
   () => route.fullPath,
   () => routeCacheKey(route) === pageKey,
-  state => localStorage.setItem('libraryState', JSON.stringify(state)),
+  state => {
+    if (route.name === 'search') writeLibraryState('localSearch', state as LocalSearchState)
+    else if (route.name !== 'cloudSearch' && route.name !== 'cloudFavorites') writeLibraryState('works', state as LibraryWorksState)
+  },
 )
+watch([cloudSort, cloudTarget], ([sort, target]) => {
+  if (routeCacheKey(route) !== pageKey) return
+  writeLibraryState('cloudSearch', { sort, target })
+  if (route.name === 'cloudSearch' && (route.query.sort !== sort || route.query.target !== target)) {
+    void router.replace({ query: { ...route.query, sort, target } })
+  }
+})
+watch(cloudFavoritesRestrict, value => writeLibraryState('cloudFavorites', { restrict: value }))
+watch([cloudFavoritesMode, cloudEnabled, cloudFavoritesRestrict], () => {
+  if (cloudFavoritesMode.value && cloudEnabled.value) void startCloudMirror(cloudFavoritesRestrict.value)
+}, { immediate: true })
+watch([source, cloudEnabled], ([value]) => {
+  if (cloudEnabled.value && (value === 'pixiv:public' || value === 'pixiv:private')) {
+    void startCloudMirror(value === 'pixiv:private' ? 'private' : 'public')
+  }
+}, { immediate: true })
 // 列表底部进入视野附近时自动追加下一页。
 watchEffect(onCleanup => {
   const element = sentinel.value
@@ -299,20 +499,6 @@ watchEffect(onCleanup => {
   const observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting)) loadMore() }, { rootMargin: '600px 0px' })
   observer.observe(element)
   onCleanup(() => observer.disconnect())
-})
-// 搜索时临时切到相关度排序，清空搜索后还原用户记住的排序方式。
-watch(query, value => {
-  clearTimeout(debounce)
-  const routeQuery = route.name === 'search' && typeof route.query.q === 'string' ? route.query.q : ''
-  if (routeQuery !== value) {
-    if (value.trim()) void router.replace(searchTarget(value))
-    else if (route.name === 'search') void router.replace(listTarget())
-  }
-  debounce = setTimeout(() => {
-    if (value.trim()) { if (sort.value !== 'relevance') { preSearchSort = sort.value; sort.value = 'relevance' } }
-    else if (sort.value === 'relevance') sort.value = preSearchSort
-    void loadWorks()
-  }, 220)
 })
 // 作品页退出时发送待定位作品；列表页等目标进入结果并完成渲染后再滚动。
 function handleWorkReturn(payload: WorkReturnPayload) {
@@ -328,7 +514,7 @@ async function ensureWorkAvailable(id: string) {
   if (result.value.items.some(work => work.id === id)) return true
   while (result.value.page < result.value.pages) {
     const previousPage = result.value.page
-    await loadPage(previousPage + 1)
+    await loadMore(true)
     if (result.value.items.some(work => work.id === id)) return true
     if (result.value.page <= previousPage) break
   }
@@ -374,7 +560,7 @@ onMounted(() => {
   appEvents.on('work:return', handleWorkReturn)
   setLibraryLoader(pageKey, () => loadMore())
   void refreshStatus()
-  void loadWorks()
+  void refreshPixivStatus()
   startPolling()
   bindGlobalListeners()
   trackScroll()
@@ -385,9 +571,12 @@ onActivated(() => {
   startPolling()
   void restorePendingWork()
   void refreshStatus()
+  void refreshPixivStatus()
 })
 onDeactivated(() => {
   dismiss()
+  closeSuggestions()
+  clearTimeout(blurTimer)
   unbindGlobalListeners()
   clearInterval(poll)
 })
@@ -397,7 +586,6 @@ onUnmounted(() => {
   appEvents.off('work:return', handleWorkReturn)
   unbindGlobalListeners()
   clearInterval(poll)
-  clearTimeout(debounce)
   clearTimeout(suggestionTimer)
   clearTimeout(blurTimer)
   controller?.abort()
@@ -411,26 +599,45 @@ onUnmounted(() => {
       <a class="brand" href="#" @click.prevent="navigate('library')"><span class="brand-mark"><Icon name="gallery" :size="26" /></span><div><strong>拾光</strong><small>MEDIA GARDEN</small></div></a>
       <button class="button filled add-folder" aria-label="添加媒体目录" title="添加媒体目录" @click="openSettings"><Icon name="plus" :size="21" /><span>添加媒体目录</span></button>
       <span class="nav-label">我的空间</span>
-      <nav aria-label="主导航"><button class="nav-item" :class="{ active: view === 'library' && !source }" @click="navigate('library', '')"><Icon name="gallery" /><span>媒体库</span><span class="nav-count">{{ formatNumber(status?.works || 0) }}</span></button><button class="nav-item" :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /><span>我的收藏</span><span class="nav-count">{{ formatNumber(status?.favorites || 0) }}</span></button></nav>
+      <nav aria-label="主导航"><button class="nav-item" :class="{ active: view === 'library' && !source && !cloudFavoritesMode }" @click="navigate('library', '')"><Icon name="gallery" /><span>媒体库</span><span class="nav-count">{{ formatNumber(status?.works || 0) }}</span></button><button class="nav-item" :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /><span>我的收藏</span><span class="nav-count">{{ formatNumber(status?.favorites || 0) }}</span></button><button class="nav-item" :class="{ active: cloudFavoritesMode }" :disabled="!cloudEnabled" :title="cloudEnabled ? '查看 Pixiv 云端收藏' : '请先配置 Pixiv 账号并关闭本地模式'" @click="router.push({ name: 'cloudFavorites', query: { restrict: cloudFavoritesRestrict } })"><Icon name="cloud" /><span>云端收藏</span></button></nav>
       <div class="nav-label row-label"><span>媒体来源</span><button class="icon-button tiny" aria-label="管理媒体来源" @click="openSettings"><Icon name="plus" :size="17" /></button></div>
-      <nav class="source-nav" aria-label="媒体来源"><button v-for="item in status?.sources" :key="item.id" class="nav-item source-nav-item" :class="{ active: source === item.id }" @click="navigate('library', item.id)"><span class="source-letter" :class="item.kind">{{ item.name.slice(0, 1).toUpperCase() }}</span><span class="ellipsis">{{ item.name }}</span><span v-if="!item.online" title="目录离线"><Icon name="offline" :size="17" /></span><span v-else class="nav-count">{{ item.works }}</span></button><p v-if="!status?.sources.length" class="nav-empty">添加文件夹后，会显示在这里。</p></nav>
+      <nav class="source-nav" aria-label="媒体来源"><button v-for="item in sourceOptions" :key="item.id" class="nav-item source-nav-item" :class="{ active: source === item.id }" @click="navigate('library', item.id)"><span class="source-letter" :class="item.kind">{{ item.name.slice(0, 1).toUpperCase() }}</span><span class="ellipsis">{{ item.name }}</span><span v-if="'online' in item && !item.online" title="目录离线"><Icon name="offline" :size="17" /></span><span v-else-if="'works' in item" class="nav-count">{{ item.works }}</span></button><p v-if="!status?.sources.length" class="nav-empty">添加文件夹后，会显示在这里。</p></nav>
       <div class="sidebar-bottom"><button class="nav-item" @click="openSettings"><Icon name="settings" /><span>媒体库设置</span></button></div>
     </aside>
     <main class="main-content">
       <div class="library-toolbar" :class="{ stuck: scrolled }">
-        <div class="search-row"><div class="search-field"><Icon name="search" :size="23" /><input ref="searchInput" v-model="query" type="text" aria-label="搜索作品" placeholder="搜索标题、描述、作者或标签…" maxlength="500" role="combobox" aria-autocomplete="list" aria-controls="tag-suggestions" :aria-expanded="suggestionsVisible" :aria-activedescendant="suggestionIndex >= 0 ? 'tag-suggestion-' + suggestionIndex : undefined" @focus="focusSearch" @input="updateCaret" @click="updateCaret" @keyup="searchKeyup" @keydown.down.prevent="moveSuggestion(1)" @keydown.up.prevent="moveSuggestion(-1)" @keydown.enter.prevent="commitSuggestion()" @keydown.esc="closeSuggestions" @blur="blurSuggestions" /><button v-if="query" class="icon-button small-icon" aria-label="清空搜索" @click="clearSearch"><Icon name="close" :size="19" /></button><span v-else class="search-hint">多个关键词用空格分隔</span><div v-if="suggestionsVisible" id="tag-suggestions" class="tag-suggestions" role="listbox" aria-label="标签搜索建议"><div class="suggestion-heading"><Icon name="tag" :size="15" /><span>按标签搜索</span><b v-if="suggestionTotal > suggestions.length">还有 {{ formatNumber(suggestionTotal - suggestions.length) }} 个匹配标签</b></div><button v-for="(item, i) in suggestions" :id="'tag-suggestion-' + i" :key="item.name" type="button" class="tag-suggestion" :class="{ active: i === suggestionIndex }" role="option" :aria-selected="i === suggestionIndex" @mousedown.prevent="commitSuggestion(i)" @mouseenter="suggestionIndex = i"><span>#{{ item.name }}</span><small>{{ formatNumber(item.count) }} 组</small></button></div></div><button ref="menuButton" class="icon-button menu-button" :class="{ active: filtersActive }" :aria-expanded="menuOpen" aria-haspopup="true" :title="filtersActive ? '筛选与排序（已应用筛选）' : '筛选与排序'" @click="menuOpen = !menuOpen"><Icon name="tune" :size="21" /><span v-if="filtersActive" class="menu-dot" /></button><button class="button outlined scan-button" @click="scan" :disabled="status?.scan.running || !hasLibrary"><Icon name="refresh" :class="{ spinning: status?.scan.running }" :size="20" /><span>{{ status?.scan.running ? '正在扫描' : '刷新媒体库' }}</span></button><button class="icon-button theme-button" :aria-label="dark ? '切换浅色模式' : '切换深色模式'" :title="dark ? '切换浅色模式' : '切换深色模式'" @click="dark = !dark"><Icon :name="dark ? 'sun' : 'moon'" :size="21" /></button></div>
-        <Transition name="menu-pop"><div v-if="menuOpen" ref="menu" class="filter-menu" role="dialog" aria-label="筛选与排序"><label v-if="status && status.sources.length > 1" class="menu-row"><span>媒体来源</span><span class="menu-select"><select v-model="source" aria-label="筛选媒体来源"><option value="">全部来源</option><option v-for="item in status.sources" :key="item.id" :value="item.id">{{ item.name }}</option></select><Icon name="down" :size="16" /></span></label><div class="menu-row"><span>媒体类型</span><div class="menu-chips"><button v-for="filter in filters" :key="filter.id" class="filter-chip" :class="{ active: kind === filter.id }" :aria-pressed="kind === filter.id" @click="kind = filter.id"><Icon :name="kind === filter.id ? 'check' : filter.icon" :size="18" />{{ filter.label }}</button></div></div><label class="menu-row"><span>模糊匹配</span><span class="fuzzy-toggle"><input v-model="fuzzy" type="checkbox" /><span class="mini-switch" /><span>{{ fuzzy ? '已开启' : '已关闭' }}</span></span></label><label class="menu-row"><span>排序方式</span><span class="sort-select"><Icon name="sort" :size="18" /><select v-model="sort" aria-label="排序方式"><option v-if="query" value="relevance">相关度优先</option><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="title">标题排序</option><option value="random">随机顺序</option></select><Icon name="down" :size="16" /></span></label><label v-if="sort === 'random'" class="menu-row"><span>换一批</span><button class="button tonal small" type="button" @click="reshuffle"><Icon name="refresh" :size="17" />重新打乱</button></label><label class="menu-row" :class="{ dim: timeSortDisabled }"><span>时间依据</span><span class="fuzzy-toggle order-toggle"><input v-model="order" type="checkbox" true-value="collected" false-value="published" :disabled="timeSortDisabled" /><span class="mini-switch" /><span>{{ effectiveOrder === 'collected' ? '收藏时间' : '发布时间' }}</span></span></label></div></Transition>
+        <div class="search-row">
+          <div class="search-field">
+            <button class="search-mode-toggle" :class="{ cloud: searchSource === 'cloud' }" type="button" :aria-label="searchSource === 'cloud' ? '切换到本地搜索' : '切换到云搜索'" :title="searchSource === 'cloud' ? '切换到本地搜索' : '切换到云搜索'" @click="switchSearchMode"><Icon :name="searchSource === 'cloud' ? 'cloud' : 'folder'" :size="19" /><span>{{ searchSource === 'cloud' ? '云端' : '本地' }}</span><Icon name="swap" :size="16" /></button>
+            <input ref="searchInput" v-model="query" type="text" :aria-label="searchSource === 'cloud' ? '云搜索作品' : '搜索作品'" :placeholder="searchSource === 'cloud' ? '输入关键词，按 Enter 搜索…' : '搜索标题、描述、作者或标签…'" maxlength="500" role="combobox" aria-autocomplete="list" aria-controls="tag-suggestions" :aria-expanded="suggestionsVisible" :aria-activedescendant="suggestionsVisible && suggestionIndex >= 0 ? 'tag-suggestion-' + suggestionIndex : undefined" @focus="focusSearch" @input="updateCaret" @click="updateCaret" @keyup="searchKeyup" @keydown.down.prevent="moveSuggestion(1)" @keydown.up.prevent="moveSuggestion(-1)" @keydown.enter="submitSearch" @keydown.esc="closeSuggestions" @blur="blurSuggestions" />
+            <button v-if="query" class="icon-button small-icon" type="button" aria-label="清空搜索" @click="clearSearch"><Icon name="close" :size="19" /></button>
+            <button class="search-submit" type="button" aria-label="执行搜索" title="搜索（Enter）" @click="submitSearch()"><Icon name="search" :size="22" /></button>
+            <div v-if="suggestionsVisible" id="tag-suggestions" class="tag-suggestions" role="listbox" aria-label="标签搜索建议"><div class="suggestion-heading"><Icon name="tag" :size="15" /><span>{{ searchSource === 'cloud' ? '云搜索建议' : '按标签搜索' }}</span><b v-if="suggestionTotal > suggestions.length">还有 {{ formatNumber(suggestionTotal - suggestions.length) }} 个匹配标签</b></div><button v-for="(item, i) in suggestions" :id="'tag-suggestion-' + i" :key="item.name" type="button" class="tag-suggestion" :class="{ active: i === suggestionIndex }" role="option" :aria-selected="i === suggestionIndex" @mousedown.prevent @click="commitSuggestion(i)" @mouseenter="suggestionIndex = i"><span>{{ searchSource === 'cloud' ? item.name : '#' + item.name }}</span><small v-if="searchSource === 'local'">{{ formatNumber(item.count || 0) }} 组</small><small v-else-if="item.translatedName && item.translatedName !== item.name">{{ item.translatedName }}</small></button></div>
+          </div>
+          <button ref="menuButton" class="icon-button menu-button" :class="{ active: filtersActive }" :aria-expanded="menuOpen" aria-haspopup="true" :title="filtersActive ? '筛选与排序（已应用筛选）' : '筛选与排序'" @click="menuOpen = !menuOpen"><Icon name="tune" :size="21" /><span v-if="filtersActive" class="menu-dot" /></button>
+        </div>
+        <Transition name="menu-pop"><div v-if="menuOpen" ref="menu" class="filter-menu" role="dialog" aria-label="筛选与排序">
+          <label v-if="!cloudSearchMode && !cloudFavoritesMode && sourceOptions.length > 1" class="menu-row"><span>来源</span><span class="menu-select"><select v-model="source" aria-label="筛选媒体来源"><option value="">全部来源</option><option v-for="item in sourceOptions" :key="item.id" :value="item.id">{{ item.name }}</option></select><Icon name="down" :size="16" /></span></label>
+          <div class="menu-row"><span>媒体类型</span><div class="menu-chips"><button v-for="filter in filters" :key="filter.id" class="filter-chip" :class="{ active: kind === filter.id }" :aria-pressed="kind === filter.id" @click="kind = filter.id"><Icon :name="kind === filter.id ? 'check' : filter.icon" :size="18" />{{ filter.label }}</button></div></div>
+          <label v-if="!cloudSearchMode" class="menu-row"><span>模糊匹配</span><span class="fuzzy-toggle"><input v-model="fuzzy" type="checkbox" /><span class="mini-switch" /><span>{{ fuzzy ? '已开启' : '已关闭' }}</span></span></label>
+          <label v-if="cloudSearchMode" class="menu-row"><span>匹配规则</span><span class="menu-select"><select v-model="cloudTarget" aria-label="云搜索匹配规则"><option v-for="target in pixivSearchTargets" :key="target.value" :value="target.value">{{ target.label }}</option></select><Icon name="down" :size="16" /></span></label>
+          <label class="menu-row"><span>排序方式</span><span class="sort-select"><Icon name="sort" :size="18" /><select v-if="cloudSearchMode" v-model="cloudSort" aria-label="云搜索排序"><option value="popular_preview">热度预览</option><option value="date_desc">最新优先</option><option value="date_asc">最早优先</option></select><select v-else v-model="sort" aria-label="排序方式"><option v-if="localSearchMode && submittedQuery" value="relevance">相关度优先</option><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="title">标题排序</option><option value="random">随机顺序</option></select><Icon name="down" :size="16" /></span></label>
+          <label v-if="sort === 'random' && !cloudSearchMode" class="menu-row"><span>换一批</span><button class="button tonal small" type="button" @click="reshuffle"><Icon name="refresh" :size="17" />重新打乱</button></label>
+          <label v-if="!cloudSearchMode" class="menu-row" :class="{ dim: timeSortDisabled }"><span>时间依据</span><span class="fuzzy-toggle order-toggle"><input v-model="order" type="checkbox" true-value="collected" false-value="published" :disabled="timeSortDisabled" /><span class="mini-switch" /><span>{{ effectiveOrder === 'collected' ? '收藏时间' : '发布时间' }}</span></span></label>
+          <div class="menu-row menu-action-row"><span>媒体库索引</span><button class="button tonal small" type="button" :disabled="status?.scan.running || !hasLibrary" @click="scan"><Icon name="refresh" :class="{ spinning: status?.scan.running }" :size="17" />{{ status?.scan.running ? '正在扫描' : '刷新媒体库' }}</button></div>
+        </div></Transition>
       </div>
       <section class="hero"><div class="hero-copy"><span class="eyebrow"><span class="short-line" />{{ view === 'favorites' ? 'YOUR FAVORITE MOMENTS' : 'A HOME FOR YOUR INSPIRATION' }}</span><h1>{{ title }}</h1><p>{{ caption }}</p><div class="hero-meta"><span><strong>{{ formatNumber(view === 'favorites' ? status?.favorites || 0 : currentSource?.works || status?.works || 0) }}</strong> 组作品</span><span class="dot-separator">·</span><span>{{ status?.sources.length || 0 }} 个媒体目录</span><span v-if="hasLibrary" class="hero-status"><Icon :name="status?.scan.running ? 'refresh' : 'check'" :class="{ spinning: status?.scan.running }" :size="15" />{{ status?.scan.running ? '正在整理' : '收藏随时可见' }}</span></div></div><div class="hero-illustration" aria-hidden="true"><div class="orbit orbit-one" /><div class="orbit orbit-two" /><div class="illustration-card back"><Icon name="video" :size="30" /></div><div class="illustration-card middle"><Icon name="leaf" :size="40" /></div><div class="illustration-card front"><div class="little-sun" /><div class="little-hill hill-one" /><div class="little-hill hill-two" /></div><span class="illustration-sparkle">✦</span><span class="illustration-dot" /></div></section>
       <section class="library-content" aria-label="作品列表">
         <div v-if="status?.scan.running" class="scan-progress" role="status"><div class="indeterminate-bar" /><span>{{ status.scan.phase }}<b>{{ formatNumber(status.scan.files) }} 个文件</b></span></div>
         <div v-if="status?.scan.errors.length && !status.scan.running" class="warning-banner"><Icon name="warning" :size="20" /><span>部分目录或描述未能读取，已有索引已保留。</span><button class="button text small" @click="openSettings">查看详情</button></div>
-        <div class="results-heading"><h2>{{ query ? '搜索结果' : view === 'favorites' ? '我的收藏' : currentSource?.name || '全部作品' }}<span>{{ formatNumber(result.total) }}</span></h2><span v-if="query && !loading" class="results-note">{{ result.elapsed }} ms · 支持简繁体与拼音</span><span v-else class="results-note">{{ kind ? ({ image: '静止的画面，无限的想象', video: '按下播放，让故事继续', animation: '让灵感动起来' }[kind]) : '灵感，在这里慢慢生长' }}</span></div>
+        <div v-if="cloudFavoritesMode" class="cloud-favorite-tabs" role="tablist" aria-label="Pixiv 收藏可见性"><button type="button" role="tab" :aria-selected="cloudFavoritesRestrict === 'public'" :class="{ active: cloudFavoritesRestrict === 'public' }" @click="cloudFavoritesRestrict = 'public'; router.replace({ name: 'cloudFavorites', query: { restrict: 'public' } })">公开收藏</button><button type="button" role="tab" :aria-selected="cloudFavoritesRestrict === 'private'" :class="{ active: cloudFavoritesRestrict === 'private' }" @click="cloudFavoritesRestrict = 'private'; router.replace({ name: 'cloudFavorites', query: { restrict: 'private' } })">私密收藏</button></div>
+        <div class="results-heading"><h2>{{ cloudSearchMode ? 'Pixiv 云搜索' : cloudFavoritesMode ? (cloudFavoritesRestrict === 'private' ? 'Pixiv 私密收藏' : 'Pixiv 公开收藏') : submittedQuery ? '搜索结果' : view === 'favorites' ? '我的收藏' : currentSource?.name || '全部作品' }}<span>{{ formatNumber(result.total) }}</span></h2><span v-if="cloudSearchMode && !loading" class="results-note">{{ cloudTargetLabel }} · {{ cloudSort === 'date_desc' ? '最新优先' : cloudSort === 'date_asc' ? '最早优先' : '热度预览' }} · {{ result.elapsed }} ms</span><span v-else-if="cloudFavoritesMode" class="results-note">{{ pixivStatus?.mirrors[cloudFavoritesRestrict]?.phase === 'ready' ? '镜像已同步' : '正在后台整理收藏夹…' }} · {{ formatNumber(pixivStatus?.mirrors[cloudFavoritesRestrict]?.items || result.total) }} 组</span><span v-else-if="submittedQuery && !loading" class="results-note">{{ result.elapsed }} ms · 支持简繁体与拼音</span><span v-else class="results-note">{{ kind ? ({ image: '静止的画面，无限的想象', video: '按下播放，让故事继续', animation: '让灵感动起来' }[kind]) : '灵感，在这里慢慢生长' }}</span></div>
         <div v-if="error" class="empty-state error-state"><span class="empty-symbol"><Icon name="warning" :size="38" /></span><h3>暂时无法连接媒体库</h3><p>{{ error }}</p><button class="button filled" @click="refreshStatus(); loadWorks()">重新连接</button></div>
         <div v-else-if="loading && !result.items.length" class="work-grid" aria-label="正在加载"><div v-for="n in 8" :key="n" class="skeleton-card"><div /><span /><small /></div></div>
         <div v-else-if="!hasLibrary" class="empty-state welcome-state"><div class="empty-art"><Icon name="folder-plus" :size="54" /><span>✦</span></div><span class="eyebrow">YOUR COLLECTION STARTS HERE</span><h3>给你的喜欢，一个家。</h3><p>添加存放图片和视频的文件夹，<br />拾光会自动将同组作品整理在一起。</p><button class="button filled" @click="openSettings"><Icon name="plus" :size="20" />添加第一个媒体目录</button><div class="welcome-features"><span><Icon name="images" :size="17" />自动分组</span><span><Icon name="search" :size="17" />描述搜索</span><span><Icon name="heart" :size="17" />跨设备收藏</span></div></div>
-        <div v-else-if="!result.items.length" class="empty-state"><span class="empty-symbol"><Icon :name="query ? 'search' : view === 'favorites' ? 'heart' : 'images'" :size="40" /></span><h3>{{ status?.scan.running ? '正在整理你的第一批作品' : query ? '还没有找到相关作品' : view === 'favorites' ? '留一点位置，给心动的作品' : '这里还没有作品' }}</h3><p>{{ status?.scan.running ? '扫描完成后，作品会自动出现在这里。' : query ? '试试更短的关键词，或开启模糊匹配。' : view === 'favorites' ? '点击作品卡片上的爱心，就能在这里找到它。' : '检查分组规则，或调整筛选条件再看看。' }}</p><button v-if="query || kind || source" class="button tonal" @click="resetFilters">清除筛选</button><button v-else-if="!status?.scan.running && view !== 'favorites'" class="button tonal" @click="openSettings">检查媒体目录</button></div>
-        <div v-else class="work-grid" :class="{ refreshing: loading }"><WorkCard v-for="work in result.items" :key="work.id" :work="work" @open="openWork" @favorite="toggleFavorite" /></div>
+        <div v-else-if="!result.items.length" class="empty-state"><span class="empty-symbol"><Icon :name="submittedQuery ? 'search' : view === 'favorites' ? 'heart' : 'images'" :size="40" /></span><h3>{{ status?.scan.running ? '正在整理你的第一批作品' : submittedQuery ? '还没有找到相关作品' : view === 'favorites' ? '留一点位置，给心动的作品' : '这里还没有作品' }}</h3><p>{{ status?.scan.running ? '扫描完成后，作品会自动出现在这里。' : submittedQuery ? '试试更短的关键词，或开启模糊匹配。' : view === 'favorites' ? '点击作品卡片上的爱心，就能在这里找到它。' : '检查分组规则，或调整筛选条件再看看。' }}</p><button v-if="submittedQuery || kind || source" class="button tonal" @click="resetFilters">清除筛选</button><button v-else-if="!status?.scan.running && view !== 'favorites'" class="button tonal" @click="openSettings">检查媒体目录</button></div>
+        <div v-else class="work-grid" :class="{ refreshing: loading }"><WorkCard v-for="work in result.items" :key="work.id" :work="work" :cloud-enabled="cloudEnabled" @open="openWork" @favorite="toggleFavorite" @cloud-favorite="toggleCloudFavorite" /></div>
         <div v-if="result.items.length" class="load-more">
           <button v-if="result.page < result.pages" class="button text small" :disabled="loadingMore" @click="retryLoadMore"><Icon name="refresh" :class="{ spinning: loadingMore }" :size="18" />{{ loadingMore ? '正在加载更多…' : moreFailed ? '加载失败，点击重试' : '继续向下滚动，自动加载更多' }}</button>
           <span v-else class="load-status">已加载全部 {{ formatNumber(result.total) }} 组作品</span>
@@ -439,7 +646,7 @@ onUnmounted(() => {
       </section>
       <footer class="page-footer"><span>拾光 MEDIA GARDEN</span><span>为每一份喜欢，留一处安放。</span></footer>
     </main>
-    <nav class="mobile-nav" aria-label="手机导航"><button :class="{ active: view === 'library' }" @click="navigate('library')"><span><Icon name="gallery" /></span>媒体库</button><button :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><span><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /></span>我的收藏</button><button @click="openSettings"><span><Icon name="settings" /></span>设置</button></nav>
+    <nav class="mobile-nav" aria-label="手机导航"><button :class="{ active: view === 'library' && !cloudFavoritesMode }" @click="navigate('library')"><span><Icon name="gallery" /></span>媒体库</button><button :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><span><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /></span>我的收藏</button><button :class="{ active: cloudFavoritesMode }" :disabled="!cloudEnabled" @click="router.push({ name: 'cloudFavorites', query: { restrict: cloudFavoritesRestrict } })"><span><Icon name="cloud" /></span>云端收藏</button><button @click="openSettings"><span><Icon name="settings" /></span>设置</button></nav>
     <AppNotice :notice="toast" @dismiss="dismiss" @action="runAction" />
   </div>
 </template>

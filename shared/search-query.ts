@@ -1,5 +1,17 @@
 export interface SearchToken { value: string; tag: boolean; start: number; end: number }
 
+/** 云建议始终使用末尾到上一个空白之间的文本，与光标位置无关。 */
+export function trailingSearchToken(query: string): SearchToken {
+  const value = query.match(/[^\s]*$/u)![0]
+  return { value, tag: false, start: query.length - value.length, end: query.length }
+}
+
+export function replaceTrailingSearchToken(query: string, suggestion: string): { query: string; caret: number } {
+  const token = trailingSearchToken(query)
+  const next = query.slice(0, token.start) + suggestion
+  return { query: next, caret: next.length }
+}
+
 export function searchTokens(query: string): SearchToken[] {
   return [...query.matchAll(/[#＃]"(?:\\.|[^"\\])*"?|[^\s]+/gu)].map(match => {
     const raw = match[0]

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { activeSearchToken, replaceWithTag, searchTokens, tagQuery } from '../shared/search-query.js'
+import { activeSearchToken, replaceWithTag, replaceTrailingSearchToken, trailingSearchToken, searchTokens, tagQuery } from '../shared/search-query.js'
 
 test('搜索词拆分：普通关键词、标签与带引号的标签', () => {
   assert.deepEqual(searchTokens('山林 风景'), [
@@ -33,4 +33,15 @@ test('选择标签建议后只替换光标处的关键词并保留后续关键�
   assert.deepEqual(replaceWithTag('山', 1, '山林'), { query: '#山林 ', caret: 4 })
   assert.deepEqual(replaceWithTag('山 风景', 1, '山林'), { query: '#山林 风景', caret: 4 })
   assert.deepEqual(replaceWithTag('风景', 2, '初音 未来'), { query: '#"初音 未来" ', caret: 9 })
+})
+
+test('云搜索建议始终使用末尾关键词，替换时精确保留前面的文本', () => {
+  assert.deepEqual(trailingSearchToken('风景  初音ミ'), { value: '初音ミ', tag: false, start: 4, end: 7 })
+  assert.deepEqual(replaceTrailingSearchToken('风景  初音ミ', '初音ミク'), { query: '风景  初音ミク', caret: 8 })
+  assert.deepEqual(replaceTrailingSearchToken('初音', '初音ミク'), { query: '初音ミク', caret: 4 })
+  assert.equal(trailingSearchToken('风景 ').value, '')
+  assert.deepEqual(replaceTrailingSearchToken('风景 ', '自然'), { query: '风景 自然', caret: 5 })
+  assert.equal(trailingSearchToken('').value, '')
+  assert.deepEqual(replaceTrailingSearchToken('风景\t初音', '初音ミク'), { query: '风景\t初音ミク', caret: 7 })
+  assert.equal(trailingSearchToken('"初音 未来"').value, '未来"')
 })

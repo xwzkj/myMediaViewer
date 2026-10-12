@@ -4,6 +4,7 @@ import { router } from './router'
 import 'viewerjs/dist/viewer.css'
 import './style.css'
 
-document.documentElement.dataset.theme = localStorage.getItem('theme') === 'dark' ? 'dark' : 'light'
+try { document.documentElement.dataset.theme = localStorage.getItem('theme') === 'dark' ? 'dark' : 'light' }
+catch { document.documentElement.dataset.theme = 'light' }
 
 createApp(App).use(router).mount('#app')

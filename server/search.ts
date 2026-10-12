@@ -1,19 +1,29 @@
 import Fuse from 'fuse.js'
 import { Converter } from 'opencc-js'
 import { pinyin } from 'pinyin-pro'
-import { allWorks, type StoredWork } from './database.js'
-import type { TagSuggestionsResponse } from '../shared/types.js'
+import { allWorks } from './database.js'
+import type { TagSuggestionsResponse, Work } from '../shared/types.js'
 import { searchTokens } from '../shared/search-query.js'
 
 const simplify = Converter({ from: 't', to: 'cn' })
 export function normalize(text: string): string { return simplify(text.normalize('NFKC')).toLowerCase().replace(/\s+/g, ' ').trim() }
-interface Document { work: StoredWork; title: string; labels: string; body: string; phonetic: string; tags: Set<string> }
+interface Document { work: Work; title: string; labels: string; body: string; phonetic: string; tags: Set<string> }
 interface IndexedTag { name: string; normalized: string; count: number; phonetic: string; initials: string }
 let documents: Document[] = []
 let tags: IndexedTag[] = []
 let fuzzy: Fuse<Document>
-export function refreshSearch(): void {
-  documents = allWorks().map(work => {
+function fallbackLocalWorks(): Work[] {
+  return allWorks().map(work => ({
+    ...work,
+    favorite: false,
+    cover: '',
+    origin: 'local',
+    hasLocal: true,
+    pixivId: work.sourceKind === 'pixiv' && /^\d+$/.test(work.externalId) ? work.externalId : undefined,
+  }))
+}
+export function refreshSearch(works?: Work[]): void {
+  documents = (works || fallbackLocalWorks()).map(work => {
     const labels = normalize(`${work.author} ${work.tags.join(' ')}`)
     const title = normalize(work.title)
     const names = `${title} ${labels}`
@@ -56,7 +66,8 @@ export function suggestTags(query: string): TagSuggestionsResponse {
   }).sort((a, b) => b.score - a.score || b.tag.count - a.tag.count || a.tag.name.localeCompare(b.tag.name, 'zh-CN'))
   return { total: matches.length, items: matches.slice(0, 12).map(({ tag }) => ({ name: tag.name, count: tag.count })) }
 }
-export function searchWorks(query: string, allowFuzzy: boolean): Array<{ work: StoredWork; score: number; approximate: boolean }> {
+export function searchWorks(query: string, allowFuzzy: boolean, works?: Work[]): Array<{ work: Work; score: number; approximate: boolean }> {
+  if (works) refreshSearch(works)
   const tokens = searchTokens(query).map(token => ({ ...token, value: normalize(token.value) })).filter(token => token.value).slice(0, 12)
   const terms = tokens.map(token => token.value)
   if (!terms.length) return documents.map(doc => ({ work: doc.work, score: 0, approximate: false }))

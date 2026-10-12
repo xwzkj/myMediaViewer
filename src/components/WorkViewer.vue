@@ -8,26 +8,26 @@ import { nearbyImages, createViewerImageCache, revealThumbnail, nextTranslationD
 import { drawMangaRegion } from '../manga-layout'
 import { vReleaseVideo, releaseVideos } from '../video-lifecycle'
 import type { Notice, NoticeAction } from '../use-notice'
+import WorkRecommendations from './WorkRecommendations.vue'
 
-const props = defineProps<{ work: Work; navigating?: boolean }>()
-const emit = defineEmits<{ close: []; favorite: [work: Work]; notice: [message: string, action?: NoticeAction, tone?: Notice['tone']]; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
+const props = defineProps<{ work: WorkDetail; navigating?: boolean; cloudEnabled?: boolean }>()
+const emit = defineEmits<{ close: []; favorite: [work: Work]; cloudFavorite: [work: Work]; openRelated: [work: Work, listKey: string]; notice: [message: string, action?: NoticeAction, tone?: Notice['tone']]; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
 const root = ref<HTMLElement>()
 const stage = ref<HTMLElement>()
 const filmstrip = ref<HTMLElement>()
 const images = createViewerImageCache()
-let loadVersion = 0
 let drawVersion = 0
 const video = ref<HTMLVideoElement>()
 onBeforeUnmount(() => { if (root.value) releaseVideos(root.value) })
-const detail = ref<WorkDetail | null>(null)
+const detail = computed(() => props.work)
 const index = ref(0)
-const error = ref('')
 const mediaError = ref(false)
 const previewing = ref(false)
 const slideshow = ref(false)
 const converting = ref(false)
 const convertMessage = ref('')
 const compatible = ref(false)
+const originalAssets = ref<Set<string>>(new Set())
 // 图片翻译：保留原图 / 已擦字译图两种显示方式；OCR 与译文都从服务端任务返回。
 const mangaResults = ref<Record<string, MangaPageResult>>({})
 const mangaJob = ref<MangaJob | null>(null)
@@ -63,20 +63,14 @@ const mangaFailures = computed(() => {
     return { assetId: item.assetId, page: at >= 0 ? `第 ${at + 1} 张` : '图片', message: item.message }
   })
 })
-const mediaUrl = computed(() => compatible.value ? `/api/assets/${asset.value?.id}/compatible` : asset.value?.url)
+const mediaUrl = computed(() => {
+  if (compatible.value && asset.value?.origin !== 'pixiv') return `/api/assets/${asset.value?.id}/compatible`
+  if (asset.value?.origin === 'pixiv' && originalAssets.value.has(asset.value.id)) {
+    return `/api/pixiv/assets/${asset.value.illustId}/${asset.value.page}/original`
+  }
+  return asset.value?.url
+})
 
-async function load() {
-  const version = ++loadVersion
-  const workId = props.work.id
-  detail.value = null
-  error.value = ''
-  try {
-    const value = await api<WorkDetail>(`/works/${encodeURIComponent(workId)}`)
-    if (disposed || version !== loadVersion || workId !== props.work.id) return
-    index.value = 0
-    detail.value = value
-  } catch (e) { if (!disposed && version === loadVersion) error.value = (e as Error).message }
-}
 // 切换分 P / 作品时丢弃旧图翻译状态，后台任务即使稍后完成也不会覆盖当前页面。
 function resetManga() {
   mangaToken++
@@ -90,14 +84,12 @@ function resetManga() {
   mangaError.value = ''
   mangaScopeOpen.value = false
 }
-onMounted(async () => {
-  await load()
-  if (disposed) return
+onMounted(() => {
   timer = setInterval(() => { if (slideshow.value && !isVideo.value && !previewing.value) next(1, true) }, 4500)
 })
-// 滑动切换到别的作品后重新取详情，并回到第一张。
-watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; translation.value = null; translationError.value = ''; translationDisplay.value = 'translated'; resetManga(); void load() })
-onUnmounted(() => { disposed = true; loadVersion++; drawVersion++; images.clear(); destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); clearTimeout(mangaTimer) })
+// 详情由作品页统一加载；切换作品后直接使用新资源，并回到第一张。
+watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; originalAssets.value = new Set(); translation.value = null; translationError.value = ''; translationDisplay.value = 'translated'; resetManga() })
+onUnmounted(() => { disposed = true; drawVersion++; images.clear(); destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); clearTimeout(mangaTimer) })
 watch(index, async () => {
   destroyPreview()
   mediaError.value = false
@@ -132,7 +124,7 @@ watch(() => asset.value?.id, async (assetId, _previous, onCleanup) => {
   const token = mangaToken
   const workId = props.work.id
   await Promise.all(nearbyImages(detail.value?.assets || [], index.value).map(async item => {
-    if (item.kind !== 'image' || item.extension === 'gif' || mangaResults.value[item.id]) return
+    if (item.kind !== 'image' || item.extension === 'gif' || item.origin === 'pixiv' || mangaResults.value[item.id]) return
     try {
       const { result } = await api<{ result: MangaPageResult | null }>(`/ai/manga/auto/${encodeURIComponent(item.id)}`, { signal: controller.signal })
       if (controller.signal.aborted || disposed || token !== mangaToken || workId !== props.work.id || mangaBusy.value || mangaResults.value[item.id]) return
@@ -196,7 +188,7 @@ function next(direction: number, auto = false) {
 const dragX = ref(0)
 // 切换分 P 或作品时的滑动方向，用来决定动画从哪边进出。
 const slide = ref(1)
-const mediaKey = computed(() => `${props.work.id}:${asset.value?.id || (error.value ? 'error' : 'loading')}`)
+const mediaKey = computed(() => `${props.work.id}:${asset.value?.id || 'empty'}`)
 const slideName = computed(() => slide.value >= 0 ? 'media-next' : 'media-prev')
 let gesture: { pointerId: number; startX: number; startY: number; mode: 'page' | 'work' | 'ignore' } | null = null
 let suppressClick = false
@@ -275,14 +267,18 @@ function openPreview() {
   if (suppressClick || !asset.value) return
   const host = root.value
   if (!host) return
+  const translated = mangaResult.value && mangaMode.value === 'translated' && mangaCanvas.value
+  if (!translated && asset.value.origin === 'pixiv' && asset.value.kind === 'image') {
+    originalAssets.value = new Set([...originalAssets.value, asset.value.id])
+  }
   destroyPreview()
   const token = document.createElement('div')
   token.style.display = 'none'
   const image = document.createElement('img')
   // 译图以 Canvas 叠加呈现，预览时把同一份结果编码进去，避免看到未回填的原图。
-  image.src = mangaResult.value && mangaMode.value === 'translated' && mangaCanvas.value
-    ? mangaCanvas.value.toDataURL('image/png')
-    : asset.value.url
+  image.src = translated
+    ? translated.toDataURL('image/png')
+    : mediaUrl.value!
   image.alt = props.work.title
   token.appendChild(image)
   // 放大预览挂在作品页内，随页面卸载一起清理。
@@ -508,18 +504,18 @@ function closeRoot() {
         <div ref="stage" class="media-stage" :style="dragX ? { transform: `translateX(${dragX}px)`, transition: 'none' } : undefined">
           <Transition :name="slideName" mode="out-in" @before-leave="releaseVideos">
             <div :key="mediaKey" class="media-frame">
-              <p v-if="error" class="inline-error">{{ error }}</p><div v-else-if="!asset" class="loading-state"><span class="spinner" />正在打开作品…</div>
+              <p v-if="!asset" class="inline-error">作品没有可显示的媒体</p>
               <template v-else>
                 <video v-if="isVideo" v-release-video ref="video" :key="mediaUrl" :src="mediaUrl" :poster="asset.thumbnail" controls playsinline preload="metadata" :autoplay="slideshow || asset.kind === 'animation'" :muted="asset.kind === 'animation'" :loop="asset.kind === 'animation' && !slideshow" @error="mediaError = true" @ended="slideshow && next(1, true)" />
                 <canvas v-else-if="mangaResult && mangaMode === 'translated' && mangaResult.regions.length" :key="mangaResult.key" ref="mangaCanvas" class="manga-canvas" :width="mangaResult.width" :height="mangaResult.height" :aria-label="`${work.title}，第 ${index + 1} 张的漫画译图`" @click="openPreview" />
-                <img v-else :key="asset.id" :src="asset.url" draggable="false" :alt="`${work.title}，第 ${index + 1} 张`" @click="openPreview" @error="mediaError = true" />
+                <img v-else :key="asset.id" :src="mediaUrl" draggable="false" :alt="`${work.title}，第 ${index + 1} 张`" @click="openPreview" @error="mediaError = true" />
                 <div v-if="mediaError" class="media-error"><Icon name="warning" :size="32" /><p>{{ isVideo ? '浏览器无法播放这个视频' : '无法读取这张图片' }}</p><button v-if="isVideo" class="button tonal" :disabled="converting" @click="makeCompatible">{{ converting ? '正在处理…' : '生成兼容版本' }}</button></div>
               </template>
             </div>
           </Transition>
           <button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow previous" aria-label="上一张" @click="next(-1)"><Icon name="left" :size="32" /></button><button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow next" aria-label="下一张" @click="next(1)"><Icon name="right" :size="32" /></button>
         </div>
-        <div class="viewer-controls"><span>{{ asset ? `${kindLabel(asset.kind)} · ${formatSize(asset.size)}` : '' }}</span><div><button class="icon-button" :class="{ selected: work.favorite }" :aria-label="work.favorite ? '取消收藏' : '收藏作品'" :aria-pressed="work.favorite" @click="emit('favorite', work)"><Icon :name="work.favorite ? 'heart-filled' : 'heart'" :size="20" /></button><button class="icon-button" :aria-label="slideshow ? '停止自动翻页' : '自动翻页'" :aria-pressed="slideshow" @click="slideshow = !slideshow"><Icon :name="slideshow ? 'pause' : 'play'" :size="22" /></button><button class="icon-button" aria-label="全屏" @click="fullscreen"><Icon name="fullscreen" :size="22" /></button><button class="icon-button" aria-label="返回上一页" @click="closeRoot"><Icon name="left" :size="22" /></button></div></div>
+        <div class="viewer-controls"><span class="viewer-media-info">{{ asset ? kindLabel(asset.kind) + (asset.size > 0 ? ' · ' + formatSize(asset.size) : '') : '' }}</span><div class="viewer-actions"><button v-if="work.hasLocal !== false" class="icon-button" :class="{ selected: work.favorite }" :aria-label="work.favorite ? '取消本地收藏' : '加入本地收藏'" :aria-pressed="work.favorite" @click="emit('favorite', work)"><Icon :name="work.favorite ? 'heart-filled' : 'heart'" :size="20" /></button><button v-if="cloudEnabled && work.pixivId" class="icon-button cloud-favorite" :class="{ selected: work.cloudBookmark?.bookmarked }" :aria-label="work.cloudBookmark?.bookmarked ? '取消 Pixiv 云端收藏' : '加入 Pixiv 云端收藏'" :aria-pressed="work.cloudBookmark?.bookmarked === true" @click="emit('cloudFavorite', work)"><Icon :name="work.cloudBookmark?.bookmarked ? 'cloud-heart' : 'cloud'" :size="20" /></button><button class="icon-button" :aria-label="slideshow ? '停止自动翻页' : '自动翻页'" :aria-pressed="slideshow" @click="slideshow = !slideshow"><Icon :name="slideshow ? 'pause' : 'play'" :size="22" /></button><button class="icon-button" aria-label="全屏" @click="fullscreen"><Icon name="fullscreen" :size="22" /></button><button class="icon-button" aria-label="返回上一页" @click="closeRoot"><Icon name="left" :size="22" /></button></div></div>
         <div v-if="(detail?.assets.length || 0) > 1" ref="filmstrip" class="filmstrip"><button v-for="(item, i) in detail?.assets" :key="item.id" :class="{ active: index === i }" :aria-label="`第 ${i + 1} 项`" :aria-pressed="index === i" @click="selectPage(i)"><img :src="item.thumbnail" loading="lazy" alt="" /><span>{{ i + 1 }}</span></button></div>
       </div>
             <aside class="work-info">
@@ -611,8 +607,16 @@ function closeRoot() {
           </ol>
         </section>
         <a v-if="detail?.originalUrl" class="button outlined small" :href="detail.originalUrl" target="_blank" rel="noopener noreferrer">前往原作品<Icon name="external" :size="18" /></a>
-        <div v-if="isVideo" class="compatibility-panel"><p>遇到黑屏或只有声音？</p><button class="button tonal small" :disabled="converting || compatible" @click="makeCompatible"><Icon name="video" :size="18" />{{ compatible ? '已切换兼容版本' : converting ? '正在处理…' : '生成兼容版本' }}</button><span v-if="convertMessage" role="status">{{ convertMessage }}</span><small>生成的文件只保存在缓存中，原文件保持不变。</small></div>
+        <div v-if="isVideo && asset?.origin !== 'pixiv'" class="compatibility-panel"><p>遇到黑屏或只有声音？</p><button class="button tonal small" :disabled="converting || compatible" @click="makeCompatible"><Icon name="video" :size="18" />{{ compatible ? '已切换兼容版本' : converting ? '正在处理…' : '生成兼容版本' }}</button><span v-if="convertMessage" role="status">{{ convertMessage }}</span><small>生成的文件只保存在缓存中，原文件保持不变。</small></div>
+        <WorkRecommendations :work="work" :cloud-enabled="cloudEnabled" @open="(target, listKey) => emit('openRelated', target, listKey)" @favorite="emit('favorite', $event)" @cloud-favorite="emit('cloudFavorite', $event)" @notice="emit('notice', $event)" />
       </div></Transition></aside>
     </div>
   </main>
 </template>
+
+<style scoped>
+.viewer-controls { flex-wrap: wrap; gap: 6px 12px; padding: 6px 12px; }
+.viewer-media-info { flex-shrink: 0; white-space: nowrap; }
+.viewer-actions { min-width: 0; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+.viewer-actions .icon-button { flex-shrink: 0; }
+</style>

@@ -10,6 +10,7 @@ import {
   mdiSortVariant, mdiTuneVariant, mdiImageOutline, mdiAutoFix, mdiMenu, mdiMonitor,
   mdiContentCopy, mdiFolderPlusOutline, mdiLeaf, mdiFolderOpenOutline, mdiCloudOffOutline, mdiTagOutline,
   mdiTranslate,
+  mdiCloudOutline, mdiCloudCheckOutline, mdiSwapHorizontal,
 } from '@mdi/js'
 
 const props = defineProps<{ name: string; size?: number }>()
@@ -27,6 +28,7 @@ const icons: Record<string, string> = {
   menu: mdiMenu, monitor: mdiMonitor, copy: mdiContentCopy, 'folder-plus': mdiFolderPlusOutline,
   leaf: mdiLeaf, 'folder-open': mdiFolderOpenOutline, offline: mdiCloudOffOutline, tag: mdiTagOutline,
   translate: mdiTranslate,
+  cloud: mdiCloudOutline, 'cloud-heart': mdiCloudCheckOutline, swap: mdiSwapHorizontal,
 }
 const icon = computed(() => icons[props.name] || mdiImageOutline)
 </script>

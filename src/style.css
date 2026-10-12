@@ -23,6 +23,19 @@
   .tag-chip { padding: 5px 8px; background: var(--surface-high); color: var(--primary); font-size: 10px; border-radius: 6px; overflow-wrap: anywhere; max-width: 100%; text-align: left; }
   .tag-chip:hover { background: var(--primary-container); color: var(--on-container); }
 }
+
+.search-field { min-height: 0; padding: 5px; gap: 10px; }
+.search-field input { height: 40px; }
+.search-mode-toggle { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex-shrink: 0; height: 40px; padding: 0 10px; border: 1px solid var(--outline); border-radius: 24px; background: var(--surface-high); color: var(--primary); font-size: 13px; font-weight: 600; cursor: pointer; transition: background .15s, box-shadow .15s; }
+.search-mode-toggle:hover { background: var(--primary-container); box-shadow: 0 1px 4px #0002; }
+.search-mode-toggle.cloud { background: var(--primary-container); color: var(--primary); }
+.search-submit { display: grid; place-items: center; flex-shrink: 0; width: 40px; height: 40px; padding: 0; border: 0; border-radius: 50%; background: var(--primary-container); color: var(--primary); cursor: pointer; }
+.search-submit:hover { filter: brightness(.95); }
+@media(max-width: 600px) { .search-field { gap: 6px; } .search-field input, .search-mode-toggle { height: 36px; } .search-mode-toggle { gap: 4px; padding: 0 8px; } .search-submit { width: 36px; height: 36px; } }
+.cloud-favorite-tabs { display: flex; gap: 8px; margin-top: 20px; }
+.cloud-favorite-tabs button { min-height: 36px; padding: 0 14px; border: 1px solid var(--outline); border-radius: 999px; background: var(--surface); color: var(--muted); font-size: 12px; }
+.cloud-favorite-tabs button.active { border-color: var(--primary); background: var(--primary-container); color: var(--on-container); }
+.menu-action-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 @layer responsive {
   @media (min-width: 701px) and (max-width: 960px) {
     .sidebar .add-folder { justify-content: center; align-items: center; flex-shrink: 0; padding: 0; }

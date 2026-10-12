@@ -24,8 +24,11 @@ export const router = createRouter({
     { path: '/favorites', name: 'favorites', component: LibraryView },
     { path: '/source/:sourceId', name: 'source', component: LibraryView },
     { path: '/search', name: 'search', component: LibraryView },
+    { path: '/cloud/search', name: 'cloudSearch', component: LibraryView },
+    { path: '/cloud/favorites', name: 'cloudFavorites', component: LibraryView },
     { path: '/settings', name: 'settings', component: SettingsPage },
     { path: '/works/:workId', name: 'work', component: WorkPage },
+    { path: '/cloud/works/:workId', name: 'cloudWork', component: WorkPage },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
   scrollBehavior(_to, from, savedPosition) {

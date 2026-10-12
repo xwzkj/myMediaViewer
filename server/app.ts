@@ -21,6 +21,11 @@ import { listDirectories } from './directories.js'
 import { getAiSettings, saveAiSettings, testAiConnection, listAiModels, translateFields, clearTranslationCache } from './ai.js'
 import { getAutoMangaTranslation, getMangaJob, getMangaModelStatus, mangaBaseImagePath, startMangaTranslation } from './ai/manga/service.js'
 import { debugLogging, logApi, logError, logInfo, setLoggingEnabled } from './log.js'
+import { registerPixivRoutes } from './pixiv/routes.js'
+import { getPixivRuntime } from './pixiv/auth.js'
+import { buildUnifiedCatalog, pixivBookmarkCatalog, workMatchesSource } from './pixiv/catalog.js'
+import { getPixivBookmarkRestrict, getPixivWorkRecord } from './pixiv/store.js'
+import { getOrCachePixivResource, pixivCacheKey } from './pixiv/cache.js'
 
 export async function createApp(logging = true) {
   setLoggingEnabled(logging)
@@ -34,6 +39,7 @@ export async function createApp(logging = true) {
   refreshSearch()
   onScan(refreshSearch)
   await detectFFmpeg()
+  await registerPixivRoutes(app)
   app.addHook('onRequest', async (request, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff').header('Referrer-Policy', 'same-origin')
     // 默认只服务局域网：公网地址、以及任何经过代理转发的请求（本机反向代理/隧道同样会看起来像 127.0.0.1）都拒绝，
@@ -81,10 +87,12 @@ export async function createApp(logging = true) {
   app.get('/api/status', async (): Promise<LibraryStatus> => {
     const works = allWorks()
     const favorites = favoriteIds()
+    const pixiv = getPixivRuntime()
+    const catalog = buildUnifiedCatalog(!pixiv.localMode && pixiv.configured ? pixiv.account?.id || null : null, works.map(work => toWork(work, favorites)))
     return {
-      works: works.length, files: works.reduce((total, w) => total + w.count, 0), favorites: works.filter(w => favorites.has(w.id)).length,
-      images: works.filter(w => w.kind === 'image').length, videos: works.filter(w => w.kind === 'video').length,
-      animations: works.filter(w => w.kind === 'animation').length,
+      works: catalog.length, files: works.reduce((total, w) => total + w.count, 0), favorites: works.filter(w => favorites.has(w.id)).length,
+      images: catalog.filter(w => w.kind === 'image').length, videos: catalog.filter(w => w.kind === 'video').length,
+      animations: catalog.filter(w => w.kind === 'animation').length,
       sources: sources.map(s => ({ ...s, works: works.filter(w => w.sourceId === s.id).length, online: sourceOnline.get(s.id) ?? existsSync(s.path) })),
       scan: scanStatus, ffmpeg: ffmpegAvailable,
       addresses: Object.values(networkInterfaces()).flat().filter(i => i && i.family === 'IPv4' && !i.internal).map(i => `http://${i!.address}:${port}`),
@@ -200,6 +208,8 @@ export async function createApp(logging = true) {
     schema: { querystring: { type: 'object', additionalProperties: false, properties: { q: { type: 'string', maxLength: 500 } } } },
   }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store')
+    const pixiv = getPixivRuntime()
+    refreshSearch(buildUnifiedCatalog(!pixiv.localMode && pixiv.configured ? pixiv.account?.id || null : null, allWorks().map(work => toWork(work, favoriteIds()))))
     return suggestTags(request.query.q || '')
   })
 
@@ -207,10 +217,20 @@ export async function createApp(logging = true) {
     const started = performance.now()
     const query = request.query
     const favorites = favoriteIds()
+    const pixiv = getPixivRuntime()
+    const localWorks = allWorks().map(work => toWork(work, favorites))
+    const accountId = !pixiv.localMode && pixiv.configured ? pixiv.account?.id || null : null
+    // Pixiv 收藏来源已经按 bookmark_seq 建好索引；直接读取对应书架，避免
+    // 切换来源时把本地作品和两个云书架再次合并一遍。
+    const catalog = accountId && (query.source === 'pixiv:public' || query.source === 'pixiv:private')
+      ? pixivBookmarkCatalog(accountId, query.source.endsWith(':private') ? 'private' : 'public')
+      : query.source && !query.source.startsWith('pixiv:')
+        ? localWorks
+        : buildUnifiedCatalog(accountId, localWorks)
     // kind 支持逗号分隔的多个值，例如 kind=video,animation：界面把视频和动图合并成了一个筛选。
     const kinds = (query.kind || '').split(',').map(value => value.trim()).filter(Boolean)
-    let results = searchWorks((query.q || '').slice(0, 500), query.fuzzy === 'true').filter(({ work }) =>
-      (!query.source || work.sourceId === query.source) && (!kinds.length || kinds.includes(work.kind))
+    let results = searchWorks((query.q || '').slice(0, 500), query.fuzzy === 'true', catalog).filter(({ work }) =>
+      workMatchesSource(work, query.source || '') && (!kinds.length || kinds.includes(work.kind))
       && (query.favorites !== 'true' || favorites.has(work.id)))
     if (!query.q?.trim() || query.sort !== 'relevance') {
       // by=collected 时「最新 / 最早」指收藏顺序（文件名开头的收藏编号），否则仍按发布日期。
@@ -238,12 +258,19 @@ export async function createApp(logging = true) {
     }
     const pages = Math.max(1, Math.ceil(results.length / 48))
     const page = Math.min(pages, Math.max(1, Math.floor(Number(query.page)) || 1))
-    return { items: results.slice((page - 1) * 48, page * 48).map(({ work, approximate }) => ({ ...toWork(work, favorites), approximate })), total: results.length, page, pages, elapsed: Math.round(performance.now() - started) }
+    return { items: results.slice((page - 1) * 48, page * 48).map(({ work, approximate }) => ({ ...work, approximate })), total: results.length, page, pages, elapsed: Math.round(performance.now() - started) }
   })
   app.get<{ Params: { id: string } }>('/api/works/:id', async (request, reply) => {
     const work = getWork(request.params.id)
     if (!work) return reply.code(404).send({ message: '作品不存在' })
-    return { ...toWork(work, favoriteIds()), originalUrl: /^https?:\/\//.test(work.originalUrl) ? work.originalUrl : '',
+    const pixiv = getPixivRuntime()
+    const pixivId = work.sourceKind === 'pixiv' && /^\d+$/.test(work.externalId) ? work.externalId : undefined
+    const cloudRestrict = pixiv.configured && !pixiv.localMode && pixiv.account?.id && pixivId
+      ? getPixivBookmarkRestrict(pixiv.account.id, pixivId)
+      : null
+    return { ...toWork(work, favoriteIds()), pixivId, origin: 'local' as const, hasLocal: true,
+      cloudBookmark: pixivId ? (cloudRestrict ? { bookmarked: true, restrict: cloudRestrict } : { bookmarked: false, restrict: pixiv.defaultBookmarkRestrict }) : undefined,
+      originalUrl: /^https?:\/\//.test(work.originalUrl) ? work.originalUrl : '',
       assets: workAssets(work.id).map(({ path: _path, display: _display, ...asset }) => ({ ...asset, url: `/api/assets/${asset.id}/file`, thumbnail: `/api/assets/${asset.id}/thumbnail?v=${asset.modified}` })) }
   })
   app.put<{ Params: { id: string }; Body: { favorite: boolean } }>('/api/works/:id/favorite', {
@@ -316,9 +343,33 @@ export async function createApp(logging = true) {
     const assets: StoredAsset[] = []
     for (const assetId of assetIds) {
       const asset = getAsset(assetId)
-      if (!asset || !await accessibleAsset(asset)) return reply.code(404).send({ message: '图片不存在或媒体目录离线' })
-      if (asset.kind !== 'image' || asset.extension === 'gif') return reply.code(400).send({ message: '只有静态图片支持漫画翻译' })
-      assets.push(asset)
+      if (asset) {
+        if (!await accessibleAsset(asset)) return reply.code(404).send({ message: '图片不存在或媒体目录离线' })
+        if (asset.kind !== 'image' || asset.extension === 'gif') return reply.code(400).send({ message: '只有静态图片支持漫画翻译' })
+        assets.push(asset)
+        continue
+      }
+      const match = /^pixiv:(\d+):(\d+)$/.exec(assetId)
+      const pixiv = getPixivRuntime()
+      const uid = pixiv.account?.id
+      if (!match || pixiv.localMode || !pixiv.configured || !uid) return reply.code(404).send({ message: '图片不存在或 Pixiv 云功能不可用' })
+      const record = getPixivWorkRecord(uid, match[1])
+      const page = Number(match[2])
+      const meta = record?.meta.pages[page]
+      if (!record || !meta) return reply.code(404).send({ message: 'Pixiv 图片缓存信息不存在，请重新打开云端作品' })
+      const resource = await getOrCachePixivResource(pixivCacheKey('page', match[1], page, 'original'), meta.original || meta.preview, undefined, 256 * 1024 * 1024)
+      assets.push({
+        id: assetId,
+        workId: `pixiv:${match[1]}`,
+        path: resource.path,
+        filename: `${match[1]}_p${page}.png`,
+        page,
+        kind: 'image',
+        extension: 'png',
+        size: resource.size,
+        modified: resource.modified,
+        display: true,
+      })
     }
     return startMangaTranslation(assets, body.force === true)
   })
