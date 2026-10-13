@@ -265,6 +265,13 @@ export function getPixivBookmarkRestrict(accountId: string, illustId: string): P
   return row ? asRestrict(row.restrict) : null
 }
 
+export function getPixivBookmarkStates(accountId: string): Map<string, PixivBookmarkRestrict> {
+  const rows = db.prepare('SELECT illust_id, restrict FROM pixiv_bookmarks WHERE account_id = ?').all(accountId) as Array<{ illust_id: string; restrict: string }>
+  const states = new Map<string, PixivBookmarkRestrict>()
+  for (const row of rows) if (!states.has(row.illust_id) || row.restrict === 'private') states.set(row.illust_id, asRestrict(row.restrict))
+  return states
+}
+
 export function removePixivBookmark(accountId: string, illustId: string): void {
   db.prepare('DELETE FROM pixiv_bookmarks WHERE account_id = ? AND illust_id = ?').run(accountId, illustId)
 }

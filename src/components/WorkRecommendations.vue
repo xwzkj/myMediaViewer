@@ -5,6 +5,9 @@ import { api } from '../api'
 import { readRecommendationSource, writeRecommendationSource, type SearchSource } from '../library-state'
 import { createRecommendationSession } from '../recommendation-session'
 import Icon from './Icon.vue'
+import WorkFavoriteActions from './WorkFavoriteActions.vue'
+import WorkMediaBadge from './WorkMediaBadge.vue'
+import SmoothThumbnail from './SmoothThumbnail.vue'
 
 const props = defineProps<{ work: Work; cloudEnabled?: boolean }>()
 const emit = defineEmits<{ open: [work: Work, listKey: string]; favorite: [work: Work]; cloudFavorite: [work: Work]; notice: [message: string] }>()
@@ -81,10 +84,10 @@ function openWork(work: Work) {
     <div v-else-if="!items.length" class="recommendation-empty">暂时没有找到相关作品。</div>
     <div v-else class="recommendation-list">
       <article v-for="item in items" :key="item.id" class="recommendation-card">
-        <button type="button" class="recommendation-open" :aria-label="item.title" @click="openWork(item)"><img :src="item.cover" :alt="item.title" loading="lazy" decoding="async" /></button>
+        <button type="button" class="recommendation-open" :aria-label="item.title" @click="openWork(item)"><SmoothThumbnail :src="item.cover" :alt="item.title" /></button>
         <div class="recommendation-favorites">
-          <button v-if="item.hasLocal !== false" type="button" class="icon-button" :class="{ selected: item.favorite }" :aria-label="item.favorite ? '取消本地收藏' : '加入本地收藏'" :aria-pressed="item.favorite" @click="emit('favorite', item)"><Icon :name="item.favorite ? 'heart-filled' : 'heart'" :size="18" /></button>
-          <button v-if="cloudEnabled && item.pixivId" type="button" class="icon-button" :class="{ selected: item.cloudBookmark?.bookmarked }" :aria-label="item.cloudBookmark?.bookmarked ? '取消 Pixiv 云端收藏' : '加入 Pixiv 云端收藏'" :aria-pressed="item.cloudBookmark?.bookmarked === true" @click="emit('cloudFavorite', item)"><Icon :name="item.cloudBookmark?.bookmarked ? 'cloud-heart' : 'cloud'" :size="18" /></button>
+          <WorkMediaBadge :work="item" inline />
+          <WorkFavoriteActions :work="item" :cloud-enabled="cloudEnabled" @favorite="emit('favorite', $event)" @cloud-favorite="emit('cloudFavorite', $event)" />
         </div>
       </article>
     </div>
@@ -101,13 +104,10 @@ function openWork(work: Work) {
 .recommendation-tabs button { padding: 5px 8px; border-radius: 8px; background: var(--surface-high); color: var(--muted); font-size: 9px; }
 .recommendation-tabs button.active { background: var(--primary-container); color: var(--on-container); }
 .recommendation-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.recommendation-card { position: relative; padding: 0; overflow: hidden; border: 1px solid var(--outline); border-radius: 10px; background: var(--surface-high); aspect-ratio: 1 / 1.18; }
-.recommendation-open { display: block; width: 100%; height: 100%; padding: 0; background: transparent; }
-.recommendation-favorites { position: absolute; right: 6px; bottom: 6px; display: flex; gap: 4px; }
-.recommendation-favorites .icon-button { width: 34px; height: 34px; background: var(--surface); box-shadow: 0 1px 6px #0003; color: var(--text); }
-.recommendation-favorites .icon-button.selected { background: var(--primary-container); color: var(--on-container); }
+.recommendation-card { position: relative; padding: 0; overflow: hidden; border: 1px solid var(--outline); border-radius: 12px; background: var(--card); }
+.recommendation-open { position: relative; display: block; width: 100%; aspect-ratio: 1 / 1.18; padding: 0; background: var(--surface-high); }
+.recommendation-favorites { display: flex; align-items: center; justify-content: space-between; gap: 4px; padding: 6px; border-top: 1px solid var(--outline); }
 .recommendation-card:hover { border-color: var(--primary); }
-.recommendation-card img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .recommendation-loading, .recommendation-empty, .recommendation-error { display: flex; align-items: center; gap: 8px; padding: 16px 5px; color: var(--muted); font-size: 10px; }
 .recommendation-error { color: var(--danger); }
 .recommendation-more { width: 100%; justify-content: center; margin-top: 10px; }

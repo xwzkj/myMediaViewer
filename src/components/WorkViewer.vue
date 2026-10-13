@@ -9,6 +9,7 @@ import { drawMangaRegion } from '../manga-layout'
 import { vReleaseVideo, releaseVideos } from '../video-lifecycle'
 import type { Notice, NoticeAction } from '../use-notice'
 import WorkRecommendations from './WorkRecommendations.vue'
+import SmoothThumbnail from './SmoothThumbnail.vue'
 
 const props = defineProps<{ work: WorkDetail; navigating?: boolean; cloudEnabled?: boolean }>()
 const emit = defineEmits<{ close: []; favorite: [work: Work]; cloudFavorite: [work: Work]; openRelated: [work: Work, listKey: string]; notice: [message: string, action?: NoticeAction, tone?: Notice['tone']]; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
@@ -147,7 +148,7 @@ watch(() => asset.value?.id, async (assetId, _previous, onCleanup) => {
       }
     } catch { /* Optional warmup must not block reading the original. */ }
   }))
-})
+}, { immediate: true })
 // v-if 切换会让 canvas 重新挂载；只要译图、显示模式或 canvas 实例变化，就重新绘制一次。
 watch([mangaMode, () => mangaResult.value?.key, () => mangaCanvas.value], async ([mode, key, canvas]) => {
   if (mode !== 'translated' || !key || !canvas) return
@@ -549,7 +550,7 @@ function closeRoot() {
           <button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow previous" aria-label="上一张" @click="next(-1)"><Icon name="left" :size="32" /></button><button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow next" aria-label="下一张" @click="next(1)"><Icon name="right" :size="32" /></button>
         </div>
         <div class="viewer-controls"><span class="viewer-media-info">{{ asset ? kindLabel(asset.kind) + (asset.size > 0 ? ' · ' + formatSize(asset.size) : '') : '' }}</span><div class="viewer-actions"><button v-if="work.hasLocal !== false" class="icon-button" :class="{ selected: work.favorite }" :aria-label="work.favorite ? '取消本地收藏' : '加入本地收藏'" :aria-pressed="work.favorite" @click="emit('favorite', work)"><Icon :name="work.favorite ? 'heart-filled' : 'heart'" :size="20" /></button><button v-if="cloudEnabled && work.pixivId" class="icon-button cloud-favorite" :class="{ selected: work.cloudBookmark?.bookmarked }" :aria-label="work.cloudBookmark?.bookmarked ? '取消 Pixiv 云端收藏' : '加入 Pixiv 云端收藏'" :aria-pressed="work.cloudBookmark?.bookmarked === true" @click="emit('cloudFavorite', work)"><Icon :name="work.cloudBookmark?.bookmarked ? 'cloud-heart' : 'cloud'" :size="20" /></button><button class="icon-button" :aria-label="slideshow ? '停止自动翻页' : '自动翻页'" :aria-pressed="slideshow" @click="slideshow = !slideshow"><Icon :name="slideshow ? 'pause' : 'play'" :size="22" /></button><button class="icon-button" aria-label="全屏" @click="fullscreen"><Icon name="fullscreen" :size="22" /></button><button class="icon-button" aria-label="返回上一页" @click="closeRoot"><Icon name="left" :size="22" /></button></div></div>
-        <div v-if="(detail?.assets.length || 0) > 1" ref="filmstrip" class="filmstrip"><button v-for="(item, i) in detail?.assets" :key="item.id" :class="{ active: index === i }" :aria-label="`第 ${i + 1} 项`" :aria-pressed="index === i" @click="selectPage(i)"><img :src="item.thumbnail" loading="lazy" alt="" /><span>{{ i + 1 }}</span></button></div>
+        <div v-if="(detail?.assets.length || 0) > 1" ref="filmstrip" class="filmstrip"><button v-for="(item, i) in detail?.assets" :key="item.id" :class="{ active: index === i }" :aria-label="`第 ${i + 1} 项`" :aria-pressed="index === i" @click="selectPage(i)"><SmoothThumbnail :src="item.thumbnail" alt="" /><span class="filmstrip-page">{{ i + 1 }}</span></button></div>
       </div>
             <aside class="work-info">
         <nav class="work-navigation" aria-label="切换作品">
@@ -652,4 +653,5 @@ function closeRoot() {
 .viewer-media-info { flex-shrink: 0; white-space: nowrap; }
 .viewer-actions { min-width: 0; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
 .viewer-actions .icon-button { flex-shrink: 0; }
+.viewer-actions .cloud-favorite.selected { color: var(--primary); background: var(--primary-container); }
 </style>

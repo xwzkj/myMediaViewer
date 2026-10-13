@@ -3,7 +3,7 @@ import { UGOIRA_ENCODING_VERSION } from '../../shared/ugoira.js'
 import { localPixivId } from './identity.js'
 import type { Asset, MediaKind, PixivBookmarkRestrict, Work, WorkMembership } from '../../shared/types.js'
 import { allWorks } from '../database.js'
-import { getPixivBookmarkRecords, getPixivWorkRecords } from './store.js'
+import { getPixivBookmarkRecords, getPixivWorkRecords, getPixivBookmarkStates } from './store.js'
 import type { PixivPageMeta, PixivRawIllust, PixivStoredWork, PixivUgoiraMeta, PixivWorkMeta } from './types.js'
 
 export const PIXIV_PUBLIC_SOURCE = 'pixiv:public'
@@ -251,6 +251,17 @@ export function buildUnifiedCatalog(accountId: string | null, localWorks?: Work[
 
 export function clearUnifiedCatalogCache(): void {
   catalogCache.clear()
+}
+
+/** Annotate local source lists without adding cloud-only works to the source. */
+export function withLocalCloudBookmarks(accountId: string | null, works: Work[]): Work[] {
+  const states = accountId ? getPixivBookmarkStates(accountId) : null
+  return works.map(work => {
+    const pixivId = localPixivId(work) || undefined
+    const restrict = pixivId ? states?.get(pixivId) : undefined
+    return { ...work, origin: 'local', hasLocal: true, pixivId,
+      cloudBookmark: pixivId && states ? { bookmarked: Boolean(restrict), restrict: restrict || 'public' } : undefined }
+  })
 }
 
 export function pixivBookmarkCatalog(accountId: string, restrict: PixivBookmarkRestrict): Work[] {

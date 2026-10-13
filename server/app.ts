@@ -25,7 +25,7 @@ import { getAutoMangaTranslation, getMangaJob, getMangaModelStatus, mangaBaseIma
 import { debugLogging, logApi, logError, logInfo, setLoggingEnabled } from './log.js'
 import { registerPixivRoutes } from './pixiv/routes.js'
 import { getPixivRuntime } from './pixiv/auth.js'
-import { buildUnifiedCatalog, pixivBookmarkCatalog, workMatchesSource } from './pixiv/catalog.js'
+import { buildUnifiedCatalog, pixivBookmarkCatalog, workMatchesSource, withLocalCloudBookmarks } from './pixiv/catalog.js'
 import { getPixivBookmarkRestrict, getPixivWorkRecord } from './pixiv/store.js'
 import { getOrCachePixivResource, pixivCacheKey } from './pixiv/cache.js'
 
@@ -229,7 +229,7 @@ export async function createApp(logging = true) {
     const catalog = accountId && (query.source === 'pixiv:public' || query.source === 'pixiv:private')
       ? pixivBookmarkCatalog(accountId, query.source.endsWith(':private') ? 'private' : 'public')
       : query.source && !query.source.startsWith('pixiv:')
-        ? localWorks
+        ? withLocalCloudBookmarks(accountId, localWorks)
         : buildUnifiedCatalog(accountId, localWorks)
     // kind 支持逗号分隔的多个值，例如 kind=video,animation：界面把视频和动图合并成了一个筛选。
     const kinds = (query.kind || '').split(',').map(value => value.trim()).filter(Boolean)
