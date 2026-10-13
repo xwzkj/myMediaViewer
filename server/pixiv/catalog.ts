@@ -1,4 +1,6 @@
 import path from 'node:path'
+import { UGOIRA_ENCODING_VERSION } from '../../shared/ugoira.js'
+import { localPixivId } from './identity.js'
 import type { Asset, MediaKind, PixivBookmarkRestrict, Work, WorkMembership } from '../../shared/types.js'
 import { allWorks } from '../database.js'
 import { getPixivBookmarkRecords, getPixivWorkRecords } from './store.js'
@@ -136,7 +138,7 @@ export function cloudAssets(illustId: string, work: Work, meta: PixivWorkMeta): 
       extension: 'webm',
       size: 0,
       modified: work.updated,
-      url: `/api/pixiv/ugoira/${illustId}/animation`,
+      url: `/api/pixiv/ugoira/${illustId}/animation?v=${UGOIRA_ENCODING_VERSION}`,
       thumbnail: `/api/pixiv/assets/${illustId}/0/preview?v=${work.updated}`,
       origin: 'pixiv',
       illustId,
@@ -156,11 +158,6 @@ export function cloudAssets(illustId: string, work: Work, meta: PixivWorkMeta): 
     origin: 'pixiv',
     illustId,
   }))
-}
-
-function localPixivId(work: Work): string | null {
-  if (work.sourceKind !== 'pixiv' || !/^\d+$/.test(work.externalId)) return null
-  return work.externalId
 }
 
 function localMembership(work: Work): WorkMembership {
@@ -201,7 +198,7 @@ export function buildUnifiedCatalog(accountId: string | null, localWorks?: Work[
 
   // 来源切换会在短时间内连续请求 status、works 和 tags。镜像数据本身只在
   // 后台分页同步时变化，短 TTL 可以避免每个请求都反序列化整套 Pixiv 目录。
-  const cacheKey = `${accountId}|${local.map(work => `${work.id}:${work.updated}:${work.count}:${work.favorite ? 1 : 0}`).join(';')}`
+  const cacheKey = `${accountId}|${local.map(work => `${work.id}:${work.updated}:${work.count}:${work.favorite ? 1 : 0}:${work.pixivId || ''}`).join(';')}`
   const cached = catalogCache.get(accountId)
   if (cached && cached.key === cacheKey && Date.now() - cached.at < CATALOG_CACHE_MS) return cached.works
 

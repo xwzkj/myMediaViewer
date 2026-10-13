@@ -98,6 +98,10 @@
 | GET | `/api/pixiv/ugoira/:illustId/:variant` | 云端 Ugoira 动画资源 |
 | GET | `/api/works/:id/related` | 本地相关作品推荐 |
 
+Ugoira 的 `variant` 为 `animation`。默认返回缓存的 VP9/WebM，FFmpeg 不可用或转码失败时返回动画 WebP。可传 `format=webp` 强制获取独立缓存的动画 WebP，供浏览器视频解码失败时回退；不支持的格式返回 400。视频响应可正常使用 Range 请求（206）。
+
+VP9 使用 CRF 18、`b:v=0` 恒定质量模式、8 位 Profile 0 / yuv420p，并按毫秒保留逐帧延迟和最后一帧时长；WebP 回退质量为 95。编码版本同时写入缓存键和资源 URL，参数升级后按需重新生成，复用已下载的 ZIP。
+
 Pixiv 云接口沿用现有返回结构。设置接口只返回账号概要，不返回 token；提交非空 `refreshToken` 时先向 OAuth 验证，验证失败不覆盖原账号。未登录及断开账号时强制开启本地模式，成功登录后自动关闭；已登录时允许手动切换。本地模式下云接口返回 403；`/api/pixiv/cache/clear` 仍然可用，但必须显式提交 `all: true` 或正整数 `olderThanDays`，缺失或非法参数返回 400，不会默认为全部清理。
 
 `/api/pixiv/search` 接受 `q`、`sort=popular_preview|date_desc|date_asc`、`target` 和上次响应的 `nextCursor`（以 `cursor` 参数传回）。`target` 支持 `partial_match_for_tags`（默认，标签部分一致）、`exact_match_for_tags`（标签完全一致）、`title_and_caption`（标题、简介）、`keyword`（标签、标题、简介）。热度预览一般没有后续页。`nextCursor` 是服务端生成的不透明游标，只能用于同一查询、排序和匹配规则，相关作品游标只能用于同一作品。作品 ID 必须是正整数字符串；媒体 `page` 是从 0 开始的非负整数，`variant` 仅接受 `preview` / `original`，Ugoira 仅接受 `animation`。
@@ -120,6 +124,7 @@ Pixiv 请求失败时，后端输出请求地址、表单参数、HTTP 状态、
 | name | string | 显示名称 |
 | kind | `pixiv` / `telegram` / `custom` | 兼容展示字段，不驱动扫描 |
 | rules | SourceRules | 版本化规则与元信息脚本（见下文） |
+| pixivWorks | boolean，可选 | 该来源中的作品是否为 Pixiv 作品；启用后将正整数 `externalId` 作为 PID，支持云端推荐、收藏及云作品关联 |
 | path | string | 服务端实际目录的绝对路径 |
 
 ### 3.2 Work：作品列表项
@@ -233,6 +238,8 @@ Pixiv 请求失败时，后端输出请求地址、表单参数、HTTP 状态、
 ```
 
 `name` 和 `path` 必填，长度分别为 1–60、1–2048。推荐提供 `rules`；兼容旧请求的 `kind: pixiv/telegram`，服务端会转换成对应规则和脚本文本。两者都有时以 `rules` 为准，返回 `kind: custom`。名称去除首尾空格后不能为空；路径必须为服务端可访问的绝对目录，服务端解析真实路径。
+
+可提交 `pixivWorks: true/false` 指定作品身份，独立于命名规则和 `kind`。显式 `false` 优先于 Pixiv 预设。旧来源未设置时，`kind: pixiv` 或 Pixiv 预设默认视为 Pixiv 作品；编辑请求省略该字段时保留已保存的选择。只有不带前缀的正整数作品编号才会返回 `pixivId`。
 
 成功返回 201 和完整 Source，并自动触发扫描。错误包括 400（路径、名称不合法）、409（重复目录或扫描中）。Windows 下目录重复比较忽略大小写。
 

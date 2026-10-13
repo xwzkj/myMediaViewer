@@ -257,9 +257,11 @@ export async function registerPixivRoutes(app: FastifyInstance): Promise<void> {
     return sendMedia(request, reply, resource.path, extensionForContentType(resource.contentType))
   })
 
-  app.get<{ Params: { illustId: string; variant: string } }>('/api/pixiv/ugoira/:illustId/:variant', async (request, reply) => {
+  app.get<{ Params: { illustId: string; variant: string }; Querystring: { format?: string } }>('/api/pixiv/ugoira/:illustId/:variant', async (request, reply) => {
     requirePixivReady()
     if (request.params.variant !== 'animation') throw new PixivApiError('Ugoira 资源类型无效', 400, 'invalid_asset')
+    const format = request.query.format || 'auto'
+    if (format !== 'auto' && format !== 'webp') throw new PixivApiError('Ugoira 格式无效', 400, 'invalid_asset')
     const version = getPixivSessionVersion()
     const uid = getPixivRuntime().account!.id
     let record = await fetchIllustRecord(request.params.illustId)
@@ -279,7 +281,7 @@ export async function registerPixivRoutes(app: FastifyInstance): Promise<void> {
     }
     const ugoira = record.meta.ugoira
     if (!ugoira) return reply.code(404).send({ message: 'Ugoira 元数据不可用' })
-    const resource = await prepareUgoira(request.params.illustId, ugoira.zipUrl, ugoira.frames)
+    const resource = await prepareUgoira(request.params.illustId, ugoira.zipUrl, ugoira.frames, format)
     assertPixivSession(version)
     enforcePixivCacheLimit(getPixivSettings().cacheLimitMb * 1024 * 1024)
     return sendMedia(request, reply, resource.path, extensionForContentType(resource.contentType))

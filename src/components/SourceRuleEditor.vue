@@ -8,7 +8,7 @@ import SourceCodeEditor from './SourceCodeEditor.vue'
 import FileRuleControl from './FileRuleControl.vue'
 import { api } from '../api'
 const props = defineProps<{ modelValue: SourceRules; folder: string; name: string; disabled?: boolean }>()
-const emit = defineEmits<{ 'update:modelValue': [SourceRules]; 'preview-errors': [boolean]; busy: [boolean]; invalid: [boolean] }>()
+const emit = defineEmits<{ 'update:modelValue': [SourceRules]; 'preview-errors': [boolean]; busy: [boolean]; invalid: [boolean]; preset: [string] }>()
 const preview = ref<SourcePreview | null>(null), error = ref(''), loading = ref(false), overrides = ref(''), overrideError = ref('')
 const calculating = ref<number | null>(null)
 const jsIssues = computed(() => scriptIssues(props.modelValue.script))
@@ -17,7 +17,7 @@ watch(invalid, v => emit('invalid',v), {immediate:true})
 watch(() => props.modelValue.typeOverrides, v => { overrides.value = Object.entries(v).map(([ext, kind]) => `${ext}=${kind}`).join(', '); overrideError.value = '' }, {immediate:true,deep:true})
 watch(() => JSON.stringify([props.modelValue, props.folder]), () => { preview.value = null; error.value = ''; emit('preview-errors', false) })
 function update(patch: Partial<SourceRules>) { emit('update:modelValue', {...props.modelValue,...patch}) }
-function applyPreset(value: string) { emit('update:modelValue', value === 'custom' ? customRules() : sourcePreset(value as 'pixiv' | 'telegram')) }
+function applyPreset(value: string) { emit('update:modelValue', value === 'custom' ? customRules() : sourcePreset(value as 'pixiv' | 'telegram')); emit('preset', value) }
 function metadataRule(index: number, rule: FileRule) { update({metadata:props.modelValue.metadata.map((r,i) => i === index ? rule : r)}) }
 function pathExample() {
   const rules = customRules()

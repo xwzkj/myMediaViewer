@@ -31,6 +31,7 @@ test('来源迁移、预览只读、分组缓存失效和失败降级', async ()
     const legacyId = 'legacy:12'
     setFavorite(legacyId,true)
     const before = (await app.inject(`/api/works/${encodeURIComponent(legacyId)}`)).json()
+    assert.equal(before.pixivId, '12')
     await scanLibrary()
     const after = (await app.inject(`/api/works/${encodeURIComponent(legacyId)}`)).json()
     assert.equal(after.favorite,true)
@@ -94,5 +95,30 @@ test('来源迁移、预览只读、分组缓存失效和失败降级', async ()
     const invalid = {...body,rules:{...rules,script:'export const wrong = 1'}}
     assert.equal((await app.inject({method:'PUT',url:`/api/sources/${id}`,payload:invalid})).statusCode,400)
     assert.equal((await app.inject({method:'PUT',url:`/api/sources/${id}`,payload:{...body,rules:{...rules,script:'import fs from "node:fs"; export function extract() {}'}}})).statusCode,400)
+    // A custom grouping rule does not imply that a numeric ID is a Pixiv PID.
+    await writeFile(path.join(folder,'456_1.jpg'),'image')
+    rules.script = 'export async function extract(input) { return {title: input.id} }'
+    await scanLibrary()
+    const pidWorkId = `${id}:456`
+    const pidDetail = async () => (await app.inject(`/api/works/${encodeURIComponent(pidWorkId)}`)).json()
+    assert.equal((await pidDetail()).pixivId, undefined)
+    setFavorite(pidWorkId, true)
+    const enabled = await app.inject({method:'PUT',url:`/api/sources/${id}`,payload:{...body,pixivWorks:true}})
+    assert.equal(enabled.statusCode,200,enabled.body); await wait()
+    assert.equal(enabled.json().pixivWorks,true)
+    assert.equal((await pidDetail()).pixivId,'456')
+    assert.equal((await pidDetail()).favorite,true)
+    assert.equal((await get()).pixivId,undefined,'非数字 ID 不能作为 PID')
+    assert.equal((await app.inject(`/api/works?source=${id}`)).json().items.find((work:{id:string}) => work.id === pidWorkId).pixivId,'456')
+    assert.equal(JSON.parse(await readFile(path.join(data,'sources.json'),'utf8')).find((source:{id:string}) => source.id === id).pixivWorks,true)
+    // An older client omitting the flag must preserve the saved choice.
+    assert.equal((await app.inject({method:'PUT',url:`/api/sources/${id}`,payload:body})).statusCode,200); await wait()
+    assert.equal((await pidDetail()).pixivId,'456')
+    assert.equal((await app.inject({method:'PUT',url:`/api/sources/${id}`,payload:{...body,pixivWorks:false}})).statusCode,200); await wait()
+    assert.equal((await pidDetail()).pixivId,undefined)
+    assert.equal((await pidDetail()).favorite,true)
+    const legacySource = sources.find(source => source.id === 'legacy')!
+    assert.equal((await app.inject({method:'PUT',url:'/api/sources/legacy',payload:{name:legacySource.name,path:media,rules:legacySource.rules,pixivWorks:false}})).statusCode,200); await wait()
+    assert.equal((await app.inject(`/api/works/${encodeURIComponent(legacyId)}`)).json().pixivId,undefined,'显式关闭优先于 Pixiv 预设')
   } finally { await wait(); await app.close(); db.close(); await rm(root,{recursive:true,force:true}) }
 })

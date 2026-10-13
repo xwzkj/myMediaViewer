@@ -4,6 +4,7 @@ import type { DirectoryEntry, LibraryStatus, Source } from '../../shared/types'
 import SourceEditorDialog from './SourceEditorDialog.vue'
 import SourceRuleEditor from './SourceRuleEditor.vue'
 import { customRules, sourcePreset } from '../../shared/source-presets'
+import { sourceContainsPixivWorks } from '../../shared/source-identity'
 import Icon from './Icon.vue'
 import FolderPicker from './FolderPicker.vue'
 import AiSettingsPanel from './AiSettingsPanel.vue'
@@ -18,6 +19,7 @@ const formVisible = ref(false)
 const name = ref('')
 const folder = ref('')
 const rules = ref(customRules())
+const pixivWorks = ref(false)
 const previewErrors = ref(false)
 const acceptPreviewErrors = ref(false)
 const previewBusy = ref(false)
@@ -33,6 +35,7 @@ function edit(source?: Source) {
   name.value = source?.name || ''
   folder.value = source?.path || ''
   rules.value = source?.rules ? JSON.parse(JSON.stringify(source.rules)) : source && source.kind !== 'custom' ? sourcePreset(source.kind) : customRules()
+  pixivWorks.value = source ? sourceContainsPixivWorks(source) : false
   previewErrors.value = false; acceptPreviewErrors.value = false; invalidRules.value = false
   error.value = ''; deleting.value = null; formVisible.value = true
   pickerVisible.value = false
@@ -48,7 +51,7 @@ async function save() {
   if (previewErrors.value && !acceptPreviewErrors.value) { error.value = '预览存在错误，请修复或勾选仍然保存'; return }
   saving.value = true; error.value = ''
   try {
-    await api(`/sources${editing.value ? `/${editing.value}` : ''}`, { method: editing.value ? 'PUT' : 'POST', body: JSON.stringify({ name: name.value, path: folder.value, rules: rules.value }) })
+    await api(`/sources${editing.value ? `/${editing.value}` : ''}`, { method: editing.value ? 'PUT' : 'POST', body: JSON.stringify({ name: name.value, path: folder.value, rules: rules.value, pixivWorks: pixivWorks.value }) })
     formVisible.value = false; emit('changed'); emit('notice', '目录已保存，正在整理作品')
   } catch (e) { error.value = (e as Error).message }
   finally { saving.value = false }
@@ -68,7 +71,7 @@ async function remove(id: string) {
     <header class="settings-heading"><div><span class="eyebrow">MAKE IT YOURS</span><h2 id="settings-title">媒体库设置</h2></div><button class="icon-button" aria-label="返回上一页" @click="emit('close')"><Icon name="left" /></button></header>
     <div class="settings-body">
       <ThemeSettings />
-      <section>
+      <section class="settings-section">
         <div class="section-heading"><div><h3>媒体目录</h3><p>连接文件夹，让散落的收藏井然有序。</p></div><button class="button tonal small" @click="edit()" :disabled="busy"><Icon name="plus" :size="18" />添加目录</button></div>
         <div v-if="!status?.sources.length && !formVisible" class="directory-empty"><Icon name="folder-plus" :size="40" /><p>还没有添加媒体目录</p><span>添加运行服务的电脑上的文件夹即可开始。</span></div>
         <div v-for="source in status?.sources" :key="source.id" class="source-item">
@@ -91,7 +94,8 @@ async function remove(id: string) {
         <form class="source-form" @submit.prevent="save">
           <label class="field">目录名称<input v-model="name" required maxlength="60" placeholder="例如：我的插画收藏" autofocus /></label>
           <div class="field folder-field"><span id="media-folder-label">媒体文件夹</span><button type="button" class="folder-choice" :disabled="busy" aria-labelledby="media-folder-label selected-folder-path" @click="pickerVisible = true"><Icon name="folder-open" :size="23" /><span id="selected-folder-path" :class="{ 'folder-placeholder': !folder }">{{ folder || '点击浏览并选择文件夹' }}</span><span class="folder-choice-action">{{ folder ? '更改' : '浏览' }}<Icon name="right" :size="17" /></span></button><span>选择这台电脑上的文件夹，里面的媒体会自动整理。</span></div>
-          <SourceRuleEditor v-model="rules" :folder="folder" :name="name" :disabled="!!busy" @busy="previewBusy = $event" @invalid="invalidRules = $event" @preview-errors="previewErrors = $event; acceptPreviewErrors = false" />
+          <div class="source-pixiv-option"><label><input v-model="pixivWorks" type="checkbox" :disabled="busy" />该媒体来源中的作品是 Pixiv 作品</label><p>启用后，分组规则提取的作品编号将作为 Pixiv PID，用于云端推荐、云端收藏及关联云端作品。作品编号须为不带前缀的正整数。</p></div>
+          <SourceRuleEditor v-model="rules" :folder="folder" :name="name" :disabled="!!busy" @preset="pixivWorks = $event === 'pixiv'" @busy="previewBusy = $event" @invalid="invalidRules = $event" @preview-errors="previewErrors = $event; acceptPreviewErrors = false" />
           <label v-if="previewErrors" class="helper"><input v-model="acceptPreviewErrors" type="checkbox" />预览存在错误，仍然保存（失败的元信息将使用默认值）</label>
           <p v-if="error" class="inline-error" role="alert">{{ error }}</p>
           <div class="form-actions"><button type="button" class="button text" :disabled="saving || previewBusy" @click="formVisible = false">取消</button><button class="button filled" :disabled="busy || invalidRules || !folder || (previewErrors && !acceptPreviewErrors)"><Icon name="check" :size="18" />{{ saving ? '正在保存…' : '保存并扫描' }}</button></div>
@@ -99,3 +103,10 @@ async function remove(id: string) {
   </SourceEditorDialog>
   <FolderPicker v-if="pickerVisible" :initial-path="folder" :shortcuts="shortcuts" @select="chooseFolder" @close="pickerVisible = false" />
 </template>
+
+<style scoped>
+.source-pixiv-option { margin-bottom: 18px; padding: 14px; border: 1px solid var(--outline); border-radius: 12px; background: var(--surface); }
+.source-pixiv-option label { display: flex; align-items: center; gap: 9px; font-size: 12px; font-weight: 500; }
+.source-pixiv-option input { accent-color: var(--primary); width: 16px; height: 16px; margin: 0; flex-shrink: 0; }
+.source-pixiv-option p { margin-top: 8px; font-size: 11px; line-height: 1.8; color: var(--muted); }
+</style>

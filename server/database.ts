@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite'
 import path from 'node:path'
 import { dataDir } from './config.js'
 import type { Work, MediaKind, Source } from '../shared/types.js'
+import { localPixivId } from './pixiv/identity.js'
 
 export interface StoredAsset {
   id: string; workId: string; path: string; filename: string; page: number; kind: MediaKind;
@@ -64,5 +65,5 @@ export function saveSource(source: Source, works: StoredWork[], assets: StoredAs
 }
 export function toWork(work: StoredWork, favorites: Set<string>): Work {
   const { coverId, originalUrl: _url, ...data } = work
-  return { ...data, favorite: favorites.has(work.id), cover: `/api/assets/${coverId}/thumbnail?v=${work.updated}` }
+  return { ...data, pixivId: localPixivId(work) || undefined, favorite: favorites.has(work.id), cover: `/api/assets/${coverId}/thumbnail?v=${work.updated}` }
 }

@@ -497,7 +497,7 @@ watch(() => route.fullPath, () => {
   if (samePage) routeInitialized = true
 }, { immediate: true })
 watch([view, source, kind, sort, fuzzy, order, seed, cloudSort], () => {
-  if (route.name === 'cloudSearch' || route.name === 'cloudFavorites') return
+  if (route.name === 'cloudSearch') return
   queueLoadWorks()
 })
 watchLibraryMemory(

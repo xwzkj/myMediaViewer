@@ -13,6 +13,8 @@ import { scanLibrary, scanStatus, onScan, sourceOnline } from './scanner.js'
 import { accessibleAsset, sendMedia, thumbnail, detectFFmpeg, ffmpegAvailable, convert, conversionStatus, conversionPath } from './media.js'
 import type { Source, LibraryStatus, AiTranslateFields } from '../shared/types.js'
 import { sourcePreset } from '../shared/source-presets.js'
+import { sourceContainsPixivWorks } from '../shared/source-identity.js'
+import { localPixivId } from './pixiv/identity.js'
 import { validateRules } from './source-sandbox.js'
 import { sourceTreeSample } from './source-tree.js'
 import { sourceAiTurn, forgetSourceAiConversation, type SourceAiTurn } from './source-ai.js'
@@ -114,7 +116,7 @@ export async function createApp(logging = true) {
 
   const sourceBody = {
     type: 'object', additionalProperties: false, required: ['name', 'path'],
-    properties: { name: { type: 'string', minLength: 1, maxLength: 60 }, path: { type: 'string', minLength: 1, maxLength: 2048 }, kind: { type: 'string', enum: ['pixiv', 'telegram', 'custom'] }, rules: { type: 'object', additionalProperties: true } },
+    properties: { name: { type: 'string', minLength: 1, maxLength: 60 }, path: { type: 'string', minLength: 1, maxLength: 2048 }, kind: { type: 'string', enum: ['pixiv', 'telegram', 'custom'] }, rules: { type: 'object', additionalProperties: true }, pixivWorks: { type: 'boolean' } },
   } as const
   async function validateSource(body: Omit<Source, 'id'>, except?: string, preview = false) {
     const raw = body.path.trim().replace(/^"|"$/g, '')
@@ -131,7 +133,9 @@ export async function createApp(logging = true) {
     if (!body.name.trim()) throw Object.assign(new Error('请输入目录名称'), { statusCode: 400 })
     const rules = body.rules ?? (body.kind === 'pixiv' || body.kind === 'telegram' ? sourcePreset(body.kind) : undefined)
     try { await validateRules(rules, preview) } catch (error) { throw Object.assign(new Error((error as Error).message), { statusCode: 400 }) }
-    return { name: body.name.trim(), path: resolved, kind: body.rules ? 'custom' as const : body.kind, rules }
+    const existing = except ? sources.find(source => source.id === except) : undefined
+    const pixivWorks = body.pixivWorks ?? existing?.pixivWorks ?? sourceContainsPixivWorks({ kind: body.kind || 'custom', rules })
+    return { name: body.name.trim(), path: resolved, kind: body.rules ? 'custom' as const : body.kind, rules, pixivWorks }
 
   }
   app.post<{Body:{path:string}}>('/api/sources/ai/sample', {
@@ -264,7 +268,7 @@ export async function createApp(logging = true) {
     const work = getWork(request.params.id)
     if (!work) return reply.code(404).send({ message: '作品不存在' })
     const pixiv = getPixivRuntime()
-    const pixivId = work.sourceKind === 'pixiv' && /^\d+$/.test(work.externalId) ? work.externalId : undefined
+    const pixivId = localPixivId(work) || undefined
     const cloudRestrict = pixiv.configured && !pixiv.localMode && pixiv.account?.id && pixivId
       ? getPixivBookmarkRestrict(pixiv.account.id, pixivId)
       : null

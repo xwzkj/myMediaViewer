@@ -10,7 +10,7 @@ export interface SourceRules {
   preset?: 'pixiv' | 'telegram'
 }
 // kind is retained for API compatibility/display only, never for scanning.
-export interface Source { id: string; name: string; kind: SourceKind; path: string; rules?: SourceRules }
+export interface Source { id: string; name: string; kind: SourceKind; path: string; rules?: SourceRules; pixivWorks?: boolean }
 export interface MetadataFields { title: string; author: string; description: string; tags: string[]; date: string; originalUrl: string }
 export interface ScriptFile {
   filename: string; relativePath: string; directory?: string; directoryName?: string; extension: string; size: number; modified: number;

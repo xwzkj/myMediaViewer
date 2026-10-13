@@ -73,6 +73,9 @@ const mediaUrl = computed(() => {
   } else {
     url = asset.value?.url
   }
+  if (url && ugoiraImageFallback.value) {
+    url = `${url}${url.includes('?') ? '&' : '?'}format=webp`
+  }
   if (url && asset.value?.origin === 'pixiv' && mediaRetryToken.value) {
     return `${url}${url.includes('?') ? '&' : '?'}retry=${mediaRetryToken.value}`
   }
@@ -278,7 +281,10 @@ function retryMedia() {
   ugoiraImageFallback.value = false
   mediaRetryToken.value++
 }
-function handleVideoError() {
+function handleVideoError(event: Event) {
+  // Ignore errors from a video released during navigation or replaced by a new work.
+  const element = event.target as HTMLVideoElement | null
+  if (disposed || !element?.getAttribute('src') || element.getAttribute('src') !== mediaUrl.value) return
   if (asset.value?.origin === 'pixiv' && asset.value.kind === 'animation' && !ugoiraImageFallback.value) {
     ugoiraImageFallback.value = true
     mediaError.value = false
