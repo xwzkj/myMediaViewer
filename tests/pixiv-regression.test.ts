@@ -120,6 +120,13 @@ test('Pixiv 云服务回归', async t => {
       handler = async () => json({ unexpected: [] })
       assert.equal((await app.inject('/api/pixiv/suggestions?q=invalid-response')).statusCode, 502)
     })
+    await t.test('清理缓存必须显式指定天数或全部', async () => {
+      assert.equal((await app.inject({ method: 'POST', url: '/api/pixiv/cache/clear', payload: {} })).statusCode, 400)
+      assert.equal((await app.inject({ method: 'POST', url: '/api/pixiv/cache/clear', payload: { olderThanDays: 'bad' } })).statusCode, 400)
+      const all = await app.inject({ method: 'POST', url: '/api/pixiv/cache/clear', payload: { all: true } })
+      assert.equal(all.statusCode, 200, all.body)
+      assert.equal(typeof all.json().removed, 'number')
+    })
     await t.test('多页列表缓存会补齐详情，并发请求合并且列表不会覆盖完整页面', async () => {
       store.savePixivWorkRecords(uid, [catalog.normalizePixivIllust(illust(456, 3), 'private')])
       let calls = 0
@@ -311,6 +318,30 @@ test('Pixiv 云服务回归', async t => {
       assert.equal(urls.length, 1)
       assert.match(urls[0], /filter=for_ios/)
       assert.deepEqual(store.getPixivBookmarkRecords(uid, 'public').map(item => item.work.externalId), ['901', '902'])
+    })
+    await t.test('force 刷新已就绪镜像会重新从第一页同步', async () => {
+      const urls: string[] = []
+      handler = async input => {
+        urls.push(String(input))
+        return json({ illusts: [illust(903)], next_url: null })
+      }
+      mirror.startPixivMirror('public', { mode: 'full', manual: true })
+      await waitFor(() => store.getPixivMirrorState(uid, 'public').phase === 'ready' && store.getPixivBookmarkRecords(uid, 'public')[0]?.work.externalId === '903')
+      assert.equal(urls.length, 1)
+      assert.deepEqual(store.getPixivBookmarkRecords(uid, 'public').map(item => item.work.externalId), ['903'])
+    })
+    await t.test('增量更新只追加新收藏，不清理旧收藏', async () => {
+      const old = catalog.normalizePixivIllust(illust(905), 'public')
+      store.savePixivBookmarks(uid, 'public', [{ work: old.work, sequence: Date.now() - 10_000 }], Date.now() - 10_000)
+      const urls: string[] = []
+      handler = async input => {
+        urls.push(String(input))
+        return json({ illusts: [illust(904), illust(903)], next_url: null })
+      }
+      mirror.startPixivMirror('public', { mode: 'incremental', manual: true })
+      await waitFor(() => store.getPixivMirrorState(uid, 'public').phase === 'ready' && store.getPixivBookmarkRecords(uid, 'public').some(item => item.work.externalId === '904'))
+      assert.equal(urls.length, 1)
+      assert.deepEqual(store.getPixivBookmarkRecords(uid, 'public').map(item => item.work.externalId), ['904', '903', '905'])
     })
     await t.test('从持久分页恢复时保留已同步页面，完成后清理漏失收藏', async () => {
       const generation = Date.now() - 1000

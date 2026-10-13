@@ -56,6 +56,7 @@ onMounted(() => {
 })
 watch(() => props.modelValue, value => { if (view && value !== view.state.doc.toString()) view.dispatch({changes: {from:0, to:view.state.doc.length, insert:value}}) })
 watch(() => props.language, () => view?.dispatch({effects:language.reconfigure(mode())}))
+watch(() => [props.mediaRule, props.metadataRules], () => view?.dispatch({effects:language.reconfigure(mode())}), {deep:true})
 watch(() => props.disabled, value => view?.dispatch({effects:readOnly.reconfigure([EditorState.readOnly.of(!!value),EditorView.editable.of(!value)])}))
 watch(() => props.issues, () => view?.dispatch({effects:lint.reconfigure(diagnostics())}), {deep:true})
 onBeforeUnmount(() => view?.destroy())

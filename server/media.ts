@@ -34,8 +34,20 @@ export async function detectFFmpeg() {
   else logWarn('转换', '未找到 FFmpeg，视频封面与兼容版本转码不可用，可设置 FFMPEG_PATH')
 }
 
+function sourceIdFromWorkId(workId: string): string | null {
+  if (workId.startsWith('v2:')) {
+    try {
+      const value = JSON.parse(workId.slice(3)) as unknown
+      return Array.isArray(value) && typeof value[0] === 'string' ? value[0] : null
+    } catch { return null }
+  }
+  const separator = workId.indexOf(':')
+  return separator > 0 ? workId.slice(0, separator) : null
+}
+
 export async function accessibleAsset(asset: StoredAsset): Promise<boolean> {
-  const source = sources.find(s => asset.workId.startsWith(`${s.id}:`))
+  const sourceId = sourceIdFromWorkId(asset.workId)
+  const source = sourceId ? sources.find(s => s.id === sourceId) : undefined
   if (!source) return false
   try {
     const [root, file] = await Promise.all([realpath(source.path), realpath(asset.path)])

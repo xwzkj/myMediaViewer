@@ -50,7 +50,12 @@ async function load(reset = false) {
       page.value = response.page
       pages.value = response.pages
     }
-  } catch (e) { if (version === loadVersion) error.value = (e as Error).message }
+  } catch (e) {
+    if (version !== loadVersion) return
+    const message = (e as Error).message
+    if (reset || !items.value.length) error.value = message
+    else emit('notice', `加载更多失败：${message}`)
+  }
   finally { if (version === loadVersion) loading.value = false }
 }
 

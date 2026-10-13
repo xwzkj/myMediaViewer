@@ -99,17 +99,21 @@ export async function registerPixivRoutes(app: FastifyInstance): Promise<void> {
   })
 
   app.post<{ Body: { olderThanDays?: number | null; all?: boolean } }>('/api/pixiv/cache/clear', async request => {
+    const all = request.body?.all === true
+    const days = all ? null : cleanCacheLimitDays(request.body?.olderThanDays)
+    if (!all && days == null) throw new PixivApiError('请指定要清理的天数或全部清理', 400, 'invalid_days')
     clearPixivApiCache()
-    const days = request.body?.all ? null : cleanCacheLimitDays(request.body?.olderThanDays)
     return clearPixivCache(days)
   })
 
-  app.post<{ Params: { restrict: string } }>('/api/pixiv/mirror/:restrict', async request => {
+  app.post<{ Params: { restrict: string }; Querystring: { force?: string; mode?: string } }>('/api/pixiv/mirror/:restrict', async request => {
     requirePixivReady()
     if (!['public', 'private'].includes(request.params.restrict)) throw new PixivApiError('收藏可见性无效', 400, 'invalid_restrict')
     const restrict = asRestrict(request.params.restrict)
-    startPixivMirror(restrict)
-    return { ok: true, restrict }
+    const mode = request.query.mode === 'incremental' ? 'incremental' : 'full'
+    const manual = request.query.mode === 'incremental' || request.query.mode === 'full' || request.query.force === 'true'
+    startPixivMirror(restrict, { mode, manual })
+    return { ok: true, restrict, mode }
   })
 
   app.get<{ Querystring: { q?: string; sort?: string; target?: string; cursor?: string } }>('/api/pixiv/search', async (request): Promise<PixivSearchResponse> => {

@@ -22,11 +22,13 @@ onBeforeUnmount(() => { if (root.value) releaseVideos(root.value) })
 const detail = computed(() => props.work)
 const index = ref(0)
 const mediaError = ref(false)
+const mediaRetryToken = ref(0)
 const previewing = ref(false)
 const slideshow = ref(false)
 const converting = ref(false)
 const convertMessage = ref('')
 const compatible = ref(false)
+const ugoiraImageFallback = ref(false)
 const originalAssets = ref<Set<string>>(new Set())
 // 图片翻译：保留原图 / 已擦字译图两种显示方式；OCR 与译文都从服务端任务返回。
 const mangaResults = ref<Record<string, MangaPageResult>>({})
@@ -48,7 +50,7 @@ let timer: ReturnType<typeof setInterval> | undefined
 let conversionTimer: ReturnType<typeof setTimeout> | undefined
 let disposed = false
 const asset = computed(() => detail.value?.assets[index.value])
-const isVideo = computed(() => asset.value && (asset.value.kind === 'video' || asset.value.extension === 'webm'))
+const isVideo = computed(() => asset.value && !ugoiraImageFallback.value && (asset.value.kind === 'video' || asset.value.extension === 'webm'))
 const canTranslateManga = computed(() => asset.value?.kind === 'image' && asset.value.extension !== 'gif')
 const mangaResult = computed(() => asset.value ? mangaResults.value[asset.value.id] || null : null)
 const mangaPageAssets = computed(() => (detail.value?.assets || []).filter(item => item.kind === 'image' && item.extension !== 'gif'))
@@ -64,11 +66,17 @@ const mangaFailures = computed(() => {
   })
 })
 const mediaUrl = computed(() => {
-  if (compatible.value && asset.value?.origin !== 'pixiv') return `/api/assets/${asset.value?.id}/compatible`
-  if (asset.value?.origin === 'pixiv' && originalAssets.value.has(asset.value.id)) {
-    return `/api/pixiv/assets/${asset.value.illustId}/${asset.value.page}/original`
+  let url: string | undefined
+  if (compatible.value && asset.value?.origin !== 'pixiv') url = `/api/assets/${asset.value?.id}/compatible`
+  else if (asset.value?.origin === 'pixiv' && originalAssets.value.has(asset.value.id)) {
+    url = `/api/pixiv/assets/${asset.value.illustId}/${asset.value.page}/original`
+  } else {
+    url = asset.value?.url
   }
-  return asset.value?.url
+  if (url && asset.value?.origin === 'pixiv' && mediaRetryToken.value) {
+    return `${url}${url.includes('?') ? '&' : '?'}retry=${mediaRetryToken.value}`
+  }
+  return url
 })
 
 // 切换分 P / 作品时丢弃旧图翻译状态，后台任务即使稍后完成也不会覆盖当前页面。
@@ -88,12 +96,14 @@ onMounted(() => {
   timer = setInterval(() => { if (slideshow.value && !isVideo.value && !previewing.value) next(1, true) }, 4500)
 })
 // 详情由作品页统一加载；切换作品后直接使用新资源，并回到第一张。
-watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; compatible.value = false; converting.value = false; convertMessage.value = ''; originalAssets.value = new Set(); translation.value = null; translationError.value = ''; translationDisplay.value = 'translated'; resetManga() })
+watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; mediaRetryToken.value = 0; compatible.value = false; ugoiraImageFallback.value = false; converting.value = false; convertMessage.value = ''; originalAssets.value = new Set(); translation.value = null; translationError.value = ''; translationDisplay.value = 'translated'; resetManga() })
 onUnmounted(() => { disposed = true; drawVersion++; images.clear(); destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); clearTimeout(mangaTimer) })
 watch(index, async () => {
   destroyPreview()
   mediaError.value = false
+  mediaRetryToken.value = 0
   compatible.value = false
+  ugoiraImageFallback.value = false
   converting.value = false
   convertMessage.value = ''
   clearTimeout(conversionTimer)
@@ -188,7 +198,7 @@ function next(direction: number, auto = false) {
 const dragX = ref(0)
 // 切换分 P 或作品时的滑动方向，用来决定动画从哪边进出。
 const slide = ref(1)
-const mediaKey = computed(() => `${props.work.id}:${asset.value?.id || 'empty'}`)
+const mediaKey = computed(() => `${props.work.id}:${asset.value?.id || 'empty'}:${mediaRetryToken.value}`)
 const slideName = computed(() => slide.value >= 0 ? 'media-next' : 'media-prev')
 let gesture: { pointerId: number; startX: number; startY: number; mode: 'page' | 'work' | 'ignore' } | null = null
 let suppressClick = false
@@ -263,6 +273,19 @@ function touchEnd(event: TouchEvent) {
 }
 function touchCancel() { gesture = null; dragX.value = 0 }
 // 点按图片交给 viewer.js 打开浮层，缩放、拖动、双击、捏合都由它负责。
+function retryMedia() {
+  mediaError.value = false
+  ugoiraImageFallback.value = false
+  mediaRetryToken.value++
+}
+function handleVideoError() {
+  if (asset.value?.origin === 'pixiv' && asset.value.kind === 'animation' && !ugoiraImageFallback.value) {
+    ugoiraImageFallback.value = true
+    mediaError.value = false
+    return
+  }
+  mediaError.value = true
+}
 function openPreview() {
   if (suppressClick || !asset.value) return
   const host = root.value
@@ -431,7 +454,11 @@ async function runMangaTranslation(scope: 'page' | 'work', force = false) {
     mangaTimer = setTimeout(async () => {
       try { await handle(await api<MangaJob>(`/ai/manga/jobs/${job.id}`)) }
       catch (e) {
-        if (token === mangaToken) mangaError.value = (e as Error).message
+        if (token !== mangaToken) return
+        const message = (e as Error).message
+        mangaError.value = message
+        mangaJob.value = { ...job, state: 'failed', stage: '翻译失败', progress: 100, message }
+        emit('notice', `图片翻译失败：${message}`, undefined, 'error')
       }
     }, delay)
   }
@@ -506,10 +533,10 @@ function closeRoot() {
             <div :key="mediaKey" class="media-frame">
               <p v-if="!asset" class="inline-error">作品没有可显示的媒体</p>
               <template v-else>
-                <video v-if="isVideo" v-release-video ref="video" :key="mediaUrl" :src="mediaUrl" :poster="asset.thumbnail" controls playsinline preload="metadata" :autoplay="slideshow || asset.kind === 'animation'" :muted="asset.kind === 'animation'" :loop="asset.kind === 'animation' && !slideshow" @error="mediaError = true" @ended="slideshow && next(1, true)" />
+                <video v-if="isVideo" v-release-video ref="video" :key="mediaUrl" :src="mediaUrl" :poster="asset.thumbnail" controls playsinline preload="metadata" :autoplay="slideshow || asset.kind === 'animation'" :muted="asset.kind === 'animation'" :loop="asset.kind === 'animation' && !slideshow" @error="handleVideoError" @ended="slideshow && next(1, true)" />
                 <canvas v-else-if="mangaResult && mangaMode === 'translated' && mangaResult.regions.length" :key="mangaResult.key" ref="mangaCanvas" class="manga-canvas" :width="mangaResult.width" :height="mangaResult.height" :aria-label="`${work.title}，第 ${index + 1} 张的漫画译图`" @click="openPreview" />
-                <img v-else :key="asset.id" :src="mediaUrl" draggable="false" :alt="`${work.title}，第 ${index + 1} 张`" @click="openPreview" @error="mediaError = true" />
-                <div v-if="mediaError" class="media-error"><Icon name="warning" :size="32" /><p>{{ isVideo ? '浏览器无法播放这个视频' : '无法读取这张图片' }}</p><button v-if="isVideo" class="button tonal" :disabled="converting" @click="makeCompatible">{{ converting ? '正在处理…' : '生成兼容版本' }}</button></div>
+                <img v-else :key="mediaUrl" :src="mediaUrl" draggable="false" :alt="`${work.title}，第 ${index + 1} 张`" @click="openPreview" @error="mediaError = true" />
+                <div v-if="mediaError" class="media-error"><Icon name="warning" :size="32" /><p>{{ isVideo ? '浏览器无法播放这个视频' : '无法读取这张图片' }}</p><button v-if="asset?.origin === 'pixiv'" class="button tonal" @click="retryMedia"><Icon name="refresh" :size="18" />重试</button><button v-else-if="isVideo" class="button tonal" :disabled="converting" @click="makeCompatible">{{ converting ? '正在处理…' : '生成兼容版本' }}</button></div>
               </template>
             </div>
           </Transition>

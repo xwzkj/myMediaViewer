@@ -48,6 +48,20 @@ const cloudNextCursor = ref<string | null>(null)
 const cloudResult = ref<PixivSearchResponse>({ items: [], nextCursor: null, elapsed: 0 })
 const pixivStatus = ref<PixivStatus | null>(null)
 const cloudEnabled = computed(() => Boolean(pixivStatus.value?.settings.configured && !pixivStatus.value.settings.localMode))
+const mirrorRefreshing = ref(false)
+const mirrorRefreshMode = ref<'incremental' | 'full' | null>(null)
+const currentMirror = computed(() => pixivStatus.value?.mirrors[cloudFavoritesRestrict.value])
+const mirrorBusy = computed(() => currentMirror.value?.phase === 'backfilling' || currentMirror.value?.phase === 'maintaining')
+const incrementalUpdating = computed(() => mirrorRefreshMode.value === 'incremental' || currentMirror.value?.phase === 'maintaining')
+const fullUpdating = computed(() => mirrorRefreshMode.value === 'full' || currentMirror.value?.phase === 'backfilling')
+const mirrorStatusText = computed(() => {
+  const mirror = currentMirror.value
+  if (!mirror || mirror.phase === 'idle') return '尚未同步，可增量更新或全量刷新'
+  if (mirror.phase === 'ready') return '镜像已同步'
+  if (mirror.phase === 'error') return mirror.error ? `同步失败：${mirror.error}` : '同步失败'
+  if (mirror.phase === 'maintaining') return '正在增量更新…'
+  return '正在全量刷新…'
+})
 const cloudSearchMode = computed(() => route.name === 'cloudSearch')
 const localSearchMode = computed(() => route.name === 'search')
 const cloudFavoritesMode = computed(() => route.name === 'cloudFavorites')
@@ -74,6 +88,7 @@ let suggestionTimer: ReturnType<typeof setTimeout>
 let blurTimer: ReturnType<typeof setTimeout>
 let suggestionController: AbortController | undefined
 let loadQueued = false
+let routeInitialized = false
 const pageCache = new Map<string, WorksResponse>()
 
 // 路由变化会同时触发 route、筛选和来源监听。合并同一轮更新，避免切换来源时
@@ -168,19 +183,22 @@ async function loadCloudPage(reset = false) {
   try {
     const response = await api<PixivSearchResponse>(`/pixiv/search?${params}`, { signal: active.signal })
     if (controller !== active) return
+    const nextPage = reset ? 1 : result.value.page + 1
     cloudResult.value = response
     cloudNextCursor.value = response.nextCursor
     result.value = {
       items: reset ? response.items : [...result.value.items, ...response.items],
       total: (reset ? 0 : result.value.total) + response.items.length,
-      page: reset ? 1 : result.value.page + 1,
-      pages: response.nextCursor ? 999999 : (reset ? 1 : result.value.pages),
+      page: nextPage,
+      pages: response.nextCursor ? nextPage + 1 : nextPage,
       elapsed: response.elapsed,
     }
     syncLibrarySession(pageKey, result.value, !reset)
   } catch (e) {
     if (active.signal.aborted) return
-    error.value = (e as Error).message
+    const message = (e as Error).message
+    if (reset || !result.value.items.length) error.value = message
+    else { moreFailed.value = true; notice(`加载更多失败：${message}`) }
   } finally {
     if (controller === active) { loading.value = false; loadingMore.value = false }
   }
@@ -231,10 +249,19 @@ async function refreshPixivStatus() {
     pixivStatus.value = await api<PixivStatus>('/pixiv/status')
   } catch { pixivStatus.value = null }
 }
-async function startCloudMirror(restrict: 'public' | 'private') {
-  if (!cloudEnabled.value) return
-  try { await api(`/pixiv/mirror/${restrict}`, { method: 'POST' }) }
-  catch (e) { notice((e as Error).message) }
+async function refreshCloudMirror(mode: 'incremental' | 'full') {
+  if (!cloudEnabled.value || !cloudFavoritesMode.value || mirrorRefreshing.value || mirrorBusy.value) return
+  mirrorRefreshing.value = true
+  mirrorRefreshMode.value = mode
+  try {
+    await api(`/pixiv/mirror/${cloudFavoritesRestrict.value}?mode=${mode}`, { method: 'POST' })
+    await refreshPixivStatus()
+    notice(mode === 'incremental' ? '已开始增量更新 Pixiv 收藏镜像' : '已开始全量刷新 Pixiv 收藏镜像')
+  } catch (e) { notice((e as Error).message) }
+  finally {
+    mirrorRefreshing.value = false
+    if (mirrorRefreshMode.value === mode) mirrorRefreshMode.value = null
+  }
 }
 async function toggleFavorite(work: Work) {
   if (busyFavorites.has(work.id)) return
@@ -462,7 +489,13 @@ function resetFilters() {
   if (route.name === 'search' || route.name === 'cloudSearch' || route.name === 'source' || route.name === 'cloudFavorites') router.replace({ name: view.value === 'favorites' ? 'favorites' : 'library' })
 }
 function retryLoadMore() { loadMore(true) }
-watch(() => route.fullPath, () => { applyRoute(); queueLoadWorks() }, { immediate: true })
+watch(() => route.fullPath, () => {
+  const samePage = routeCacheKey(route) === pageKey
+  const returningToKnownPath = samePage && route.fullPath === pagePath.value
+  applyRoute()
+  if (!routeInitialized || !returningToKnownPath) queueLoadWorks()
+  if (samePage) routeInitialized = true
+}, { immediate: true })
 watch([view, source, kind, sort, fuzzy, order, seed, cloudSort], () => {
   if (route.name === 'cloudSearch' || route.name === 'cloudFavorites') return
   queueLoadWorks()
@@ -484,14 +517,6 @@ watch([cloudSort, cloudTarget], ([sort, target]) => {
   }
 })
 watch(cloudFavoritesRestrict, value => writeLibraryState('cloudFavorites', { restrict: value }))
-watch([cloudFavoritesMode, cloudEnabled, cloudFavoritesRestrict], () => {
-  if (cloudFavoritesMode.value && cloudEnabled.value) void startCloudMirror(cloudFavoritesRestrict.value)
-}, { immediate: true })
-watch([source, cloudEnabled], ([value]) => {
-  if (cloudEnabled.value && (value === 'pixiv:public' || value === 'pixiv:private')) {
-    void startCloudMirror(value === 'pixiv:private' ? 'private' : 'public')
-  }
-}, { immediate: true })
 // 列表底部进入视野附近时自动追加下一页。
 watchEffect(onCleanup => {
   const element = sentinel.value
@@ -520,10 +545,30 @@ async function ensureWorkAvailable(id: string) {
   }
   return false
 }
+function scrollToPendingWork(id: string, token: number): boolean {
+  if (token !== pendingScrollToken || pendingWorkId.value !== id) return false
+  const target = Array.from(document.querySelectorAll<HTMLElement>('.work-card[data-work-id]'))
+    .find(card => card.dataset.workId === id)
+  if (!target) return false
+  target.scrollIntoView({ block: 'center', behavior: 'auto' })
+  pendingWorkId.value = ''
+  return true
+}
+function scheduleScrollToPendingWork(id: string, token: number): void {
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => { scrollToPendingWork(id, token) })
+  })
+}
 async function restorePendingWork() {
   const id = pendingWorkId.value
   if (!id || routeCacheKey(route) !== pageKey || route.fullPath !== pagePath.value) return
   const token = ++pendingScrollToken
+  // 返回列表时，已加载过的卡片通常已经在 DOM 里。先直接定位，不要等后台刷新/加载状态结束。
+  if (result.value.items.some(work => work.id === id)) {
+    await nextTick()
+    scheduleScrollToPendingWork(id, token)
+    return
+  }
   const available = await ensureWorkAvailable(id)
   if (token !== pendingScrollToken || pendingWorkId.value !== id) return
   if (!available) {
@@ -531,16 +576,7 @@ async function restorePendingWork() {
     return
   }
   await nextTick()
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      if (token !== pendingScrollToken) return
-      const target = Array.from(document.querySelectorAll<HTMLElement>('.work-card[data-work-id]'))
-        .find(card => card.dataset.workId === id)
-      if (!target) return
-      target.scrollIntoView({ block: 'center', behavior: 'auto' })
-      pendingWorkId.value = ''
-    })
-  })
+  scheduleScrollToPendingWork(id, token)
 }
 function startPolling() {
   clearInterval(poll)
@@ -631,8 +667,8 @@ onUnmounted(() => {
       <section class="library-content" aria-label="作品列表">
         <div v-if="status?.scan.running" class="scan-progress" role="status"><div class="indeterminate-bar" /><span>{{ status.scan.phase }}<b>{{ formatNumber(status.scan.files) }} 个文件</b></span></div>
         <div v-if="status?.scan.errors.length && !status.scan.running" class="warning-banner"><Icon name="warning" :size="20" /><span>部分目录或描述未能读取，已有索引已保留。</span><button class="button text small" @click="openSettings">查看详情</button></div>
-        <div v-if="cloudFavoritesMode" class="cloud-favorite-tabs" role="tablist" aria-label="Pixiv 收藏可见性"><button type="button" role="tab" :aria-selected="cloudFavoritesRestrict === 'public'" :class="{ active: cloudFavoritesRestrict === 'public' }" @click="cloudFavoritesRestrict = 'public'; router.replace({ name: 'cloudFavorites', query: { restrict: 'public' } })">公开收藏</button><button type="button" role="tab" :aria-selected="cloudFavoritesRestrict === 'private'" :class="{ active: cloudFavoritesRestrict === 'private' }" @click="cloudFavoritesRestrict = 'private'; router.replace({ name: 'cloudFavorites', query: { restrict: 'private' } })">私密收藏</button></div>
-        <div class="results-heading"><h2>{{ cloudSearchMode ? 'Pixiv 云搜索' : cloudFavoritesMode ? (cloudFavoritesRestrict === 'private' ? 'Pixiv 私密收藏' : 'Pixiv 公开收藏') : submittedQuery ? '搜索结果' : view === 'favorites' ? '我的收藏' : currentSource?.name || '全部作品' }}<span>{{ formatNumber(result.total) }}</span></h2><span v-if="cloudSearchMode && !loading" class="results-note">{{ cloudTargetLabel }} · {{ cloudSort === 'date_desc' ? '最新优先' : cloudSort === 'date_asc' ? '最早优先' : '热度预览' }} · {{ result.elapsed }} ms</span><span v-else-if="cloudFavoritesMode" class="results-note">{{ pixivStatus?.mirrors[cloudFavoritesRestrict]?.phase === 'ready' ? '镜像已同步' : '正在后台整理收藏夹…' }} · {{ formatNumber(pixivStatus?.mirrors[cloudFavoritesRestrict]?.items || result.total) }} 组</span><span v-else-if="submittedQuery && !loading" class="results-note">{{ result.elapsed }} ms · 支持简繁体与拼音</span><span v-else class="results-note">{{ kind ? ({ image: '静止的画面，无限的想象', video: '按下播放，让故事继续', animation: '让灵感动起来' }[kind]) : '灵感，在这里慢慢生长' }}</span></div>
+        <div v-if="cloudFavoritesMode" class="cloud-favorite-tabs" role="tablist" aria-label="Pixiv 收藏可见性"><button type="button" role="tab" :aria-selected="cloudFavoritesRestrict === 'public'" :class="{ active: cloudFavoritesRestrict === 'public' }" @click="cloudFavoritesRestrict = 'public'; router.replace({ name: 'cloudFavorites', query: { restrict: 'public' } })">公开收藏</button><button type="button" role="tab" :aria-selected="cloudFavoritesRestrict === 'private'" :class="{ active: cloudFavoritesRestrict === 'private' }" @click="cloudFavoritesRestrict = 'private'; router.replace({ name: 'cloudFavorites', query: { restrict: 'private' } })">私密收藏</button><span class="cloud-mirror-actions"><button type="button" class="cloud-mirror-refresh" :disabled="!cloudEnabled || mirrorRefreshing || mirrorBusy" @click="refreshCloudMirror('incremental')"><Icon name="refresh" :class="{ spinning: incrementalUpdating }" :size="16" />{{ incrementalUpdating ? '正在增量' : '增量更新' }}</button><button type="button" class="cloud-mirror-refresh" :disabled="!cloudEnabled || mirrorRefreshing || mirrorBusy" @click="refreshCloudMirror('full')"><Icon name="cloud" :size="16" />{{ fullUpdating ? '正在全量' : '全量刷新' }}</button></span></div>
+        <div class="results-heading"><h2>{{ cloudSearchMode ? 'Pixiv 云搜索' : cloudFavoritesMode ? (cloudFavoritesRestrict === 'private' ? 'Pixiv 私密收藏' : 'Pixiv 公开收藏') : submittedQuery ? '搜索结果' : view === 'favorites' ? '我的收藏' : currentSource?.name || '全部作品' }}<span>{{ formatNumber(result.total) }}</span></h2><span v-if="cloudSearchMode && !loading" class="results-note">{{ cloudTargetLabel }} · {{ cloudSort === 'date_desc' ? '最新优先' : cloudSort === 'date_asc' ? '最早优先' : '热度预览' }} · {{ result.elapsed }} ms</span><span v-else-if="cloudFavoritesMode" class="results-note" :title="currentMirror?.error || mirrorStatusText">{{ mirrorStatusText }} · {{ formatNumber(currentMirror?.items || result.total) }} 组</span><span v-else-if="submittedQuery && !loading" class="results-note">{{ result.elapsed }} ms · 支持简繁体与拼音</span><span v-else class="results-note">{{ kind ? ({ image: '静止的画面，无限的想象', video: '按下播放，让故事继续', animation: '让灵感动起来' }[kind]) : '灵感，在这里慢慢生长' }}</span></div>
         <div v-if="error" class="empty-state error-state"><span class="empty-symbol"><Icon name="warning" :size="38" /></span><h3>暂时无法连接媒体库</h3><p>{{ error }}</p><button class="button filled" @click="refreshStatus(); loadWorks()">重新连接</button></div>
         <div v-else-if="loading && !result.items.length" class="work-grid" aria-label="正在加载"><div v-for="n in 8" :key="n" class="skeleton-card"><div /><span /><small /></div></div>
         <div v-else-if="!hasLibrary" class="empty-state welcome-state"><div class="empty-art"><Icon name="folder-plus" :size="54" /><span>✦</span></div><span class="eyebrow">YOUR COLLECTION STARTS HERE</span><h3>给你的喜欢，一个家。</h3><p>添加存放图片和视频的文件夹，<br />拾光会自动将同组作品整理在一起。</p><button class="button filled" @click="openSettings"><Icon name="plus" :size="20" />添加第一个媒体目录</button><div class="welcome-features"><span><Icon name="images" :size="17" />自动分组</span><span><Icon name="search" :size="17" />描述搜索</span><span><Icon name="heart" :size="17" />跨设备收藏</span></div></div>

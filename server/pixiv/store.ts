@@ -254,6 +254,11 @@ export function getPixivBookmarks(accountId: string, restrict: PixivBookmarkRest
   return getPixivBookmarkRecords(accountId, restrict).map(record => record.work)
 }
 
+export function countPixivBookmarks(accountId: string, restrict: PixivBookmarkRestrict): number {
+  const row = db.prepare('SELECT COUNT(*) AS count FROM pixiv_bookmarks WHERE account_id = ? AND restrict = ?').get(accountId, restrict) as { count: number }
+  return row?.count || 0
+}
+
 export function getPixivBookmarkRestrict(accountId: string, illustId: string): PixivBookmarkRestrict | null {
   const row = db.prepare('SELECT restrict FROM pixiv_bookmarks WHERE account_id = ? AND illust_id = ? LIMIT 1')
     .get(accountId, illustId) as { restrict: string } | undefined

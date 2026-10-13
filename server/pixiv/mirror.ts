@@ -7,15 +7,21 @@ import { pixivIllustPage } from './service.js'
 import type { PixivIllustPage } from './service.js'
 import { PixivApiError } from './errors.js'
 import { pixivPageUrl } from './protocol.js'
-import { getPixivMirrorState, removeMissingPixivBookmarks, savePixivBookmarks, savePixivMirrorState, savePixivWorkRecords } from './store.js'
+import { countPixivBookmarks, getPixivBookmarkRecords, getPixivMirrorState, removeMissingPixivBookmarks, savePixivBookmarks, savePixivMirrorState, savePixivWorkRecords } from './store.js'
 
 const PAGE_INTERVAL_MS = 5_000
+export type PixivMirrorMode = 'incremental' | 'full'
+export interface PixivMirrorOptions { mode?: PixivMirrorMode; manual?: boolean }
 interface MirrorJob { version: number; controller: AbortController; promise: Promise<void> }
 const jobs = new Map<string, MirrorJob>()
 const lastStartAt = new Map<string, number>()
 
-async function loop(uid: string, restrict: PixivBookmarkRestrict, job: MirrorJob): Promise<void> {
-  const firstPage = `/v1/user/bookmarks/illust?user_id=${uid}&restrict=${restrict}&filter=for_ios`
+function firstBookmarkPage(uid: string, restrict: PixivBookmarkRestrict): string {
+  return `/v1/user/bookmarks/illust?user_id=${uid}&restrict=${restrict}&filter=for_ios`
+}
+
+async function loopFull(uid: string, restrict: PixivBookmarkRestrict, job: MirrorJob): Promise<void> {
+  const firstPage = firstBookmarkPage(uid, restrict)
   const visited = new Set<string>()
   try {
     for (;;) {
@@ -64,8 +70,70 @@ async function loop(uid: string, restrict: PixivBookmarkRestrict, job: MirrorJob
   }
 }
 
-export function startPixivMirror(restrict: PixivBookmarkRestrict): void {
+async function loopIncremental(uid: string, restrict: PixivBookmarkRestrict, job: MirrorJob): Promise<void> {
+  const firstPage = firstBookmarkPage(uid, restrict)
+  const existing = new Map(getPixivBookmarkRecords(uid, restrict).map(record => [
+    record.work.pixivId || record.work.externalId,
+    record.sequence,
+  ]))
+  const visited = new Set<string>()
+  try {
+    let url: string | null = firstPage
+    for (;;) {
+      if (!url) return
+      assertPixivSession(job.version)
+      job.controller.signal.throwIfAborted()
+      if (visited.has(url)) throw new PixivApiError('Pixiv 返回了重复的收藏分页，请重试', 502, 'invalid_response')
+      visited.add(url)
+      const response = pixivIllustPage(await pixivFetch<PixivIllustPage>(url, { signal: job.controller.signal }))
+      assertPixivSession(job.version)
+      job.controller.signal.throwIfAborted()
+      const nextUrl = response.next_url ? pixivPageUrl(response.next_url, firstPage) : null
+      if (nextUrl && (visited.has(nextUrl) || nextUrl === new URL(url, 'https://app-api.pixiv.net').toString())) throw new PixivApiError('Pixiv 返回了重复的收藏分页，请重试', 502, 'invalid_response')
+
+      const records = response.illusts.map(raw => normalizePixivIllust(raw, restrict))
+      const now = Date.now()
+      let added = 0
+      const updates = records.map((record, index) => {
+        const id = record.work.pixivId || record.work.externalId
+        const current = existing.get(id)
+        const isNew = current === undefined
+        const sequence = current ?? now - added - index
+        if (isNew) {
+          added++
+          existing.set(id, sequence)
+        }
+        return { work: record.work, sequence, meta: record.meta, isNew }
+      })
+      const hasNew = updates.some(item => item.isNew)
+      savePixivWorkRecords(uid, records, now)
+      savePixivBookmarks(uid, restrict, updates.map(({ isNew: _isNew, ...item }) => item), now)
+      const state = getPixivMirrorState(uid, restrict)
+      savePixivMirrorState(uid, {
+        ...state,
+        started: true,
+        phase: hasNew && nextUrl ? 'maintaining' : 'ready',
+        nextUrl: null,
+        items: countPixivBookmarks(uid, restrict),
+        lastSynced: now,
+        error: '',
+      })
+      clearUnifiedCatalogCache()
+      if (!hasNew || !nextUrl) return
+      url = nextUrl
+      await delay(PAGE_INTERVAL_MS, undefined, { signal: job.controller.signal })
+    }
+  } catch (error) {
+    if (job.controller.signal.aborted || job.version !== getPixivSessionVersion()) return
+    const state = getPixivMirrorState(uid, restrict)
+    savePixivMirrorState(uid, { ...state, phase: 'error', error: error instanceof Error ? error.message : 'Pixiv 收藏增量更新失败' })
+  }
+}
+
+export function startPixivMirror(restrict: PixivBookmarkRestrict, options: PixivMirrorOptions = {}): void {
   requirePixivReady()
+  const mode = options.mode ?? 'full'
+  const manual = options.manual === true
   const uid = getPixivRuntime().account!.id
   const version = getPixivSessionVersion()
   const key = `${uid}:${restrict}`
@@ -74,15 +142,21 @@ export function startPixivMirror(restrict: PixivBookmarkRestrict): void {
   running?.controller.abort()
   const current = getPixivMirrorState(uid, restrict)
   const now = Date.now()
-  if (current.phase === 'ready' && (lastStartAt.get(key) || 0) > now - 30_000) return
+  if (!manual && current.phase === 'ready' && (lastStartAt.get(key) || 0) > now - 30_000) return
   lastStartAt.set(key, now)
-  const resume = current.started && Boolean(current.nextUrl)
-  if (!resume) {
-    savePixivMirrorState(uid, { ...current, started: true, phase: current.started ? 'maintaining' : 'backfilling', nextUrl: null, pages: 0, items: 0, error: '', generation: now })
+
+  if (mode === 'incremental') {
+    savePixivMirrorState(uid, { ...current, started: true, phase: 'maintaining', nextUrl: null, error: '' })
+  } else {
+    const resume = !manual && current.started && Boolean(current.nextUrl)
+    if (!resume) {
+      savePixivMirrorState(uid, { ...current, started: true, phase: 'backfilling', nextUrl: null, pages: 0, items: 0, error: '', generation: now })
+    }
   }
+
   const job: MirrorJob = { version, controller: new AbortController(), promise: Promise.resolve() }
   jobs.set(key, job)
-  job.promise = loop(uid, restrict, job).finally(() => { if (jobs.get(key) === job) jobs.delete(key) })
+  job.promise = (mode === 'incremental' ? loopIncremental : loopFull)(uid, restrict, job).finally(() => { if (jobs.get(key) === job) jobs.delete(key) })
 }
 
 export async function stopPixivMirrors(): Promise<void> {
@@ -96,6 +170,6 @@ export function resumePixivMirrors(): void {
   if (runtime.localMode || !runtime.configured || !runtime.account) return
   for (const restrict of ['public', 'private'] as const) {
     const state = getPixivMirrorState(runtime.account.id, restrict)
-    if (state.started && state.phase !== 'ready') startPixivMirror(restrict)
+    if (state.started && state.nextUrl) startPixivMirror(restrict)
   }
 }

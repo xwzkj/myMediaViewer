@@ -35,6 +35,9 @@
 .cloud-favorite-tabs { display: flex; gap: 8px; margin-top: 20px; }
 .cloud-favorite-tabs button { min-height: 36px; padding: 0 14px; border: 1px solid var(--outline); border-radius: 999px; background: var(--surface); color: var(--muted); font-size: 12px; }
 .cloud-favorite-tabs button.active { border-color: var(--primary); background: var(--primary-container); color: var(--on-container); }
+.cloud-mirror-actions { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+.cloud-mirror-refresh { display: inline-flex; align-items: center; gap: 6px; }
+.cloud-mirror-refresh:disabled { opacity: .62; cursor: wait; }
 .menu-action-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 @layer responsive {
   @media (min-width: 701px) and (max-width: 960px) {

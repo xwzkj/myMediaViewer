@@ -6,6 +6,7 @@ import os from 'node:os'
 import sharp from 'sharp'
 import { parseJsonMetadata, parseName, parseMetadata, decodeText } from '../server/parsers.js'
 import { isLocalAddress } from '../server/access.js'
+import { sourcePreset } from '../shared/source-presets.js'
 
 test('两种命名规则、数字页码、大小写和双点扩展名', () => {
   assert.deepEqual(parseName('20434537023-92408550_p10.jpg', 'pixiv'), { externalId: '92408550', page: 10, metadata: false, kind: 'image', extension: 'jpg', sequence: 20434537023 })
@@ -321,6 +322,25 @@ test('媒体库端到端：目录管理、分组、搜索、收藏、媒体流�
       assert.equal(fallback.assets[0].extension, 'gif')
       assert.equal(fallback.favorite, true)
       assert.deepEqual(await readFile(path.join(animations, '100-31.gif')), gif)
+    })
+    await t.test('目录隔离来源仍能读取媒体', async () => {
+      const scoped = path.join(root, 'scoped')
+      await mkdir(path.join(scoped, 'album'), { recursive: true })
+      await writeFile(path.join(scoped, 'album', '100-12_p0.png'), image)
+      const rules = structuredClone(sourcePreset('pixiv'))
+      rules.scope = 'directory'
+      const added = await app.inject({ method: 'POST', url: '/api/sources', payload: { name: '目录隔离', path: scoped, rules } })
+      assert.equal(added.statusCode, 201, added.body)
+      await waitScan()
+      const source = added.json()
+      const listing = (await app.inject(`/api/works?source=${source.id}`)).json()
+      assert.equal(listing.total, 1)
+      assert.match(listing.items[0].id, /^v2:/)
+      const detail = (await app.inject(`/api/works/${encodeURIComponent(listing.items[0].id)}`)).json()
+      const streamed = await app.inject(detail.assets[0].url)
+      assert.equal(streamed.statusCode, 200, streamed.body)
+      assert.deepEqual(streamed.rawPayload, image)
+      assert.equal((await app.inject({ method: 'DELETE', url: `/api/sources/${source.id}` })).statusCode, 200)
     })
   } finally {
     await app.close()

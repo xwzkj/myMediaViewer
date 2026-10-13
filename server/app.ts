@@ -62,8 +62,8 @@ export async function createApp(logging = true) {
     reportedErrors.add(request)
     logError('接口', `${request.method} ${request.url.split('?')[0]} · ${status} · ${error.message}`.trim(), error.expose ? undefined : error)
     // expose 的错误（例如 AI 配置或上游返回问题）直接把原因告诉用户，其余保持笼统提示。
-    // 如果是 AI 相关的操作或错误明确带了 message，把具体的错误详情返回给前端；仅当未捕获异常且无消息时兜底
-    const message = error.message || '服务器处理失败，请检查运行日志'
+    // 业务错误可以给用户看；未预期的 5xx 只返回笼统提示，避免泄露路径、SQL 或上游响应。
+    const message = error.expose === true || status < 500 ? error.message || '请求处理失败' : '服务器处理失败，请检查运行日志'
     reply.code(status).send({ message })
   })
 
