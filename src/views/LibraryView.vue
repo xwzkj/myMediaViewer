@@ -14,6 +14,7 @@ import { watchLibraryMemory } from '../library-memory'
 import { releaseLibrarySession, retainLibrarySession, setLibraryLoader, syncLibrarySession, getLibrarySession } from '../library-session'
 import { asCloudSearchEntity, migrateLegacyLibraryState, readLibraryState, writeLibraryState, type CloudSearchEntity, type LibraryWorksState, type LocalSearchState, type SearchSource } from '../library-state'
 import Icon from '../components/Icon.vue'
+import AppSelect from '../components/AppSelect.vue'
 import AppNotice from '../components/AppNotice.vue'
 import { useNotice } from '../use-notice'
 import WorkCard from '../components/WorkCard.vue'
@@ -43,6 +44,13 @@ const query = ref('')
 const submittedQuery = ref('')
 const sort = ref<'newest' | 'oldest' | 'title' | 'random' | 'relevance'>(initialWorks.sort)
 // 随机顺序用 seed 固定这一次的乱序结果，翻页不会重复或漏作品；换一批就换一个 seed。
+const localSortOptions = computed(() => [
+  ...(localSearchMode.value && submittedQuery.value ? [{ value: 'relevance' as const, label: '相关度优先' }] : []),
+  { value: 'newest' as const, label: '最新优先' },
+  { value: 'oldest' as const, label: '最早优先' },
+  { value: 'title' as const, label: '标题排序' },
+  { value: 'random' as const, label: '随机顺序' },
+])
 const seed = ref(initialWorks.seed || String(Date.now()))
 // 排序依据：收藏时间（文件名开头的 bmk_id）或发布时间，默认按收藏顺序。
 const order = ref(initialWorks.order)
@@ -1002,11 +1010,11 @@ onUnmounted(() => {
           <button v-if="!isUserEntity" ref="menuButton" class="icon-button menu-button" :class="{ active: filtersActive }" :aria-expanded="menuOpen" aria-haspopup="true" :title="filtersActive ? '筛选与排序（已应用筛选）' : '筛选与排序'" @click="menuOpen = !menuOpen"><Icon name="tune" :size="21" /><span v-if="filtersActive" class="menu-dot" /></button>
         </div>
         <Transition v-if="!isUserEntity" name="menu-pop"><div v-if="menuOpen" ref="menu" class="filter-menu" role="dialog" aria-label="筛选与排序">
-          <label v-if="!cloudSearchMode && !cloudFavoritesMode && sourceOptions.length > 1" class="menu-row"><span>来源</span><span class="menu-select"><select v-model="source" aria-label="筛选媒体来源"><option value="">全部来源</option><option v-for="item in sourceOptions" :key="item.id" :value="item.id">{{ item.name }}</option></select><Icon name="down" :size="16" /></span></label>
+          <div v-if="!cloudSearchMode && !cloudFavoritesMode && sourceOptions.length > 1" class="menu-row"><span>来源</span><AppSelect v-model="source" compact label="筛选媒体来源" :options="[{ value: '', label: '全部来源' }, ...sourceOptions.map(item => ({ value: item.id, label: item.name }))]" /></div>
           <div v-if="!isUserEntity" class="menu-row"><span>媒体类型</span><div class="menu-chips"><button v-for="filter in filters" :key="filter.id" class="filter-chip" :class="{ active: kind === filter.id }" :aria-pressed="kind === filter.id" @click="kind = filter.id"><Icon :name="kind === filter.id ? 'check' : filter.icon" :size="18" />{{ filter.label }}</button></div></div>
           <label v-if="!cloudSearchMode" class="menu-row"><span>模糊匹配</span><span class="fuzzy-toggle"><input v-model="fuzzy" type="checkbox" /><span class="mini-switch" /><span>{{ fuzzy ? '已开启' : '已关闭' }}</span></span></label>
-          <label v-if="cloudSearchMode && !isUserEntity" class="menu-row"><span>匹配规则</span><span class="menu-select"><select v-model="cloudTarget" aria-label="云搜索匹配规则"><option v-for="target in pixivSearchTargets" :key="target.value" :value="target.value">{{ target.label }}</option></select><Icon name="down" :size="16" /></span></label>
-          <label class="menu-row"><span>排序方式</span><span class="sort-select"><Icon name="sort" :size="18" /><select v-if="cloudSearchMode && !isUserEntity" v-model="cloudSort" aria-label="云搜索排序"><option value="popular_preview">热度预览</option><option value="date_desc">最新优先</option><option value="date_asc">最早优先</option></select><select v-else-if="!isUserEntity" v-model="sort" aria-label="排序方式"><option v-if="localSearchMode && submittedQuery" value="relevance">相关度优先</option><option value="newest">最新优先</option><option value="oldest">最早优先</option><option value="title">标题排序</option><option value="random">随机顺序</option></select><Icon name="down" :size="16" /></span></label>
+          <div v-if="cloudSearchMode && !isUserEntity" class="menu-row"><span>匹配规则</span><AppSelect v-model="cloudTarget" compact label="云搜索匹配规则" :options="pixivSearchTargets" /></div>
+          <div class="menu-row"><span>排序方式</span><AppSelect v-if="cloudSearchMode && !isUserEntity" v-model="cloudSort" compact label="云搜索排序" :options="[{ value: 'popular_preview', label: '热度预览' }, { value: 'date_desc', label: '最新优先' }, { value: 'date_asc', label: '最早优先' }]" /><AppSelect v-else-if="!isUserEntity" v-model="sort" compact label="排序方式" :options="localSortOptions" /></div>
           <label v-if="sort === 'random' && !cloudSearchMode" class="menu-row"><span>换一批</span><button class="button tonal small" type="button" @click="reshuffle"><Icon name="refresh" :size="17" />重新打乱</button></label>
           <label v-if="!cloudSearchMode && !isUserEntity" class="menu-row" :class="{ dim: timeSortDisabled }"><span>时间依据</span><span class="fuzzy-toggle order-toggle"><input v-model="order" type="checkbox" true-value="collected" false-value="published" :disabled="timeSortDisabled" /><span class="mini-switch" /><span>{{ effectiveOrder === 'collected' ? '收藏时间' : '发布时间' }}</span></span></label>
           <label v-if="!isUserEntity" class="menu-row menu-action-row"><span>媒体库索引</span><button class="button tonal small" type="button" :disabled="status?.scan.running || !hasLibrary" @click="scan"><Icon name="refresh" :class="{ spinning: status?.scan.running }" :size="17" />{{ status?.scan.running ? '正在扫描' : '刷新媒体库' }}</button></label>

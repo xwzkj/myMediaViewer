@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import type { PixivSettings, PixivStatus } from '../../shared/types'
 import Icon from './Icon.vue'
+import AppSelect from './AppSelect.vue'
 import { api } from '../api'
 import { appEvents } from '../events'
 
@@ -108,7 +109,10 @@ async function clearCache(days: number | null, all = false) {
       <label class="field">refresh_token<div class="key-field"><input v-model="token" :type="showToken ? 'text' : 'password'" autocomplete="off" spellcheck="false" :placeholder="settings.configured ? '已配置；留空表示不修改' : '粘贴 Pixiv refresh_token'" /><button type="button" class="button text small" @click="showToken = !showToken">{{ showToken ? '隐藏' : '显示' }}</button></div><span>token 只发送到服务端保存，接口不回传明文。</span></label>
       <details class="token-help"><summary>如何获取 refresh_token？</summary><p>本应用不自建 Pixiv 登录页。可在信任的 Pixiv OAuth / PKCE 第三方客户端或取 token 工具中完成一次登录，再从返回的 OAuth token 响应里复制 <code>refresh_token</code>。不要填写 <code>access_token</code>，它约一小时后就会失效。</p></details>
       <fieldset class="bookmark-settings"><legend>收藏选项</legend>
-        <label class="field">默认收藏到<span class="menu-select"><select v-model="settings.defaultBookmarkRestrict" aria-label="默认收藏到"><option value="private">私密收藏夹</option><option value="public">公开收藏夹</option></select><Icon name="down" :size="16" /></span><span>点击云端收藏按钮时，直接使用此选项。</span></label>
+        <div class="bookmark-destination">
+          <div class="bookmark-destination-copy"><span>默认收藏到</span><small>点击云端收藏按钮时，直接使用此选项。</small></div>
+          <AppSelect v-model="settings.defaultBookmarkRestrict" label="默认收藏到" :options="[{ value: 'private', label: '私密收藏夹' }, { value: 'public', label: '公开收藏夹' }]" />
+        </div>
         <label class="menu-row pixiv-toggle"><span>自动附加收藏标签</span><span class="fuzzy-toggle"><input v-model="settings.autoBookmarkTags" type="checkbox" /><span class="mini-switch" /><span>{{ settings.autoBookmarkTags ? '优先原文，最多 10 个' : '已关闭' }}</span></span></label>
       </fieldset>
       <label class="field">云端缓存上限（MB）<input v-model.number="settings.cacheLimitMb" type="number" min="128" max="1048576" step="128" /><span>默认 15360 MB；按最后访问时间自动 LRU 淘汰。</span></label>
@@ -123,6 +127,11 @@ async function clearCache(days: number | null, all = false) {
 .pixiv-form { display: grid; gap: 14px; }
 .bookmark-settings { min-width: 0; display: grid; gap: 14px; margin: 0; padding: 16px; border: 1px solid var(--outline); border-radius: 13px; }
 .bookmark-settings legend { padding: 0 6px; color: var(--text); font-size: 12px; font-weight: 600; }
+.bookmark-destination { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-width: 0; }
+.bookmark-destination-copy { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.bookmark-destination-copy > span { color: var(--text); font-size: 12px; font-weight: 600; }
+.bookmark-destination-copy > small { color: var(--muted); font-size: 10px; line-height: 1.6; }
+.bookmark-destination > .app-select { flex: 0 0 160px; min-width: 0; }
 .pixiv-toggle { padding: 0; }
 .pixiv-toggle:hover { background: transparent; }
 .settings-section { border-top: 1px solid var(--outline); }
@@ -139,4 +148,5 @@ async function clearCache(days: number | null, all = false) {
 .cache-card span { color: var(--muted); font-size: 10px; }
 .cache-actions { display: flex; flex-wrap: wrap; gap: 7px; justify-content: flex-end; }
 @media (max-width: 700px) { .cache-card { align-items: stretch; flex-direction: column; } .cache-actions { justify-content: flex-start; } }
+@media (max-width: 480px) { .bookmark-destination { align-items: stretch; flex-direction: column; gap: 9px; } .bookmark-destination > .app-select { flex-basis: auto; width: 100%; } }
 </style>

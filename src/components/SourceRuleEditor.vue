@@ -6,6 +6,7 @@ import { ruleIssues, scriptIssues, issueLocation } from '../../shared/source-dia
 import SourceAiPanel from './SourceAiPanel.vue'
 import SourceCodeEditor from './SourceCodeEditor.vue'
 import FileRuleControl from './FileRuleControl.vue'
+import AppSelect from './AppSelect.vue'
 import { api } from '../api'
 const props = defineProps<{ modelValue: SourceRules; folder: string; name: string; disabled?: boolean }>()
 const emit = defineEmits<{ 'update:modelValue': [SourceRules]; 'preview-errors': [boolean]; busy: [boolean]; invalid: [boolean]; preset: [string] }>()
@@ -72,8 +73,8 @@ async function calculate(index: number) {
       <p><strong>正则：</strong><code>(?&lt;id&gt;\d+)(?:_p(?&lt;page&gt;\d+))?\.(?&lt;ext&gt;jpg|png)</code>；<code>\d+</code> 表示数字，<code>(?&lt;名字&gt;…)</code> 提取字段，<code>(?:…)?</code> 表示可选。不要加 <code>/…/i</code> 外壳。</p>
     </section>
     <div class="rule-grid">
-      <label class="field">分组范围<select :value="modelValue.scope" @change="update({scope:($event.target as HTMLSelectElement).value as SourceRules['scope']})"><option value="source">整个来源合并同 ID</option><option value="directory">按文件所在子目录隔离</option></select></label>
-      <label class="field">重复文件处理<select :value="modelValue.duplicates" @change="update({duplicates:($event.target as HTMLSelectElement).value as SourceRules['duplicates']})"><option value="all">保留全部</option><option value="page">同类型同页择优</option></select><span>同页动画优先 WebM，其次取最新修改文件；没有页码时不折叠。</span></label>
+      <div class="field">分组范围<AppSelect :model-value="modelValue.scope" label="分组范围" :disabled="disabled || loading" :options="[{ value: 'source', label: '整个来源合并同 ID' }, { value: 'directory', label: '按文件所在子目录隔离' }]" @update:model-value="update({scope:$event as SourceRules['scope']})" /></div>
+      <div class="field">重复文件处理<AppSelect :model-value="modelValue.duplicates" label="重复文件处理" :disabled="disabled || loading" :options="[{ value: 'all', label: '保留全部' }, { value: 'page', label: '同类型同页择优' }]" @update:model-value="update({duplicates:$event as SourceRules['duplicates']})" /><span>同页动画优先 WebM，其次取最新修改文件；没有页码时不折叠。</span></div>
     </div>
     <h4>1. 媒体分组规则</h4>
     <FileRuleControl :model-value="modelValue.media" label="媒体命名规则" :disabled="disabled || loading" @update:model-value="update({media:$event})" />
