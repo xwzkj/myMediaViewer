@@ -596,7 +596,7 @@ onBeforeRouteLeave(() => {
       </div>
       <div v-else-if="!current.items.length" class="creator-empty"><Icon name="images" :size="40" /><p>这位画师还没有{{ activeTab === 'manga' ? '漫画' : '插画' }}作品。</p></div>
       <div v-else class="work-grid">
-        <WorkCard v-for="work in current.items" :key="work.id" :work="work" :cloud-enabled="cloudEnabled" @open="openWork" @open-author="openAuthor" @favorite="toggleFavorite" @cloud-favorite="toggleCloudFavorite" />
+        <WorkCard v-for="work in current.items" :key="work.id" :work="work" hide-source-badge :cloud-enabled="cloudEnabled" @open="openWork" @open-author="openAuthor" @favorite="toggleFavorite" @cloud-favorite="toggleCloudFavorite" />
       </div>
       <div v-if="current.items.length" class="load-more">
         <button v-if="current.cursor" class="button text small" :disabled="current.loading" @click="retryMore"><Icon name="refresh" :class="{ spinning: current.loading }" :size="18" />{{ current.loading ? '正在加载更多…' : current.moreFailed ? '加载失败，点击重试' : '继续向下滚动，自动加载更多' }}</button>

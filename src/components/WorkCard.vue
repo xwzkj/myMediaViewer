@@ -4,7 +4,7 @@ import type { Work } from '../../shared/types'
 import Icon from './Icon.vue'
 import WorkFavoriteActions from './WorkFavoriteActions.vue'
 import WorkMediaBadge from './WorkMediaBadge.vue'
-defineProps<{ work: Work; cloudEnabled?: boolean }>()
+defineProps<{ work: Work; cloudEnabled?: boolean; hideSourceBadge?: boolean }>()
 defineEmits<{ open: [work: Work]; favorite: [work: Work]; cloudFavorite: [work: Work]; openAuthor: [work: Work] }>()
 const failed = ref(false)
 </script>
@@ -15,7 +15,7 @@ const failed = ref(false)
       <div class="card-art">
         <img v-if="!failed" :src="work.cover" :alt="work.title" loading="lazy" decoding="async" @error="failed = true" />
         <div v-else class="card-placeholder"><Icon :name="work.kind" :size="44" /><span>预览暂不可用</span></div>
-        <div class="card-topline"><span class="source-badge">{{ work.sourceName }}</span><span v-if="work.hasLocal === false" class="source-badge cloud-badge">云端</span><span v-if="work.approximate" class="source-badge">近似匹配</span></div>
+        <div class="card-topline"><span v-if="!hideSourceBadge" class="source-badge">{{ work.sourceName }}</span><span v-if="work.hasLocal === false" class="source-badge cloud-badge">云端</span><span v-if="work.approximate" class="source-badge">近似匹配</span></div>
         <WorkMediaBadge :work="work" />
         <div v-if="work.kind !== 'image'" class="card-play"><Icon :name="work.kind === 'video' ? 'play' : 'animation'" :size="28" /></div>
       </div>

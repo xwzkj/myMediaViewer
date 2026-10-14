@@ -9,6 +9,7 @@ import { appEvents, type PixivAuthChangedPayload, type PixivBookmarkSyncedPayloa
 import { createSearchSessionId } from '../route-cache-key'
 import { pushPage, replacePage } from '../navigation'
 import { usePageRoute } from '../use-page-route'
+import { createMirrorUpdateTracker } from '../mirror-update-tracker'
 import { watchLibraryMemory } from '../library-memory'
 import { releaseLibrarySession, retainLibrarySession, setLibraryLoader, syncLibrarySession, getLibrarySession } from '../library-session'
 import { asCloudSearchEntity, migrateLegacyLibraryState, readLibraryState, writeLibraryState, type CloudSearchEntity, type LibraryWorksState, type LocalSearchState, type SearchSource } from '../library-state'
@@ -65,6 +66,12 @@ const cloudResult = ref<PixivSearchResponse>({ items: [], nextCursor: null, elap
 const pixivStatus = ref<PixivStatus | null>(null)
 // auth 变化只标 dirty 手动刷新，不自动重置返回结果。
 const cloudDataDirty = ref(false)
+const cloudDirtyReason = ref<'auth' | 'mirror' | 'library'>('auth')
+const cloudDirtyMessage = computed(() => cloudDirtyReason.value === 'mirror'
+  ? '云端收藏镜像有更新，当前列表可能已过期。'
+  : cloudDirtyReason.value === 'library' ? '媒体库有更新，当前列表可能已过期。'
+    : 'Pixiv 账号状态已变化，当前云端结果可能已过期。')
+const mirrorUpdates = createMirrorUpdateTracker()
 const cloudEnabled = computed(() => Boolean(pixivStatus.value?.settings.configured && !pixivStatus.value.settings.localMode))
 const mirrorRefreshing = ref(false)
 const mirrorRefreshMode = ref<'incremental' | 'full' | null>(null)
@@ -383,7 +390,7 @@ async function refreshStatus() {
       cloudFavoritesMode.value ? api<PixivStatus>('/pixiv/status').catch(() => null) : Promise.resolve(null),
     ])
     if (destroyed) return
-    const previousMirrorItems = pixivStatus.value?.mirrors[cloudFavoritesRestrict.value]?.items || 0
+    const mirrorChanged = nextPixiv ? mirrorUpdates.observe(nextPixiv, cloudFavoritesRestrict.value) : false
     status.value = next
     if (nextPixiv) pixivStatus.value = nextPixiv
     if (source.value && !source.value.startsWith('pixiv:') && !next.sources.some(s => s.id === source.value)) {
@@ -391,13 +398,15 @@ async function refreshStatus() {
     if (route.value.name === 'source') void replacePage(router, { name: 'library' }, route.value)
   }
     // scan/mirror 变化：只标 dirty 横幅 + active 手动提示，不自动 loadWorks 重置返回数据。
-    if (previous !== undefined && previous !== next.scan.finishedAt) {
+    if (previous !== undefined && previous !== next.scan.finishedAt && !cloudSearchMode.value) {
       cloudDataDirty.value = true
-      if (pageActive.value) notice('媒体库有更新，当前列表可能已过期', { label: '重新加载', handler: () => { void loadWorks() } })
+      cloudDirtyReason.value = 'library'
+      if (pageActive.value) notice('媒体库有更新，当前列表可能已过期', { label: '重新加载', handler: reloadCloudResults })
     }
-    if (nextPixiv && cloudFavoritesMode.value && nextPixiv.mirrors[cloudFavoritesRestrict.value].items !== previousMirrorItems) {
+    if (mirrorChanged && cloudFavoritesMode.value) {
       cloudDataDirty.value = true
-      if (pageActive.value) notice('云端收藏镜像有更新，当前列表可能已过期', { label: '重新加载', handler: () => { void loadWorks() } })
+      cloudDirtyReason.value = 'mirror'
+      if (pageActive.value) notice('云端收藏镜像有更新，当前列表可能已过期', { label: '重新加载', handler: reloadCloudResults })
     }
   } catch (e) { if (!status.value) error.value = (e as Error).message }
   finally { refreshInProgress = false }
@@ -408,7 +417,11 @@ async function scan() {
 }
 async function refreshPixivStatus() {
   try {
-    pixivStatus.value = await api<PixivStatus>('/pixiv/status')
+    const next = await api<PixivStatus>('/pixiv/status')
+    if (destroyed) return
+    pixivStatus.value = next
+    // Do not consume update observations here: the polling path owns notifications.
+    // Its first successful observation establishes the baseline independently.
   } catch { pixivStatus.value = null }
 }
 async function refreshCloudMirror(mode: 'incremental' | 'full') {
@@ -819,6 +832,8 @@ function handleAuthChanged(payload: PixivAuthChangedPayload) {
   // 账号/登出/localMode 变化：在途云端请求全部作废，迟到响应不再写回。
   if (previous.settings.configured !== payload.configured || previous.settings.localMode !== payload.localMode || previousAccount !== nextAccount) {
     pixivStatus.value = null
+    mirrorUpdates.reset()
+    cloudDirtyReason.value = 'auth'
     cloudRequestVersion++
     controller?.abort()
     cloudUserLoading.value = false
@@ -1003,7 +1018,7 @@ onUnmounted(() => {
         <div v-if="status?.scan.running" class="scan-progress" role="status"><div class="indeterminate-bar" /><span>{{ status.scan.phase }}<b>{{ formatNumber(status.scan.files) }} 个文件</b></span></div>
         <div v-if="status?.scan.errors.length && !status.scan.running" class="warning-banner"><Icon name="warning" :size="20" /><span>部分目录或描述未能读取，已有索引已保留。</span><button class="button text small" @click="openSettings">查看详情</button></div>
         <div v-if="cloudFavoritesMode" class="cloud-favorite-tabs" role="tablist" aria-label="Pixiv 收藏可见性"><button type="button" role="tab" :aria-selected="cloudFavoritesRestrict === 'public'" :class="{ active: cloudFavoritesRestrict === 'public' }" @click="switchCloudFavorites('public')">公开收藏</button><button type="button" role="tab" :aria-selected="cloudFavoritesRestrict === 'private'" :class="{ active: cloudFavoritesRestrict === 'private' }" @click="switchCloudFavorites('private')">私密收藏</button><span class="cloud-mirror-actions"><button type="button" class="cloud-mirror-refresh" :disabled="!cloudEnabled || mirrorRefreshing || mirrorBusy" @click="refreshCloudMirror('incremental')"><Icon name="refresh" :class="{ spinning: incrementalUpdating }" :size="16" />{{ incrementalUpdating ? '正在增量' : '增量更新' }}</button><button type="button" class="cloud-mirror-refresh" :disabled="!cloudEnabled || mirrorRefreshing || mirrorBusy" @click="refreshCloudMirror('full')"><Icon name="cloud" :size="16" />{{ fullUpdating ? '正在全量' : '全量刷新' }}</button></span></div>
-        <div v-if="cloudDataDirty && (cloudSearchMode || cloudFavoritesMode)" class="dirty-banner" role="status"><Icon name="warning" :size="18" /><span>Pixiv 账号状态已变化，当前云端结果可能已过期。</span><button class="button tonal small" type="button" @click="reloadCloudResults">重新加载</button></div>
+        <div v-if="cloudDataDirty && (cloudSearchMode || cloudFavoritesMode)" class="dirty-banner" role="status"><Icon name="warning" :size="18" /><span>{{ cloudDirtyMessage }}</span><button class="button tonal small" type="button" @click="reloadCloudResults">重新加载</button></div>
         <div v-if="cloudSearchMode" class="cloud-entity-tabs" role="tablist" aria-label="云搜索维度"><button type="button" role="tab" :aria-selected="cloudEntity === 'works'" :class="{ active: cloudEntity === 'works' }" @click="openCloudEntity('works')">作品</button><button type="button" role="tab" :aria-selected="cloudEntity === 'users'" :class="{ active: cloudEntity === 'users' }" @click="openCloudEntity('users')">作者</button></div>
         <div class="results-heading"><h2>{{ cloudSearchMode ? (isUserEntity ? 'Pixiv 作者搜索' : 'Pixiv 云搜索') : cloudFavoritesMode ? (cloudFavoritesRestrict === 'private' ? 'Pixiv 私密收藏' : 'Pixiv 公开收藏') : submittedQuery ? '搜索结果' : view === 'favorites' ? '我的收藏' : currentSource?.name || '全部作品' }}<span>{{ formatNumber(isUserEntity ? cloudUsers.length : result.total) }}</span></h2><span v-if="cloudSearchMode && isUserEntity && !cloudUserLoading" class="results-note">已加载 {{ formatNumber(cloudUsers.length) }} 位作者 · {{ cloudUserElapsed }} ms</span><span v-else-if="cloudSearchMode && isUserEntity" class="results-note">正在搜索作者…</span><span v-else-if="cloudSearchMode && !isUserEntity && !loading" class="results-note">{{ cloudTargetLabel }} · {{ cloudSort === 'date_desc' ? '最新优先' : cloudSort === 'date_asc' ? '最早优先' : '热度预览' }} · {{ result.elapsed }} ms</span><span v-else-if="cloudSearchMode" class="results-note">正在搜索作品…</span><span v-else-if="cloudFavoritesMode" class="results-note" :title="currentMirror?.error || mirrorStatusText">{{ mirrorStatusText }} · {{ formatNumber(currentMirror?.items || result.total) }} 组</span><span v-else-if="submittedQuery && !loading" class="results-note">{{ result.elapsed }} ms · 支持简繁体与拼音</span><span v-else-if="submittedQuery" class="results-note">正在搜索…</span><span v-else class="results-note">{{ kind ? ({ image: '静止的画面，无限的想象', video: '按下播放，让故事继续', animation: '让灵感动起来' }[kind]) : '灵感，在这里慢慢生长' }}</span></div>
         <div v-if="cloudSearchMode && isUserEntity" class="user-results" aria-label="作者搜索结果">
