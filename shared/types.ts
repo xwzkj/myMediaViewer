@@ -44,6 +44,8 @@ export interface Work {
   hasLocal?: boolean
   /** Pixiv 作品 ID；存在时可使用云端收藏与云推荐。 */
   pixivId?: string
+  /** Pixiv 画师（创作者）ID；存在时可进入创作者主页。作者名仍沿用 author 字符串。 */
+  pixivUserId?: string
   /** 该条目所属的全部本地/虚拟来源；首个为主要来源。 */
   memberships?: WorkMembership[]
   /** null 表示状态未知；undefined 表示该作品不支持云收藏。 */
@@ -98,6 +100,34 @@ export interface PixivSearchResponse {
 }
 export interface PixivSearchSuggestionsResponse {
   items: Array<{ name: string; translatedName: string }>
+}
+/** Pixiv 画师（创作者）摘要：id/name 必需，其余可选；统计一律不编造。 */
+export interface PixivUserSummary {
+  id: string
+  name: string
+  account?: string
+  comment?: string
+  avatarUrl?: string
+  isFollowed?: boolean
+}
+/** Pixiv 画师档案：摘要的可选扩展，仅展示上游返回的公开信息。 */
+export interface PixivUserProfile extends PixivUserSummary {
+  backgroundUrl?: string
+  webpage?: string
+  twitterUrl?: string
+  totalIllusts?: number
+  totalManga?: number
+  totalNovels?: number
+  totalFollows?: number
+  location?: string
+  job?: string
+  gender?: string
+  workspace?: Array<{ label: string; value: string }>
+}
+export interface PixivUserSearchResponse {
+  items: PixivUserSummary[]
+  nextCursor: string | null
+  elapsed: number
 }
 export interface PixivBookmarkUpdateResult {
   bookmarked: boolean

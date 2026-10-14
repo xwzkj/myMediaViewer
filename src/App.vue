@@ -5,7 +5,7 @@ import { routeCacheKey } from './route-cache-key'
 
 <template>
   <RouterView v-slot="{ Component, route }">
-    <KeepAlive include="LibraryView" :max="16">
+    <KeepAlive include="LibraryView,WorkPage,PixivUserPage,SettingsPage" :max="32">
       <component :is="Component" :key="routeCacheKey(route)" />
     </KeepAlive>
   </RouterView>

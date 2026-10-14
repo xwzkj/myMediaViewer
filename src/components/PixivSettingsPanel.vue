@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import type { PixivSettings, PixivStatus } from '../../shared/types'
 import Icon from './Icon.vue'
 import { api } from '../api'
+import { appEvents } from '../events'
 
 const emit = defineEmits<{ notice: [message: string] }>()
 const settings = ref<PixivSettings | null>(null)
@@ -53,6 +54,11 @@ async function save() {
     settings.value = await api<PixivSettings>('/pixiv/settings', { method: 'PUT', body: JSON.stringify(payload) })
     token.value = ''
     await load()
+    appEvents.emit('pixiv:auth-changed', {
+      configured: settings.value.configured,
+      localMode: settings.value.localMode,
+      accountId: settings.value.account?.id,
+    })
     emit('notice', settings.value.configured ? 'Pixiv 设置已保存' : '设置已保存，尚未连接 Pixiv 账号')
   } catch (e) { error.value = (e as Error).message }
   finally { saving.value = false }
@@ -64,6 +70,11 @@ async function disconnect() {
     await api('/pixiv/account', { method: 'DELETE' })
     token.value = ''
     await load()
+    appEvents.emit('pixiv:auth-changed', {
+      configured: settings.value?.configured ?? false,
+      localMode: settings.value?.localMode ?? false,
+      accountId: settings.value?.account?.id,
+    })
     emit('notice', '已断开 Pixiv 账号，云端缓存和镜像未被删除')
   } catch (e) { error.value = (e as Error).message }
   finally { saving.value = false }

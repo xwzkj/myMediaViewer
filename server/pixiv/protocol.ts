@@ -35,12 +35,18 @@ export function pixivIllustId(value: string): string {
   return value
 }
 
+/** 画师 ID 与作品 ID 同规则：严格纯数字，不做字符剥离。 */
+export function pixivUserId(value: string): string {
+  if (!/^[1-9]\d*$/.test(value)) throw new PixivApiError('Pixiv 画师 ID 无效', 400, 'invalid_id')
+  return value
+}
+
 export function pixivPageUrl(value: string, firstPage: string): string {
   const url = pixivApiUrl(value)
   const expected = pixivApiUrl(firstPage)
   if (url.pathname !== expected.pathname) throw new PixivApiError('分页游标与当前接口不匹配', 400, 'invalid_cursor')
   for (const [key, item] of expected.searchParams) {
-    if (['word', 'sort', 'search_target', 'illust_id', 'user_id', 'restrict'].includes(key) && url.searchParams.get(key) !== item) throw new PixivApiError('分页游标与当前查询不匹配', 400, 'invalid_cursor')
+    if (['word', 'sort', 'search_target', 'illust_id', 'user_id', 'restrict', 'type'].includes(key) && url.searchParams.get(key) !== item) throw new PixivApiError('分页游标与当前查询不匹配', 400, 'invalid_cursor')
   }
   return url.toString()
 }

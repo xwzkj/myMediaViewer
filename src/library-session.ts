@@ -12,6 +12,7 @@ export interface LibrarySession {
 }
 
 const sessions = new Map<string, LibrarySession>()
+const owners = new Map<string, number>()
 
 function createSession(key: string): LibrarySession {
   return {
@@ -22,6 +23,32 @@ function createSession(key: string): LibrarySession {
     pages: 1,
     loadMore: null,
   }
+}
+
+/**
+ * 会话持有计数：来源页在缓存存续期持有，详情页在存续期持有来源 list。
+ * 失活不释放；真正卸载（0 owner 才删）或 push 失败时释放。被持有时不被清理。
+ * loader 在来源卸载时不清空：KeepAlive 淘汰来源而详情仍持有时，held loader
+ * 保持 fetch 能力，详情跨页续加载不受来源 destroyed 影响（主流程；LRU 语义
+ * 不 overbuild，0 owner 才 delete）。
+ */
+export function retainLibrarySession(key: string): void {
+  ensureLibrarySession(key)
+  owners.set(key, (owners.get(key) || 0) + 1)
+}
+
+export function releaseLibrarySession(key: string): void {
+  const count = (owners.get(key) || 0) - 1
+  if (count <= 0) {
+    owners.delete(key)
+    sessions.delete(key)
+    return
+  }
+  owners.set(key, count)
+}
+
+export function librarySessionOwners(key: string): number {
+  return owners.get(key) || 0
 }
 
 export function getLibrarySession(key: string): LibrarySession | undefined {

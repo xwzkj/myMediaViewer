@@ -164,10 +164,11 @@ export function savePixivWorkRecords(accountId: string, records: PixivStoredWork
   db.exec('BEGIN')
   try {
     for (const record of records) {
-      const work = record.work
-      const illustId = work.pixivId || work.externalId
+      const illustId = record.work.pixivId || record.work.externalId
       if (!/^\d+$/.test(illustId)) continue
       const existing = getPixivWorkRecord(accountId, illustId)
+      // Copy inputs: callers must not observe store-side merges.
+      const work = { ...record.work }
       // List responses must not discard full-detail pages or lazily fetched animation metadata.
       const meta = { ...record.meta }
       if (existing) {
@@ -177,6 +178,9 @@ export function savePixivWorkRecords(accountId: string, records: PixivStoredWork
           meta.pages = existing.meta.pages
           meta.detailFetchedAt = existing.meta.detailFetchedAt
         }
+        if (!meta.userCheckedAt && existing.meta.userCheckedAt) meta.userCheckedAt = existing.meta.userCheckedAt
+        // Creator UID survives list rewrites that omit the author.
+        if (!work.pixivUserId && existing.work.pixivUserId) work.pixivUserId = existing.work.pixivUserId
       }
       statement.run(accountId, illustId, JSON.stringify({ work, meta }), work.updated || Date.now(), lastSeen)
     }
@@ -230,9 +234,18 @@ export function savePixivBookmarks(
   `)
   db.exec('BEGIN')
   try {
-    for (const { work, sequence, meta } of works) {
+    for (const { work: incoming, sequence, meta } of works) {
+      const work = { ...incoming }
       const illustId = work.pixivId || work.externalId
       if (!/^\d+$/.test(illustId)) continue
+      if (!work.pixivUserId) {
+        const previous = getPixivWork(accountId, illustId)?.pixivUserId
+          || (() => {
+            const row = db.prepare('SELECT data FROM pixiv_bookmarks WHERE account_id = ? AND illust_id = ? AND restrict = ?').get(accountId, illustId, restrict) as { data: string } | undefined
+            return row ? (JSON.parse(row.data) as { work?: Work }).work?.pixivUserId : undefined
+          })()
+        if (previous) work.pixivUserId = previous
+      }
       statement.run(accountId, illustId, restrict, sequence, JSON.stringify({ work, sequence, meta }), lastSeen)
     }
     db.exec('COMMIT')

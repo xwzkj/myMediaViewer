@@ -22,7 +22,13 @@ export interface LocalSearchState {
   seed: string
 }
 
-export interface CloudSearchState { sort: 'popular_preview' | 'date_desc' | 'date_asc'; target: PixivSearchTarget }
+export type CloudSearchEntity = 'works' | 'users'
+
+export function asCloudSearchEntity(value: unknown): CloudSearchEntity {
+  return value === 'users' ? 'users' : 'works'
+}
+
+export interface CloudSearchState { sort: 'popular_preview' | 'date_desc' | 'date_asc'; target: PixivSearchTarget; entity: CloudSearchEntity }
 export interface CloudFavoritesState { restrict: 'public' | 'private' }
 export interface LibraryStateMap {
   works: LibraryWorksState
@@ -41,7 +47,7 @@ const keys: Record<LibraryScope, string> = {
 const defaults: LibraryStateMap = {
   works: { view: 'library', source: '', kind: '', fuzzy: false, sort: 'newest', order: 'collected', seed: '' },
   localSearch: { source: '', kind: '', fuzzy: false, sort: 'relevance', order: 'published', seed: '' },
-  cloudSearch: { sort: 'popular_preview', target: defaultPixivSearchTarget },
+  cloudSearch: { sort: 'popular_preview', target: defaultPixivSearchTarget, entity: 'works' },
   cloudFavorites: { restrict: 'public' },
 }
 
@@ -99,6 +105,7 @@ function normalizeCloudSearch(value: unknown): CloudSearchState {
   return {
     sort: asString(raw.sort, ['popular_preview', 'date_desc', 'date_asc'] as const, 'popular_preview'),
     target: isPixivSearchTarget(raw.target) ? raw.target : defaultPixivSearchTarget,
+    entity: asCloudSearchEntity(raw.entity),
   }
 }
 

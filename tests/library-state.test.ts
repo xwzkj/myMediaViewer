@@ -19,7 +19,7 @@ test('媒体库、本地搜索、云搜索状态完全隔离', () => {
   storage.clear()
   writeLibraryState('works', { view: 'library', source: '', kind: '', fuzzy: false, sort: 'newest', order: 'collected', seed: 'w' })
   writeLibraryState('localSearch', { source: '', kind: '', fuzzy: false, sort: 'relevance', order: 'published', seed: 's' })
-  writeLibraryState('cloudSearch', { sort: 'date_asc', target: 'exact_match_for_tags' })
+  writeLibraryState('cloudSearch', { sort: 'date_asc', target: 'exact_match_for_tags', entity: 'works' })
   assert.equal(readLibraryState('works').sort, 'newest')
   assert.equal(readLibraryState('localSearch').sort, 'relevance')
   assert.equal(readLibraryState('cloudSearch').sort, 'date_asc')
@@ -31,13 +31,22 @@ test('媒体库、本地搜索、云搜索状态完全隔离', () => {
 test('云搜索旧状态补默认规则，无效规则安全回退', () => {
   storage.clear()
   storage.setItem('library.cloudSearch.v2', JSON.stringify({ sort: 'date_desc' }))
-  assert.deepEqual(readLibraryState('cloudSearch'), { sort: 'date_desc', target: 'partial_match_for_tags' })
+  assert.deepEqual(readLibraryState('cloudSearch'), { sort: 'date_desc', target: 'partial_match_for_tags', entity: 'works' })
   storage.setItem('library.cloudSearch.v2', JSON.stringify({ sort: 'date_asc', target: 'invalid' }))
-  assert.deepEqual(readLibraryState('cloudSearch'), { sort: 'date_asc', target: 'partial_match_for_tags' })
+  assert.deepEqual(readLibraryState('cloudSearch'), { sort: 'date_asc', target: 'partial_match_for_tags', entity: 'works' })
   for (const target of ['partial_match_for_tags', 'exact_match_for_tags', 'title_and_caption', 'keyword'] as const) {
-    writeLibraryState('cloudSearch', { sort: 'popular_preview', target })
+    writeLibraryState('cloudSearch', { sort: 'popular_preview', target, entity: 'works' })
     assert.equal(readLibraryState('cloudSearch').target, target)
   }
+})
+
+test('云搜索 entity 缺省 works、非法回退 works，仅新搜索默认使用记忆', () => {
+  storage.clear()
+  assert.equal(readLibraryState('cloudSearch').entity, 'works')
+  storage.setItem('library.cloudSearch.v2', JSON.stringify({ sort: 'popular_preview', target: 'partial_match_for_tags', entity: 'users' }))
+  assert.equal(readLibraryState('cloudSearch').entity, 'users')
+  storage.setItem('library.cloudSearch.v2', JSON.stringify({ sort: 'popular_preview', target: 'partial_match_for_tags', entity: 'invalid' }))
+  assert.equal(readLibraryState('cloudSearch').entity, 'works')
 })
 
 test('损坏 JSON 与旧状态迁移安全降级', () => {

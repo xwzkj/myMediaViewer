@@ -1,5 +1,6 @@
-import type { FastifyInstance } from 'fastify'
-import type { PixivBookmarkRestrict, PixivBookmarkUpdateResult, PixivSearchResponse, PixivSearchSuggestionsResponse, PixivStatus, Work, WorkDetail } from '../../shared/types.js'
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
+import { createHash } from 'node:crypto'
+import type { PixivBookmarkRestrict, PixivBookmarkUpdateResult, PixivSearchResponse, PixivSearchSuggestionsResponse, PixivStatus, PixivUserProfile, PixivUserSearchResponse, Work, WorkDetail } from '../../shared/types.js'
 import { allWorks, favoriteIds, toWork } from '../database.js'
 import { clearPixivApiCache, allPixivMirrorStates, savePixivWorkRecords, setPixivApiCache, getPixivApiCache, updatePixivBookmark } from './store.js'
 import { assertPixivSession, getPixivSessionVersion, clearPixivAccount, getPixivRuntime, getPixivSettings, requirePixivReady, savePixivSettings, PixivApiError } from './auth.js'
@@ -11,7 +12,10 @@ import { sendMedia } from '../media.js'
 import { resumePixivMirrors, startPixivMirror, stopPixivMirrors } from './mirror.js'
 import type { PixivRawIllust, PixivUgoiraMeta } from './types.js'
 import { fetchIllustRecord, pixivIllustPage, isPixivPlaceholder } from './service.js'
-import { pixivIllustId, pixivPageUrl } from './protocol.js'
+import type { PixivIllustPage } from './service.js'
+import { fetchUserProfile, getUserSummary, getCachedUserProfile, publicUserProfile, publicUserSummary, normalizeUserSearch, normalizeUserWork, saveUserSummaries, validateUserSearchPage, USER_WORKS_CACHE_MS } from './user.js'
+import type { PixivUserSearchPage } from './types.js'
+import { pixivIllustId, pixivPageUrl, pixivUserId } from './protocol.js'
 import { defaultPixivSearchTarget, isPixivSearchTarget } from '../../shared/pixiv-search.js'
 
 const SEARCH_CACHE_MS = 5 * 60_000
@@ -134,6 +138,101 @@ export async function registerPixivRoutes(app: FastifyInstance): Promise<void> {
       setPixivApiCache(cacheKey, response, SEARCH_CACHE_MS)
     }
     return { items: normalizeSearchWorks(response.illusts || []), nextCursor: encodeCursor(response.next_url), elapsed: Math.round(performance.now() - started) }
+  })
+
+  app.get<{ Querystring: { q?: string; cursor?: string } }>('/api/pixiv/users/search', async (request): Promise<PixivUserSearchResponse> => {
+    const started = performance.now()
+    requirePixivReady()
+    const version = getPixivSessionVersion()
+    const query = (request.query.q || '').trim().slice(0, 100)
+    if (!query) return { items: [], nextCursor: null, elapsed: 0 }
+    const params = new URLSearchParams({ word: query, filter: 'for_ios' })
+    const path = `/v1/search/user?${params}`
+    const url = decodeCursor(request.query.cursor, path)
+    const uid = getPixivRuntime().account?.id || ''
+    const cacheKey = `user-search:${uid}:${url}`
+    let page = getPixivApiCache<PixivUserSearchPage>(cacheKey)
+    if (!page) {
+      page = validateUserSearchPage(await pixivFetch<PixivUserSearchPage>(url))
+      assertPixivSession(version)
+      setPixivApiCache(cacheKey, page, SEARCH_CACHE_MS)
+    }
+    // 原始缓存命中也要保证 summary 落盘，供头像路由使用。
+    const items = normalizeUserSearch(page)
+    assertPixivSession(version)
+    saveUserSummaries(uid, items)
+    assertPixivSession(version)
+    return { items: items.map(item => publicUserSummary(getUserSummary(uid, item.id) || item)), nextCursor: encodeCursor(page.next_url), elapsed: Math.round(performance.now() - started) }
+  })
+
+  app.get<{ Params: { id: string } }>('/api/pixiv/users/:id', async (request): Promise<PixivUserProfile> => {
+    requirePixivReady()
+    const version = getPixivSessionVersion()
+    const profile = await fetchUserProfile(request.params.id)
+    assertPixivSession(version)
+    return publicUserProfile(profile)
+  })
+
+  app.get<{ Params: { id: string }; Querystring: { type?: string; cursor?: string } }>('/api/pixiv/users/:id/works', async (request): Promise<PixivSearchResponse> => {
+    const started = performance.now()
+    requirePixivReady()
+    const version = getPixivSessionVersion()
+    const userId = pixivUserId(request.params.id)
+    const type = request.query.type === 'manga' ? 'manga' : request.query.type === undefined || request.query.type === 'illust' ? 'illust' : null
+    if (!type) throw new PixivApiError('画师作品类型无效', 400, 'invalid_type')
+    const params = new URLSearchParams({ user_id: userId, type, filter: 'for_ios' })
+    const path = `/v1/user/illusts?${params}`
+    const url = decodeCursor(request.query.cursor, path)
+    const uid = getPixivRuntime().account?.id || ''
+    const cacheKey = `user-works:${uid}:${url}`
+    let response = getPixivApiCache<PixivIllustPage>(cacheKey)
+    if (!response) {
+      response = pixivIllustPage(await pixivFetch<PixivIllustPage>(url))
+      assertPixivSession(version)
+      setPixivApiCache(cacheKey, response, USER_WORKS_CACHE_MS)
+    }
+    const records = (response.illusts || []).map(raw => normalizeUserWork(raw))
+    assertPixivSession(version)
+    if (uid) savePixivWorkRecords(uid, records)
+    assertPixivSession(version)
+    return {
+      items: records.map(record => ({
+        ...record.work,
+        sourceId: `pixiv:user:${userId}`,
+        sourceName: `Pixiv 画师 ${userId} 的${type === 'manga' ? '漫画' : '插画'}`,
+        memberships: undefined,
+      })),
+      nextCursor: encodeCursor(response.next_url),
+      elapsed: Math.round(performance.now() - started),
+    }
+  })
+
+  /** 画师头像/背景：只读服务端已知的 pximg URL，无任意 u/url 参数，缺失直接 404。 */
+  async function serveUserImage(userId: string, kind: 'avatar' | 'background', request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
+    requirePixivReady()
+    const version = getPixivSessionVersion()
+    const id = pixivUserId(userId)
+    const uid = getPixivRuntime().account!.id
+    const summary = getUserSummary(uid, id)
+    const profile = getCachedUserProfile(uid, id)
+    const url = kind === 'avatar' ? summary?.avatarUrl || profile?.avatarUrl : profile?.backgroundUrl
+    assertPixivSession(version)
+    if (!url) return reply.code(404).send({ message: '画师图片不存在' })
+    const hash = createHash('sha256').update(url).digest('hex').slice(0, 16)
+    const cacheKey = pixivCacheKey('meta', id, 0, `user:${kind}:${hash}`)
+    const resource = await getOrCachePixivResource(cacheKey, url, undefined, 32 * 1024 * 1024)
+    assertPixivSession(version)
+    if (!/^image\/(png|jpeg|gif|webp|avif)$/.test(resource.contentType.split(';')[0] || '')) throw new PixivApiError('画师图片响应无效', 502, 'invalid_resource')
+    enforcePixivCacheLimit(getPixivSettings().cacheLimitMb * 1024 * 1024)
+    return sendMedia(request, reply, resource.path, extensionForContentType(resource.contentType))
+  }
+
+  app.get<{ Params: { id: string } }>('/api/pixiv/users/:id/avatar', async (request, reply) => {
+    return serveUserImage(request.params.id, 'avatar', request, reply)
+  })
+
+  app.get<{ Params: { id: string } }>('/api/pixiv/users/:id/background', async (request, reply) => {
+    return serveUserImage(request.params.id, 'background', request, reply)
   })
 
   app.get<{ Querystring: { q?: string } }>('/api/pixiv/suggestions', async (request): Promise<PixivSearchSuggestionsResponse> => {
@@ -264,7 +363,7 @@ export async function registerPixivRoutes(app: FastifyInstance): Promise<void> {
     if (format !== 'auto' && format !== 'webp') throw new PixivApiError('Ugoira 格式无效', 400, 'invalid_asset')
     const version = getPixivSessionVersion()
     const uid = getPixivRuntime().account!.id
-    let record = await fetchIllustRecord(request.params.illustId)
+    let record = await fetchIllustRecord(request.params.illustId, false)
     assertPixivSession(version)
     if (record.work.kind !== 'animation') throw new PixivApiError('该作品不是 Ugoira 动图', 400, 'invalid_asset')
     if (!record.meta.ugoira) {

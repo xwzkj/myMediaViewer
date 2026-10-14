@@ -80,6 +80,8 @@ export function normalizePixivIllust(
 ): PixivStoredWork {
   const illustId = numericId(raw.id)
   if (!illustId) throw new Error('Pixiv 作品缺少 ID')
+  const userId = String(raw.user?.id ?? '')
+  const pixivUserId = /^[1-9]\d*$/.test(userId) ? userId : undefined
   const kind: MediaKind = raw.type === 'ugoira' ? 'animation' : 'image'
   const animationPreview = imagePreview(raw.image_urls)
   const pages = kind === 'animation'
@@ -119,6 +121,7 @@ export function normalizePixivIllust(
     origin: 'pixiv',
     hasLocal: false,
     pixivId: illustId,
+    ...(pixivUserId ? { pixivUserId } : {}),
     memberships: [{ id: sourceId, name: pixivSourceName(sourceRestrict), kind: 'pixiv', origin: 'pixiv' }],
     cloudBookmark: restrict
       ? { bookmarked: true, restrict: sourceRestrict }

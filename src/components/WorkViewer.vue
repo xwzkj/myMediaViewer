@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, onMounted, onBeforeUnmount, onUnmounted, watch } from 'vue'
+import { ref, computed, nextTick, onBeforeUnmount, onUnmounted, onActivated, onDeactivated, watch } from 'vue'
 import type { AiTranslateFields, AiTranslateResult, MangaJob, MangaPageResult, WorkDetail, Work } from '../../shared/types'
 import { Viewer } from 'v-viewer'
 import { api, formatSize, kindLabel } from '../api'
@@ -11,8 +11,10 @@ import type { Notice, NoticeAction } from '../use-notice'
 import WorkRecommendations from './WorkRecommendations.vue'
 import SmoothThumbnail from './SmoothThumbnail.vue'
 
-const props = defineProps<{ work: WorkDetail; navigating?: boolean; cloudEnabled?: boolean }>()
-const emit = defineEmits<{ close: []; favorite: [work: Work]; cloudFavorite: [work: Work]; openRelated: [work: Work, listKey: string]; notice: [message: string, action?: NoticeAction, tone?: Notice['tone']]; searchTag: [tag: string]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
+const props = defineProps<{ work: WorkDetail; active?: boolean; navigating?: boolean; cloudEnabled?: boolean }>()
+const emit = defineEmits<{ close: []; favorite: [work: Work]; cloudFavorite: [work: Work]; openRelated: [work: Work, listKey: string]; notice: [message: string, action?: NoticeAction, tone?: Notice['tone']]; searchTag: [tag: string]; openAuthor: [work: Work]; searchAuthor: [author: string]; navigate: [direction: number, auto?: boolean] }>()
+// 在线作者走应用内主页：有 pixivUserId 且为在线条目才可点；本地作者保留按名搜索。
+const onlineAuthor = computed(() => Boolean(props.work.pixivUserId && (props.work.hasLocal === false || props.work.origin === 'pixiv' || props.work.id.startsWith('pixiv:'))))
 const root = ref<HTMLElement>()
 const stage = ref<HTMLElement>()
 const filmstrip = ref<HTMLElement>()
@@ -96,12 +98,151 @@ function resetManga() {
   mangaError.value = ''
   mangaScopeOpen.value = false
 }
-onMounted(() => {
-  timer = setInterval(() => { if (slideshow.value && !isVideo.value && !previewing.value) next(1, true) }, 4500)
+const isActive = computed(() => props.active ?? true)
+function startSlideshowTimer() {
+  stopSlideshowTimer()
+  timer = setInterval(() => { if (slideshow.value && !isVideo.value && !previewing.value && isActive.value) next(1, true) }, 4500)
+}
+function stopSlideshowTimer() {
+  if (timer) clearInterval(timer)
+  timer = undefined
+}
+function pauseMediaForLeave() {
+  // 离屏仅暂停：保留 currentTime/src，回来看 cached 可继续；不释放资源。
+  try { video.value?.pause() } catch { /* 离屏暂停失败不影响返回 */ }
+  // 批准语义：halt 自动翻页，返回不自动续播，由用户显式再开。
+  slideshow.value = false
+  stopSlideshowTimer()
+  clearTimeout(mangaTimer)
+  mangaTimer = undefined
+  clearTimeout(conversionTimer)
+  conversionTimer = undefined
+  destroyPreview()
+}
+// 可续查的在途任务：只记 GET 可恢复的 job 查询，不记 POST 提交。
+let resumableMangaJobId = ''
+let resumableConversionAssetId = ''
+let resumeInFlight = false
+async function resumeJobStatus() {
+  // activated 只 GET 续查，不 POST 新任务；单次在途防重复 timer；token 守卫防旧页串新页。
+  if (resumeInFlight) return
+  resumeInFlight = true
+  const token = mangaToken
+  const workId = props.work.id
+  try {
+    if (resumableMangaJobId && mangaBusy.value) {
+      const jobId = resumableMangaJobId
+      try {
+        const job = await api<MangaJob>(`/ai/manga/jobs/${jobId}`)
+        if (disposed || token !== mangaToken || workId !== props.work.id) return
+        await handleMangaJob(job, token, false)
+      } catch { /* 续查失败保留 job，下次激活再试 */ }
+    }
+    if (resumableConversionAssetId && converting.value) {
+      const id = resumableConversionAssetId
+      try {
+        const job = await api<{ state: string; message?: string }>(`/assets/${id}/convert`)
+        if (disposed || id !== asset.value?.id) return
+        await handleConversionJob(job, id)
+      } catch { /* 续查失败保留，下次激活再试 */ }
+    }
+  } finally {
+    resumeInFlight = false
+  }
+}
+startSlideshowTimer()
+// 图片翻译任务句柄：在途 resolve 只排下一 timer 当 active；缓存结果允许但不串 notice。
+async function handleMangaJob(job: MangaJob, token: number, notify: boolean) {
+  if (disposed || token !== mangaToken) return
+  mangaJob.value = job
+  if (job.state === 'queued' || job.state === 'processing') resumableMangaJobId = job.id
+  else if (job.state === 'ready' || job.state === 'failed') resumableMangaJobId = ''
+
+  const incoming = job.results || (job.result && job.currentAssetId ? [{ assetId: job.currentAssetId, result: job.result }] : [])
+  for (const item of incoming) mangaResults.value[item.assetId] = item.result
+
+  const currentResult = asset.value ? mangaResults.value[asset.value.id] : undefined
+  if (currentResult) mangaMode.value = 'translated'
+  if (job.state === 'ready') {
+    await nextTick()
+    if (currentResult) void drawMangaResult()
+    // POST 响应在 deactivate 后才到：notify 为 true 也不串页，只当 active 才 emit。
+    if (!notify || !isActive.value) return
+    if (job.failed?.length) {
+      emit('notice', `已完成 ${job.results?.length || 0}/${job.total} 张漫画翻译，${job.failed.length} 张失败：${job.failed[0].message}`, undefined, 'error')
+    } else if (mangaPageAssets.value.length > 1) {
+      emit('notice', `整部漫画翻译完成，共 ${job.results?.length || 0} 张`)
+    } else {
+      emit('notice', currentResult?.cached
+        ? `已显示缓存的漫画译图（${currentResult.model || '本地 OCR'}）`
+        : `漫画图片翻译完成（${currentResult?.model || '本地 OCR'}）`)
+    }
+    return
+  }
+  if (job.state === 'failed') {
+    mangaError.value = job.message || job.stage || '漫画图片翻译失败'
+    // 详情区会列出逐张失败的原因，这里再弹一条提示，保证离开详情区也能看到失败。
+    if (notify && isActive.value) emit('notice', `图片翻译失败：${mangaError.value}`, undefined, 'error')
+    return
+  }
+  if (!isActive.value) return
+  // 排下一 timer 前清旧 timer：resume 与在途轮询可能重复，只保留最新一支。
+  clearTimeout(mangaTimer)
+  const delay = job.state === 'queued' ? 1200 : 800
+  mangaTimer = setTimeout(async () => {
+    try { await handleMangaJob(await api<MangaJob>(`/ai/manga/jobs/${job.id}`), token, isActive.value) }
+    catch (e) {
+      if (token !== mangaToken) return
+      const message = (e as Error).message
+      mangaError.value = message
+      mangaJob.value = { ...job, state: 'failed', stage: '翻译失败', progress: 100, message }
+      if (isActive.value) emit('notice', `图片翻译失败：${message}`, undefined, 'error')
+    }
+  }, delay)
+}
+
+// 兼容版本任务句柄：同上，在途只当 active 续查；结果缓存允许，notice 不串页。
+async function handleConversionJob(job: { state: string; message?: string }, id: string) {
+  if (disposed || id !== asset.value?.id) return
+  if (job.state === 'ready') {
+    compatible.value = true
+    mediaError.value = false
+    converting.value = false
+    convertMessage.value = '正在播放兼容版本'
+    resumableConversionAssetId = ''
+    return
+  }
+  if (job.state === 'failed') {
+    converting.value = false
+    convertMessage.value = job.message || '转换失败'
+    resumableConversionAssetId = ''
+    return
+  }
+  resumableConversionAssetId = id
+  convertMessage.value = job.state === 'queued' ? '已加入处理队列…' : '正在生成兼容版本，完成后会自动切换…'
+  if (!isActive.value) return
+  clearTimeout(conversionTimer)
+  conversionTimer = setTimeout(async () => {
+    try { await handleConversionJob(await api(`/assets/${id}/convert`), id) }
+    catch (e) {
+      if (disposed || id !== asset.value?.id) return
+      converting.value = false
+      convertMessage.value = (e as Error).message
+    }
+  }, 2000)
+}
+onActivated(() => {
+  // 无条件建 interval 浪费：只在 slideshow 开启时计时；halt 后回来不自动续播。
+  if (slideshow.value) startSlideshowTimer()
+  void resumeJobStatus()
+})
+onDeactivated(() => {
+  pauseMediaForLeave()
 })
 // 详情由作品页统一加载；切换作品后直接使用新资源，并回到第一张。
-watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; mediaRetryToken.value = 0; compatible.value = false; ugoiraImageFallback.value = false; converting.value = false; convertMessage.value = ''; originalAssets.value = new Set(); translation.value = null; translationError.value = ''; translationDisplay.value = 'translated'; resetManga() })
-onUnmounted(() => { disposed = true; drawVersion++; images.clear(); destroyPreview(); clearInterval(timer); clearTimeout(conversionTimer); clearTimeout(mangaTimer) })
+// 跨作品清可续查句柄：旧 job 绝不串新作品；旧 timer 一并清除。
+watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; mediaRetryToken.value = 0; compatible.value = false; ugoiraImageFallback.value = false; converting.value = false; convertMessage.value = ''; originalAssets.value = new Set(); translation.value = null; translationError.value = ''; translationDisplay.value = 'translated'; resumableMangaJobId = ''; resumableConversionAssetId = ''; clearTimeout(mangaTimer); mangaTimer = undefined; clearTimeout(conversionTimer); conversionTimer = undefined; resetManga() })
+onUnmounted(() => { disposed = true; drawVersion++; images.clear(); destroyPreview(); stopSlideshowTimer(); clearTimeout(conversionTimer); clearTimeout(mangaTimer) })
 watch(index, async () => {
   destroyPreview()
   mediaError.value = false
@@ -155,7 +296,7 @@ watch([mangaMode, () => mangaResult.value?.key, () => mangaCanvas.value], async 
   await nextTick()
   void drawMangaResult()
 })
-watch(slideshow, value => { if (value && isVideo.value) void video.value?.play().catch(() => {}) })
+watch(slideshow, value => { if (value && isVideo.value && isActive.value) void video.value?.play().catch(() => {}) })
 // 标题、作者、标签、描述一起交给 AI，保证同一组信息的译文风格一致。
 const translatable = computed<AiTranslateFields>(() => {
   const tags = props.work.tags.filter(tag => tag.trim())
@@ -424,56 +565,14 @@ async function runMangaTranslation(scope: 'page' | 'work', force = false) {
 
   mangaScopeOpen.value = false
   const token = ++mangaToken
-  let firstPoll = true
   mangaError.value = ''
   clearTimeout(mangaTimer)
-  async function handle(job: MangaJob) {
-    if (disposed || token !== mangaToken) return
-    mangaJob.value = job
-
-    const incoming = job.results || (job.result && job.currentAssetId ? [{ assetId: job.currentAssetId, result: job.result }] : [])
-    for (const item of incoming) mangaResults.value[item.assetId] = item.result
-
-    const currentResult = asset.value ? mangaResults.value[asset.value.id] : undefined
-    if (currentResult) mangaMode.value = 'translated'
-    if (job.state === 'ready') {
-      await nextTick()
-      if (currentResult) void drawMangaResult()
-      if (job.failed?.length) {
-        emit('notice', `已完成 ${job.results?.length || 0}/${job.total} 张漫画翻译，${job.failed.length} 张失败：${job.failed[0].message}`, undefined, 'error')
-      } else if (scope === 'work') {
-        emit('notice', `整部漫画翻译完成，共 ${job.results?.length || 0} 张`)
-      } else {
-        emit('notice', currentResult?.cached
-          ? `已显示缓存的漫画译图（${currentResult.model || '本地 OCR'}）`
-          : `漫画图片翻译完成（${currentResult?.model || '本地 OCR'}）`)
-      }
-      return
-    }
-    if (job.state === 'failed') {
-      mangaError.value = job.message || job.stage || '漫画图片翻译失败'
-      // 详情区会列出逐张失败的原因，这里再弹一条提示，保证离开详情区也能看到失败。
-      emit('notice', `图片翻译失败：${mangaError.value}`, undefined, 'error')
-      return
-    }
-    const delay = firstPoll ? 50 : job.state === 'queued' ? 1200 : 800
-    firstPoll = false
-    mangaTimer = setTimeout(async () => {
-      try { await handle(await api<MangaJob>(`/ai/manga/jobs/${job.id}`)) }
-      catch (e) {
-        if (token !== mangaToken) return
-        const message = (e as Error).message
-        mangaError.value = message
-        mangaJob.value = { ...job, state: 'failed', stage: '翻译失败', progress: 100, message }
-        emit('notice', `图片翻译失败：${message}`, undefined, 'error')
-      }
-    }, delay)
-  }
   try {
-    await handle(await api<MangaJob>('/ai/manga/translate', {
+    // POST 只在用户手势时提交一次；后续轮询与 activated 续查都走 GET。
+    await handleMangaJob(await api<MangaJob>('/ai/manga/translate', {
       method: 'POST',
       body: JSON.stringify({ assetIds: pageIds, force }),
-    }))
+    }), token, true)
   } catch (e) {
     if (token === mangaToken) mangaError.value = (e as Error).message
   }
@@ -512,21 +611,13 @@ async function makeCompatible() {
   const id = asset.value.id
   converting.value = true
   convertMessage.value = '正在准备兼容版本…'
-  async function handle(job: { state: string; message?: string }) {
-    if (disposed || id !== asset.value?.id) return
-    if (job.state === 'ready') { compatible.value = true; mediaError.value = false; converting.value = false; convertMessage.value = '正在播放兼容版本'; return }
-    if (job.state === 'failed') { converting.value = false; convertMessage.value = job.message || '转换失败'; return }
-    convertMessage.value = job.state === 'queued' ? '已加入处理队列…' : '正在生成兼容版本，完成后会自动切换…'
-    conversionTimer = setTimeout(async () => {
-      try { await handle(await api(`/assets/${id}/convert`)) }
-      catch (e) { converting.value = false; convertMessage.value = (e as Error).message }
-    }, 2000)
-  }
-  try { await handle(await api(`/assets/${id}/convert`, { method: 'POST' })) }
+  try { await handleConversionJob(await api(`/assets/${id}/convert`, { method: 'POST' }), id) }
   catch (e) { converting.value = false; convertMessage.value = (e as Error).message }
 }
 function closeRoot() {
-  if (root.value) releaseVideos(root.value)
+  // 离开只暂停保留进度/src：真正卸载由 v-release-video（beforeUnmount）释放资源，
+  // 缓存实例 forward/back 还能继续看。旧的 releaseVideos 会清 src，返回要重载。
+  try { video.value?.pause() } catch { /* 关闭暂停失败不影响返回 */ }
   emit('close')
 }
 </script>
@@ -540,7 +631,7 @@ function closeRoot() {
             <div :key="mediaKey" class="media-frame">
               <p v-if="!asset" class="inline-error">作品没有可显示的媒体</p>
               <template v-else>
-                <video v-if="isVideo" v-release-video ref="video" :key="mediaUrl" :src="mediaUrl" :poster="asset.thumbnail" controls playsinline preload="metadata" :autoplay="slideshow || asset.kind === 'animation'" :muted="asset.kind === 'animation'" :loop="asset.kind === 'animation' && !slideshow" @error="handleVideoError" @ended="slideshow && next(1, true)" />
+                <video v-if="isVideo" v-release-video ref="video" :key="mediaUrl" :src="mediaUrl" :poster="asset.thumbnail" controls playsinline preload="metadata" :autoplay="isActive && (slideshow || asset.kind === 'animation')" :muted="asset.kind === 'animation'" :loop="asset.kind === 'animation' && !slideshow" @error="handleVideoError" @ended="slideshow && isActive && next(1, true)" />
                 <canvas v-else-if="mangaResult && mangaMode === 'translated' && mangaResult.regions.length" :key="mangaResult.key" ref="mangaCanvas" class="manga-canvas" :width="mangaResult.width" :height="mangaResult.height" :aria-label="`${work.title}，第 ${index + 1} 张的漫画译图`" @click="openPreview" />
                 <img v-else :key="mediaUrl" :src="mediaUrl" draggable="false" :alt="`${work.title}，第 ${index + 1} 张`" @click="openPreview" @error="mediaError = true" />
                 <div v-if="mediaError" class="media-error"><Icon name="warning" :size="32" /><p>{{ isVideo ? '浏览器无法播放这个视频' : '无法读取这张图片' }}</p><button v-if="asset?.origin === 'pixiv'" class="button tonal" @click="retryMedia"><Icon name="refresh" :size="18" />重试</button><button v-else-if="isVideo" class="button tonal" :disabled="converting" @click="makeCompatible">{{ converting ? '正在处理…' : '生成兼容版本' }}</button></div>
@@ -564,7 +655,8 @@ function closeRoot() {
             <span v-if="translatedVisible" class="line-tag">原文</span>
             <h2>{{ work.title }}</h2>
             <p class="work-author">
-              <button v-if="work.author" type="button" class="author-link" title="按这个作者搜索" @click="emit('searchAuthor', work.author)">{{ work.author }}</button>
+              <button v-if="work.author && onlineAuthor" type="button" class="author-link" title="查看创作者主页" @click="emit('openAuthor', work)">{{ work.author }}</button>
+              <button v-else-if="work.author" type="button" class="author-link" title="按这个作者搜索" @click="emit('searchAuthor', work.author)">{{ work.author }}</button>
               <span v-else>{{ work.sourceName }}</span>
             </p>
           </div>
@@ -572,7 +664,8 @@ function closeRoot() {
             <span class="line-tag">译文</span>
             <h2>{{ translation?.fields.title || work.title }}</h2>
             <p class="work-author">
-              <button v-if="work.author" type="button" class="author-link" title="按原文作者搜索" @click="emit('searchAuthor', work.author)">{{ translation?.fields.author || work.author }}</button>
+              <button v-if="work.author && onlineAuthor" type="button" class="author-link" title="查看创作者主页" @click="emit('openAuthor', work)">{{ translation?.fields.author || work.author }}</button>
+              <button v-else-if="work.author" type="button" class="author-link" title="按原文作者搜索" @click="emit('searchAuthor', work.author)">{{ translation?.fields.author || work.author }}</button>
               <span v-else>{{ work.sourceName }}</span>
             </p>
           </div>

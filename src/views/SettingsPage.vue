@@ -1,16 +1,22 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { onActivated, onDeactivated, onMounted, onBeforeUnmount, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import type { LibraryStatus } from '../../shared/types'
 import { createStatusPoller } from '../status-poller'
 import { api } from '../api'
+import { usePageRoute } from '../use-page-route'
+import { returnFromPage } from '../navigation'
 import Icon from '../components/Icon.vue'
 import AppNotice from '../components/AppNotice.vue'
 import { useNotice } from '../use-notice'
 import SettingsContent from '../components/SettingsContent.vue'
 
-const route = useRoute()
+defineOptions({ name: 'SettingsPage' })
+
 const router = useRouter()
+// helper 快照：失活后只读自己的 from，不读别的页面 query。
+const { route: pageRoute, active: pageActive } = usePageRoute()
+const route = pageRoute
 const status = ref<LibraryStatus | null>(null)
 const loading = ref(true)
 const error = ref('')
@@ -24,11 +30,25 @@ const poller = createStatusPoller(
 const refresh = poller.refresh
 
 function close() {
-  const from = typeof route.query.from === 'string' ? route.query.from : '/'
-  router.replace(from)
+  void returnFromPage(router, route.value)
 }
 
-onMounted(poller.start)
+// KeepAlive 初挂即触发 onActivated：主入口只从这里 start。
+// onMounted 仅作非 KeepAlive 直挂兜底（测试/SSR 无 activated）。
+// 初挂时 mounted 先于 activated 触发，两者共享 activeEntry 去重，
+// 保证 generation 只推进一次，避免首屏 run 被错位丢弃而永久 loading。
+let activeEntry = false
+onMounted(() => {
+  if (activeEntry || !pageActive.value) return
+  activeEntry = true
+  poller.start()
+})
+onActivated(() => {
+  if (activeEntry || !pageActive.value) return
+  activeEntry = true
+  poller.start()
+})
+onDeactivated(() => { activeEntry = false; poller.stop(); dismiss() })
 onBeforeUnmount(poller.stop)
 </script>
 

@@ -5,7 +5,7 @@ import Icon from './Icon.vue'
 import WorkFavoriteActions from './WorkFavoriteActions.vue'
 import WorkMediaBadge from './WorkMediaBadge.vue'
 defineProps<{ work: Work; cloudEnabled?: boolean }>()
-defineEmits<{ open: [work: Work]; favorite: [work: Work]; cloudFavorite: [work: Work] }>()
+defineEmits<{ open: [work: Work]; favorite: [work: Work]; cloudFavorite: [work: Work]; openAuthor: [work: Work] }>()
 const failed = ref(false)
 </script>
 
@@ -22,7 +22,7 @@ const failed = ref(false)
     </button>
     <div class="card-copy">
       <button type="button" class="card-title" @click="$emit('open', work)" :aria-label="`查看 ${work.title}`"><h3 :title="work.title">{{ work.title }}</h3></button>
-      <div class="card-bottom"><p><span class="card-author" :title="work.author || work.sourceName">{{ work.author || work.sourceName }}</span><span class="card-date">{{ new Date(work.date).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit' }) }}</span></p><WorkFavoriteActions :work="work" :cloud-enabled="cloudEnabled" @favorite="$emit('favorite', $event)" @cloud-favorite="$emit('cloudFavorite', $event)" /></div>
+      <div class="card-bottom"><p><button v-if="work.pixivUserId && (work.hasLocal === false || work.origin === 'pixiv' || work.id.startsWith('pixiv:'))" type="button" class="card-author link" :title="work.author || work.sourceName" @click="$emit('openAuthor', work)">{{ work.author || work.sourceName }}</button><span v-else class="card-author" :title="work.author || work.sourceName">{{ work.author || work.sourceName }}</span><span class="card-date">{{ new Date(work.date).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit' }) }}</span></p><WorkFavoriteActions :work="work" :cloud-enabled="cloudEnabled" @favorite="$emit('favorite', $event)" @cloud-favorite="$emit('cloudFavorite', $event)" /></div>
     </div>
   </article>
 </template>
@@ -31,6 +31,8 @@ const failed = ref(false)
 .card-copy { padding: 12px; min-height: 88px; }
 .card-title { display: block; width: 100%; padding: 0; text-align: left; background: transparent; }
 .card-title:hover { color: var(--primary); }
+.card-author.link { padding: 0; color: inherit; text-align: left; background: transparent; cursor: pointer; }
+.card-author.link:hover { color: var(--primary); text-decoration: underline; }
 .card-bottom { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
 .card-bottom p { min-width: 0; margin: 0; flex: 1; }
 .card-bottom p span { display: block; margin: 0; overflow: hidden; text-overflow: ellipsis; }

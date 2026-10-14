@@ -1,16 +1,20 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onUnmounted, ref, watch } from 'vue'
 import type { PixivSearchResponse, Work, WorksResponse } from '../../shared/types'
 import { api } from '../api'
 import { readRecommendationSource, writeRecommendationSource, type SearchSource } from '../library-state'
 import { createRecommendationSession } from '../recommendation-session'
+import { getLibrarySession, releaseLibrarySession, retainLibrarySession } from '../library-session'
+import { appEvents, type PixivAuthChangedPayload, type PixivBookmarkSyncedPayload } from '../events'
 import Icon from './Icon.vue'
 import WorkFavoriteActions from './WorkFavoriteActions.vue'
 import WorkMediaBadge from './WorkMediaBadge.vue'
 import SmoothThumbnail from './SmoothThumbnail.vue'
 
-const props = defineProps<{ work: Work; cloudEnabled?: boolean }>()
+const props = defineProps<{ work: Work; active?: boolean; cloudEnabled?: boolean }>()
 const emit = defineEmits<{ open: [work: Work, listKey: string]; favorite: [work: Work]; cloudFavorite: [work: Work]; notice: [message: string] }>()
+const isActive = computed(() => props.active ?? true)
+// 实例内来源：初始取全局默认，之后只归实例所有，返回不被别的作品重置。
 const source = ref<SearchSource>(readRecommendationSource())
 const items = ref<Work[]>([])
 const loading = ref(false)
@@ -18,48 +22,116 @@ const error = ref('')
 const page = ref(1)
 const pages = ref(1)
 const cursor = ref<string | null>(null)
+const ownedKeys = new Set<string>()
+// cloud 翻页去重：已见 id 跨页累积（服务端游标可能回吐重复）。
+const seenIds = new Set<string>()
 let loadVersion = 0
 let controller: AbortController | undefined
+// auth 版本：账号变化推进版本，迟到旧响应丢弃；inactive 只 clear+dirty，回来 reload。
+let authVersion = 0
+let cacheDirty = false
 const cloudAvailable = computed(() => Boolean(props.cloudEnabled && props.work.pixivId))
 
 if (!cloudAvailable.value && source.value === 'cloud') source.value = 'local'
 
 watch(source, value => writeRecommendationSource(value))
+watch(() => props.active ?? true, () => { /* 失活不中止未完成的本实例请求，回来直接用结果 */ })
 watch(() => [props.work.id, props.work.pixivId, source.value, cloudAvailable.value], () => { void load(true) }, { immediate: true })
-onBeforeUnmount(() => { loadVersion++; controller?.abort() })
+
+// 跨页同步：只收不发。auth 变化：清旧缓存并推进版本作废在途；
+// inactive 只 clear+dirty，回来（active）才 reload，避免后台请求。
+function handleAuthChanged() {
+  authVersion++
+  controller?.abort()
+  items.value = []
+  cursor.value = null
+  page.value = 1
+  pages.value = 1
+  error.value = ''
+  seenIds.clear()
+  cacheDirty = true
+  if (isActive.value) {
+    cacheDirty = false
+    void load(true)
+  }
+}
+// bookmark 同步：只更新本地 items；owned 会话镜像一并更新（详情前后翻页可用）。
+function handleBookmarkSynced(payload: PixivBookmarkSyncedPayload) {
+  const next = { bookmarked: payload.bookmarked, restrict: payload.restrict }
+  for (const item of items.value) {
+    if ((item.pixivId || item.externalId) === payload.illustId) item.cloudBookmark = next
+  }
+  for (const key of ownedKeys) {
+    const session = getLibrarySession(key)
+    if (!session) continue
+    for (const item of session.items) {
+      if ((item.pixivId || item.externalId) === payload.illustId) item.cloudBookmark = next
+    }
+  }
+}
+appEvents.on('pixiv:auth-changed', handleAuthChanged)
+appEvents.on('pixiv:bookmark-synced', handleBookmarkSynced)
+watch(isActive, active => {
+  if (active && cacheDirty) {
+    cacheDirty = false
+    void load(true)
+  }
+})
+onBeforeUnmount(() => { loadVersion++ })
+onUnmounted(() => {
+  loadVersion++
+  controller?.abort()
+  appEvents.off('pixiv:auth-changed', handleAuthChanged)
+  appEvents.off('pixiv:bookmark-synced', handleBookmarkSynced)
+  for (const key of ownedKeys) releaseLibrarySession(key)
+  ownedKeys.clear()
+})
 
 async function load(reset = false) {
   if (source.value === 'cloud' && !cloudAvailable.value) { source.value = 'local'; return }
   const version = ++loadVersion
+  const seenVersion = authVersion
   controller?.abort()
   controller = new AbortController()
   const signal = controller.signal
-  if (reset) { items.value = []; cursor.value = null; page.value = 1; pages.value = 1 }
+  if (reset) { items.value = []; seenIds.clear(); cursor.value = null; page.value = 1; pages.value = 1 }
   loading.value = true; error.value = ''
   try {
     if (source.value === 'cloud') {
       const params = new URLSearchParams()
       if (!reset && cursor.value) params.set('cursor', cursor.value)
       const response = await api<PixivSearchResponse>(`/pixiv/works/${encodeURIComponent(props.work.pixivId!)}/related?${params}`, { signal })
-      if (version !== loadVersion) return
-      items.value = reset ? response.items : [...items.value, ...response.items]
+      if (version !== loadVersion || seenVersion !== authVersion) return
+      const fresh = response.items.filter(item => !seenIds.has(item.id))
+      for (const item of fresh) seenIds.add(item.id)
+      // reset 也要过 seenIds：服务端可能首屏回吐，visited 保证不重复。
+      items.value = reset ? fresh : [...items.value, ...fresh]
       cursor.value = response.nextCursor
-      pages.value = response.nextCursor ? 2 : 1
-      page.value = reset ? 1 : page.value + 1
+      // 第 3 页起 nextCursor 仍可能存在：pages 跟随“还有下一页”走，不再固定 2。
+      if (reset) {
+        page.value = 1
+        pages.value = response.nextCursor ? 2 : 1
+      } else {
+        page.value = page.value + 1
+        pages.value = response.nextCursor ? page.value + 1 : page.value
+      }
     } else {
       const response = await api<WorksResponse>(`/works/${encodeURIComponent(props.work.id)}/related?page=${reset ? 1 : page.value + 1}`, { signal })
-      if (version !== loadVersion) return
-      items.value = reset ? response.items : [...items.value, ...response.items]
+      if (version !== loadVersion || seenVersion !== authVersion) return
+      const fresh = reset ? response.items : response.items.filter(item => !seenIds.has(item.id))
+      for (const item of response.items) seenIds.add(item.id)
+      items.value = reset ? fresh : [...items.value, ...fresh]
       page.value = response.page
       pages.value = response.pages
     }
   } catch (e) {
-    if (version !== loadVersion) return
+    if (version !== loadVersion || seenVersion !== authVersion) return
     const message = (e as Error).message
     if (reset || !items.value.length) error.value = message
-    else emit('notice', `加载更多失败：${message}`)
+    // 后台 notice 只当 active 才发：失活页的失败不串到前台。
+    else if (isActive.value) emit('notice', `加载更多失败：${message}`)
   }
-  finally { if (version === loadVersion) loading.value = false }
+  finally { if (version === loadVersion && seenVersion === authVersion) loading.value = false }
 }
 
 function changeSource(value: SearchSource) {
@@ -72,6 +144,8 @@ function openWork(work: Work) {
     workId: props.work.id, pixivId: props.work.pixivId, source: source.value,
     items: items.value, page: page.value, pages: pages.value, cursor: cursor.value,
   })
+  ownedKeys.add(listKey)
+  retainLibrarySession(listKey)
   emit('open', work, listKey)
 }
 </script>

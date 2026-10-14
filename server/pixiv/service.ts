@@ -28,7 +28,10 @@ export function fetchIllustRecord(value: string, fullDetail = true): Promise<Pix
   const version = getPixivSessionVersion()
   const stored = getPixivWorkRecord(uid, id)
   const complete = stored && stored.meta.pages.length === stored.work.count && stored.meta.pages.every(page => !isPixivPlaceholder(page.preview) && !isPixivPlaceholder(page.original))
-  if (stored && ((!fullDetail && stored.meta.pages.some(page => !isPixivPlaceholder(page.preview))) || (complete && stored.meta.bookmarkTags !== undefined && Date.now() - (stored.meta.detailFetchedAt || 0) < DETAIL_TTL_MS))) return Promise.resolve(stored)
+  const storedUser = stored?.work.pixivUserId && /^[1-9]\d*$/.test(stored.work.pixivUserId) ? stored.work.pixivUserId : undefined
+  // fullDetail 且旧记录缺画师 ID 时刷新一次回填；上游确实缺 user 则标记避免重复。
+  const needsUser = fullDetail && !storedUser && Date.now() - (stored?.meta.userCheckedAt || 0) >= DETAIL_TTL_MS
+  if (stored && !needsUser && ((!fullDetail && stored.meta.pages.some(page => !isPixivPlaceholder(page.preview))) || (complete && stored.meta.bookmarkTags !== undefined && Date.now() - (stored.meta.detailFetchedAt || 0) < DETAIL_TTL_MS))) return Promise.resolve(stored)
   const key = `${version}:${uid}:${id}`
   const existing = details.get(key)
   if (existing) return existing
@@ -41,7 +44,11 @@ export function fetchIllustRecord(value: string, fullDetail = true): Promise<Pix
     if (response.illust.visible === false || record.meta.pages.some(page => isPixivPlaceholder(page.preview))) throw new PixivApiError('Pixiv 作品已删除或当前账号不可见', 403, 'content_unavailable')
     if (record.meta.pages.length !== record.work.count) throw new PixivApiError('Pixiv 多页作品详情不完整，请重试', 502, 'invalid_response')
     record.meta.detailFetchedAt = Date.now()
+    record.meta.userCheckedAt = Date.now()
     if (stored?.meta.ugoira) record.meta.ugoira = stored.meta.ugoira
+    if (!record.work.pixivUserId) {
+      if (storedUser) record.work = { ...record.work, pixivUserId: storedUser }
+    }
     savePixivWorkRecords(uid, [record])
     return record
   })().finally(() => details.delete(key))
