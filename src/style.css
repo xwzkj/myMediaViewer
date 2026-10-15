@@ -185,9 +185,10 @@
     margin:0;
     padding:28px max(30px,calc((100% - 900px)/2)) max(36px,env(safe-area-inset-bottom));
   }
+  /* 外层铺满当前视口；仅窄屏图片区使用 svh 保持高度稳定。 */
   .viewer-page {
     width:100%;
-    height:100svh;
+    height:100dvh;
     overflow:hidden;
     background:var(--surface);
   }
@@ -214,7 +215,7 @@
     }
     .viewer-page>.viewer-content {
       height:auto;
-      min-height:100svh;
+      min-height:100dvh;
       overflow:visible;
       overscroll-behavior:auto;
     }
