@@ -13,11 +13,12 @@ import { scanLibrary, scanStatus, onScan, sourceOnline } from './scanner.js'
 import { accessibleAsset, sendMedia, thumbnail, detectFFmpeg, ffmpegAvailable, convert, conversionStatus, conversionPath } from './media.js'
 import type { Source, LibraryStatus, AiTranslateFields } from '../shared/types.js'
 import { sourcePreset } from '../shared/source-presets.js'
+import { AI_THINKING_LEVELS } from '../shared/ai-thinking.js'
 import { sourceContainsPixivWorks } from '../shared/source-identity.js'
 import { localPixivId } from './pixiv/identity.js'
 import { validateRules } from './source-sandbox.js'
 import { sourceTreeSample } from './source-tree.js'
-import { sourceAiTurn, forgetSourceAiConversation, type SourceAiTurn } from './source-ai.js'
+import { sourceAiTurn, forgetSourceAiConversation, answerSourceAiQuestion, type SourceAiTurn } from './source-ai.js'
 import { previewSource, calculatePreviewGroup } from './source-engine.js'
 import { listDirectories } from './directories.js'
 import { getAiSettings, saveAiSettings, testAiConnection, listAiModels, translateFields, clearTranslationCache } from './ai.js'
@@ -146,11 +147,32 @@ export async function createApp(logging = true) {
   })
   app.post<{Body:SourceAiTurn}>('/api/sources/ai/chat', {
     bodyLimit:256*1024,
-    schema:{body:{type:'object',additionalProperties:false,required:['sampleToken','message'],properties:{
-      sampleToken:{type:'string',minLength:1,maxLength:80},conversationId:{type:'string',minLength:1,maxLength:80},
-      message:{type:'string',minLength:1,maxLength:4000},currentRules:{type:'object',additionalProperties:true},ignoreCustomParams:{type:'boolean'},
+    schema:{body:{type:'object',additionalProperties:false,required:['message'],properties:{
+      path:{type:'string',minLength:1,maxLength:2048},sampleToken:{type:'string',minLength:1,maxLength:80},conversationId:{type:'string',minLength:1,maxLength:80},
+      message:{type:'string',maxLength:4000},currentRules:{type:'object',additionalProperties:true},ignoreCustomParams:{type:'boolean'},thinkingLevel:{type:'string',enum:AI_THINKING_LEVELS as unknown as string[]},
     }}},
   }, async request => sourceAiTurn(request.body))
+  app.post<{Body:SourceAiTurn}>('/api/sources/ai/chat/stream', { bodyLimit:256*1024 }, async (request, reply) => {
+    reply.hijack()
+    const raw = reply.raw
+    raw.writeHead(200, { 'Content-Type':'text/event-stream; charset=utf-8', 'Cache-Control':'no-cache, no-transform', Connection:'keep-alive', 'X-Accel-Buffering':'no' })
+    const send = (event: unknown) => { if (!raw.destroyed) raw.write(`data: ${JSON.stringify(event)}\n\n`) }
+    // 客户端断开（取消本轮或关掉页面）时中止上游请求与等待中的提问，不再烧额度。
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    raw.on('close', abort)
+    try {
+      const result = await sourceAiTurn(request.body, { onEvent: send, signal: controller.signal })
+      send({ type:'result', result })
+      send({ type:'done' })
+    } catch (error) {
+      const e = error as Error & { statusCode?: number }
+      send({ type:'error', message:e.message || '请求处理失败', status:e.statusCode || 500 })
+    } finally { raw.off('close', abort); raw.end() }
+  })
+  app.post<{Body:{questionId:string;answer:string}}>('/api/sources/ai/chat/answer', {
+    schema:{body:{type:'object',additionalProperties:false,required:['questionId','answer'],properties:{questionId:{type:'string',minLength:1,maxLength:80},answer:{type:'string',maxLength:2000}}}},
+  }, async request => { answerSourceAiQuestion(request.body.questionId, request.body.answer); return {ok:true} })
   app.delete<{Params:{id:string}}>('/api/sources/ai/chat/:id', async request => {
     forgetSourceAiConversation(request.params.id); return {ok:true}
   })

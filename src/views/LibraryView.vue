@@ -2,7 +2,7 @@
 import { ref, computed, onActivated, onDeactivated, onMounted, onUnmounted, watch, watchEffect, nextTick } from 'vue'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import type { LibraryStatus, PixivSearchResponse, PixivSearchSuggestionsResponse, PixivStatus, PixivUserSearchResponse, PixivUserSummary, TagSuggestionsResponse, Work, WorksResponse } from '../../shared/types'
-import { activeSearchToken, replaceWithTag, replaceTrailingSearchToken, trailingSearchToken } from '../../shared/search-query'
+import { activeSearchToken, replaceWithTag, replaceTrailingSearchToken, tagQuery, trailingSearchToken } from '../../shared/search-query'
 import { isPixivSearchTarget, pixivSearchTargets } from '../../shared/pixiv-search'
 import { api, formatNumber } from '../api'
 import { appEvents, type PixivAuthChangedPayload, type PixivBookmarkSyncedPayload, type WorkReturnPayload } from '../events'
@@ -28,11 +28,15 @@ const { route: pageRoute, active: pageActive, pageKey } = usePageRoute()
 const route = pageRoute
 // 每个列表路由由独立的 KeepAlive 实例负责，搜索页按 pid 独立缓存。
 const pagePath = ref(route.value.fullPath)
+const scrollStorageKey = `myMediaViewer:scroll:${pageKey}`
+function readSavedScroll(): number {
+  try { const value = Number(sessionStorage.getItem(scrollStorageKey)); return Number.isFinite(value) && value > 0 ? value : 0 } catch { return 0 }
+}
 const pendingWorkId = ref('')
 let pendingScrollToken = 0
 // 普通返回滚动记忆：离开列表前记 scrollY，回来无 changed 锚时恢复；
 // changed 锚定位成功即同步更新，避免普通恢复覆盖锚点。
-const savedScrollY = ref(0)
+const savedScrollY = ref(readSavedScroll())
 const status = ref<LibraryStatus | null>(null)
 // 媒体库、本地搜索、云搜索分别记忆；搜索排序不得再覆盖媒体库排序。
 migrateLegacyLibraryState()
@@ -110,6 +114,8 @@ const busyFavorites = new Set<string>()
 const suggestions = ref<Array<{ name: string; count?: number; translatedName?: string }>>([])
 const suggestionTotal = ref(0)
 const suggestionOpen = ref(false)
+const suggestionLoading = ref(false)
+const suggestionTerm = ref('')
 const suggestionIndex = ref(-1)
 const searchInput = ref<HTMLInputElement>()
 let poll: ReturnType<typeof setInterval>
@@ -151,7 +157,7 @@ function queueLoadWorks(): void {
   })
 }
 
-const suggestionsVisible = computed(() => suggestionOpen.value && suggestions.value.length > 0)
+const suggestionsVisible = computed(() => suggestionOpen.value && (suggestionLoading.value || suggestions.value.length > 0 || Boolean(suggestionTerm.value)))
 const currentSource = computed(() => status.value?.sources.find(s => s.id === source.value))
 const sourceOptions = computed(() => status.value?.sources || [])
 // 顶部工具条吸顶后才显示分隔线，滚动时和内容区分开。
@@ -481,18 +487,38 @@ async function toggleCloudFavorite(work: Work) {
   } catch (e) { notice((e as Error).message) }
   finally { busyFavorites.delete(busyKey) }
 }
-function closeSuggestions() { clearTimeout(suggestionTimer); suggestionController?.abort(); suggestionController = undefined; suggestionOpen.value = false; suggestionIndex.value = -1 }
+function closeSuggestions() { clearTimeout(suggestionTimer); suggestionController?.abort(); suggestionController = undefined; suggestionOpen.value = false; suggestionLoading.value = false; suggestionTerm.value = ''; suggestions.value = []; suggestionIndex.value = -1 }
 function blurSuggestions() { clearTimeout(blurTimer); blurTimer = setTimeout(closeSuggestions, 160) }
-function queueSuggestions() { closeSuggestions(); suggestions.value = []; suggestionTimer = setTimeout(loadSuggestions, 140) }
+function queueSuggestions() {
+  clearTimeout(suggestionTimer)
+  suggestionController?.abort()
+  suggestionController = undefined
+  suggestions.value = []
+  suggestionTotal.value = 0
+  suggestionIndex.value = -1
+  const target = searchSource.value
+  const term = activeSearchToken(query.value, caret).value.trim().slice(0, 100)
+  // 建议始终基于光标所在的关键词；本地搜索空关键词时不触发请求。
+  if (isUserEntity.value || !term || (target === 'cloud' && !cloudEnabled.value)) {
+    suggestionOpen.value = false
+    suggestionLoading.value = false
+    suggestionTerm.value = ''
+    return
+  }
+  suggestionTerm.value = term
+  suggestionOpen.value = true
+  suggestionLoading.value = true
+  suggestionTimer = setTimeout(loadSuggestions, 140)
+}
 async function loadSuggestions() {
   if (isUserEntity.value) return
   suggestionController?.abort()
   const active = new AbortController()
   suggestionController = active
   const target = searchSource.value
-  const term = (target === 'cloud' ? trailingSearchToken(query.value) : activeSearchToken(query.value, caret)).value.trim().slice(0, 100)
+  const term = activeSearchToken(query.value, caret).value.trim().slice(0, 100)
   const draft = query.value
-  if (target === 'cloud' && (!term || !cloudEnabled.value)) return
+  if (!term || (target === 'cloud' && !cloudEnabled.value)) { suggestionLoading.value = false; return }
   try {
     const response = target === 'cloud'
       ? await api<PixivSearchSuggestionsResponse>(`/pixiv/suggestions?q=${encodeURIComponent(term)}`, { signal: active.signal })
@@ -501,8 +527,11 @@ async function loadSuggestions() {
     suggestions.value = response.items
     suggestionTotal.value = 'total' in response ? response.total : response.items.length
     suggestionIndex.value = -1
-    suggestionOpen.value = response.items.length > 0
-  } catch { /* 建议列表不可用时不影响正常搜索 */ }
+    suggestionLoading.value = false
+    suggestionOpen.value = true
+  } catch {
+    if (suggestionController === active) { suggestionLoading.value = false; suggestionOpen.value = false }
+  }
 }
 function focusSearch() { clearTimeout(blurTimer); caret = searchInput.value?.selectionStart ?? query.value.length; queueSuggestions() }
 function updateCaret(event: Event) {
@@ -526,7 +555,11 @@ function moveSuggestion(direction: number) {
 function commitSuggestion(position = suggestionIndex.value) {
   const item = suggestions.value[position]
   if (!item) return
-  const next = searchSource.value === 'cloud' ? replaceTrailingSearchToken(query.value, item.name) : replaceWithTag(query.value, caret, item.name)
+  // 本地与云端建议都替换光标所在的关键词；云端不添加标签前缀。
+  const token = activeSearchToken(query.value, caret)
+  const replacement = searchSource.value === 'cloud' ? item.name : tagQuery(item.name)
+  const nextQuery = query.value.slice(0, token.start) + replacement + query.value.slice(token.end)
+  const next = { query: `${nextQuery}${searchSource.value === 'local' ? ' ' : ''}`, caret: nextQuery.length + (searchSource.value === 'local' ? 1 : 0) }
   query.value = next.query
   caret = next.caret
   closeSuggestions()
@@ -599,6 +632,11 @@ function switchSearchMode() {
   searchSource.value = next
   closeSuggestions()
   searchInput.value?.focus()
+  // 搜索方式属于结果维度；已有关键词时立即切换结果，避免还要再次按搜索。
+  if (query.value.trim()) {
+    submitSearch()
+    return
+  }
   queueSuggestions()
 }
 function listTarget() {
@@ -713,6 +751,7 @@ watch(() => route.value.fullPath, () => {
 }, { immediate: true })
 watch([view, source, kind, sort, fuzzy, order, seed, cloudSort], () => {
   if (!pageActive.value || route.value.name === 'cloudSearch') return
+  // 筛选/排序由菜单直接修改时也立即刷新，不要求用户再次提交搜索。
   queueLoadWorks()
 })
 watchLibraryMemory(
@@ -956,6 +995,7 @@ onActivated(() => {
 // 由本页统一恢复（changed 锚优先，普通恢复兜底）。
 onBeforeRouteLeave(() => {
   savedScrollY.value = window.scrollY
+  try { sessionStorage.setItem(scrollStorageKey, String(savedScrollY.value)) } catch { /* best effort */ }
 })
 onDeactivated(() => {
   dismiss()
@@ -1004,7 +1044,7 @@ onUnmounted(() => {
             <input ref="searchInput" v-model="query" type="text" :aria-label="searchSource === 'cloud' ? (isUserEntity ? '云搜索作者' : '云搜索作品') : '搜索作品'" :placeholder="searchSource === 'cloud' ? (isUserEntity ? '输入作者名，按 Enter 搜索…' : '输入关键词，按 Enter 搜索…') : '搜索标题、描述、作者或标签…'" maxlength="500" role="combobox" aria-autocomplete="list" aria-controls="tag-suggestions" :aria-expanded="suggestionsVisible" :aria-activedescendant="suggestionsVisible && suggestionIndex >= 0 ? 'tag-suggestion-' + suggestionIndex : undefined" @focus="focusSearch" @input="updateCaret" @click="updateCaret" @keyup="searchKeyup" @keydown.down.prevent="moveSuggestion(1)" @keydown.up.prevent="moveSuggestion(-1)" @keydown.enter="submitSearch" @keydown.esc="closeSuggestions" @blur="blurSuggestions" />
             <button v-if="query" class="icon-button small-icon" type="button" aria-label="清空搜索" @click="clearSearch"><Icon name="close" :size="19" /></button>
             <button class="search-submit" type="button" aria-label="执行搜索" title="搜索（Enter）" @click="submitSearch()"><Icon name="search" :size="22" /></button>
-            <div v-if="suggestionsVisible" id="tag-suggestions" class="tag-suggestions" role="listbox" aria-label="标签搜索建议"><div class="suggestion-heading"><Icon name="tag" :size="15" /><span>{{ searchSource === 'cloud' ? '云搜索建议' : '按标签搜索' }}</span><b v-if="suggestionTotal > suggestions.length">还有 {{ formatNumber(suggestionTotal - suggestions.length) }} 个匹配标签</b></div><button v-for="(item, i) in suggestions" :id="'tag-suggestion-' + i" :key="item.name" type="button" class="tag-suggestion" :class="{ active: i === suggestionIndex }" role="option" :aria-selected="i === suggestionIndex" @mousedown.prevent @click="commitSuggestion(i)" @mouseenter="suggestionIndex = i"><span>{{ searchSource === 'cloud' ? item.name : '#' + item.name }}</span><small v-if="searchSource === 'local'">{{ formatNumber(item.count || 0) }} 组</small><small v-else-if="item.translatedName && item.translatedName !== item.name">{{ item.translatedName }}</small></button></div>
+            <div v-if="suggestionsVisible" id="tag-suggestions" class="tag-suggestions" role="listbox" aria-label="标签搜索建议"><div class="suggestion-heading"><Icon name="tag" :size="15" /><span>{{ searchSource === 'cloud' ? '云搜索建议' : '按标签搜索' }}</span><b v-if="suggestionLoading">正在加载…</b><b v-else-if="!suggestions.length">暂无匹配建议</b><b v-else-if="suggestionTotal > suggestions.length">还有 {{ formatNumber(suggestionTotal - suggestions.length) }} 个匹配标签</b></div><button v-for="(item, i) in suggestions" :id="'tag-suggestion-' + i" :key="item.name" type="button" class="tag-suggestion" :class="{ active: i === suggestionIndex }" role="option" :aria-selected="i === suggestionIndex" @mousedown.prevent @click="commitSuggestion(i)" @mouseenter="suggestionIndex = i"><span>{{ searchSource === 'cloud' ? item.name : '#' + item.name }}</span><small v-if="searchSource === 'local'">{{ formatNumber(item.count || 0) }} 组</small><small v-else-if="item.translatedName && item.translatedName !== item.name">{{ item.translatedName }}</small></button></div>
           </div>
           <!-- users 实体无任何筛选/排序功能：整个按钮隐藏，不留空菜单 -->
           <button v-if="!isUserEntity" ref="menuButton" class="icon-button menu-button" :class="{ active: filtersActive }" :aria-expanded="menuOpen" aria-haspopup="true" :title="filtersActive ? '筛选与排序（已应用筛选）' : '筛选与排序'" @click="menuOpen = !menuOpen"><Icon name="tune" :size="21" /><span v-if="filtersActive" class="menu-dot" /></button>

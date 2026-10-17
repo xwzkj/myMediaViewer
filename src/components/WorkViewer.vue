@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, onBeforeUnmount, onUnmounted, onActivated, onDeactivated, watch } from 'vue'
+import { ref, computed, nextTick, onBeforeUnmount, onUnmounted, onActivated, onDeactivated, onMounted, watch } from 'vue'
 import type { AiTranslateFields, AiTranslateResult, MangaJob, MangaPageResult, WorkDetail, Work } from '../../shared/types'
 import { Viewer } from 'v-viewer'
 import { api, formatSize, kindLabel } from '../api'
@@ -21,7 +21,11 @@ const filmstrip = ref<HTMLElement>()
 const images = createViewerImageCache()
 let drawVersion = 0
 const video = ref<HTMLVideoElement>()
-onBeforeUnmount(() => { if (root.value) releaseVideos(root.value) })
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', keyboard)
+  if (root.value) releaseVideos(root.value)
+})
+onMounted(() => window.addEventListener('keydown', keyboard))
 const detail = computed(() => props.work)
 const index = ref(0)
 const mediaError = ref(false)
@@ -241,7 +245,31 @@ onDeactivated(() => {
 })
 // 详情由作品页统一加载；切换作品后直接使用新资源，并回到第一张。
 // 跨作品清可续查句柄：旧 job 绝不串新作品；旧 timer 一并清除。
-watch(() => props.work.id, () => { index.value = 0; destroyPreview(); mediaError.value = false; mediaRetryToken.value = 0; compatible.value = false; ugoiraImageFallback.value = false; converting.value = false; convertMessage.value = ''; originalAssets.value = new Set(); translation.value = null; translationError.value = ''; translationDisplay.value = 'translated'; resumableMangaJobId = ''; resumableConversionAssetId = ''; clearTimeout(mangaTimer); mangaTimer = undefined; clearTimeout(conversionTimer); conversionTimer = undefined; resetManga() })
+watch(() => props.work.id, () => {
+  index.value = 0
+  slide.value = 1
+  dragX.value = 0
+  gesture = null
+  suppressClick = false
+  destroyPreview()
+  mediaError.value = false
+  mediaRetryToken.value = 0
+  compatible.value = false
+  ugoiraImageFallback.value = false
+  converting.value = false
+  convertMessage.value = ''
+  originalAssets.value = new Set()
+  translation.value = null
+  translationError.value = ''
+  translationDisplay.value = 'translated'
+  resumableMangaJobId = ''
+  resumableConversionAssetId = ''
+  clearTimeout(mangaTimer)
+  mangaTimer = undefined
+  clearTimeout(conversionTimer)
+  conversionTimer = undefined
+  resetManga()
+})
 onUnmounted(() => { disposed = true; drawVersion++; images.clear(); destroyPreview(); stopSlideshowTimer(); clearTimeout(conversionTimer); clearTimeout(mangaTimer) })
 watch(index, async () => {
   destroyPreview()
@@ -348,9 +376,25 @@ const slideName = computed(() => slide.value >= 0 ? 'media-next' : 'media-prev')
 let gesture: { pointerId: number; startX: number; startY: number; mode: 'page' | 'work' | 'ignore' } | null = null
 let suppressClick = false
 // viewer.js 浮层实例，以及给它提供图片的隐藏节点。
+type PreviewAsset = { item: WorkDetail['assets'][number]; pageIndex: number }
+type PreviewSession = {
+  id: number
+  workId: string
+  viewer: InstanceType<typeof Viewer>
+  token: HTMLDivElement
+  assets: PreviewAsset[]
+  currentIndex: number
+  closing: boolean
+  cleaned: boolean
+}
 let preview: InstanceType<typeof Viewer> | undefined
 let previewToken: HTMLDivElement | undefined
+let previewSession: PreviewSession | undefined
+let previewSessionId = 0
 let previewDestroying = false
+const previewAssets = computed<PreviewAsset[]>(() => (detail.value?.assets || [])
+  .map((item, pageIndex) => ({ item, pageIndex }))
+  .filter(({ item }) => item.kind === 'image' && item.extension !== 'webm'))
 function gestureMode(target: EventTarget | null): 'page' | 'work' | 'ignore' {
   if (!(target instanceof Element)) return 'ignore'
   // viewer.js 浮层里的手势交给它自己处理。
@@ -435,50 +479,105 @@ function handleVideoError(event: Event) {
   mediaError.value = true
 }
 function openPreview() {
-  if (suppressClick || !asset.value) return
+  if (suppressClick || !asset.value || asset.value.kind !== 'image') return
   const host = root.value
   if (!host) return
+  const assets = previewAssets.value
+  if (!assets.length) return
   const translated = mangaResult.value && mangaMode.value === 'translated' && mangaCanvas.value
-  if (!translated && asset.value.origin === 'pixiv' && asset.value.kind === 'image') {
+  if (!translated && asset.value.origin === 'pixiv') {
     originalAssets.value = new Set([...originalAssets.value, asset.value.id])
   }
-  destroyPreview()
+  // A main-viewer page change tears down the old preview without allowing its late
+  // hidden callback to put the old page back into the main viewer.
+  destroyPreview(false)
+  const currentId = asset.value.id
+  const currentIndex = assets.findIndex(({ item }) => item.id === currentId)
+  const initialIndex = currentIndex >= 0 ? currentIndex : 0
   const token = document.createElement('div')
   token.style.display = 'none'
-  const image = document.createElement('img')
-  // 译图以 Canvas 叠加呈现，预览时把同一份结果编码进去，避免看到未回填的原图。
-  image.src = translated
-    ? translated.toDataURL('image/png')
-    : mediaUrl.value!
-  image.alt = props.work.title
-  token.appendChild(image)
-  // 放大预览挂在作品页内，随页面卸载一起清理。
+  assets.forEach(({ item }, pageIndex) => {
+    const image = document.createElement('img')
+    // 译图以 Canvas 叠加呈现，预览当前页时保留译图；其他页使用原图。
+    image.src = pageIndex === initialIndex && translated
+      ? translated.toDataURL('image/png')
+      : item.url
+    image.alt = `${props.work.title}，第 ${item.page + 1} 张`
+    token.appendChild(image)
+  })
   host.appendChild(token)
-  previewToken = token
-  previewing.value = true
+
+  // Keep the filtered preview list and its mapping alive for the whole viewer
+  // session.  The computed list may change after the main page changes, which
+  // must never change the meaning of viewer.js's local index.
+  const session: PreviewSession = {
+    id: ++previewSessionId,
+    workId: props.work.id,
+    viewer: undefined as unknown as InstanceType<typeof Viewer>,
+    token,
+    assets,
+    currentIndex: initialIndex,
+    closing: false,
+    cleaned: false,
+  }
+  const syncSessionPage = () => {
+    if (session.cleaned || previewSession !== session || session.workId !== props.work.id) return
+    const viewed = session.assets[session.currentIndex]
+    if (viewed && viewed.pageIndex !== index.value) selectPage(viewed.pageIndex)
+  }
   const instance = new Viewer(token, {
     container: host,
     zIndex: 2200,
+    className: 'media-preview',
     navbar: false,
+    navigation: assets.length > 1,
     title: false,
     fullscreen: false,
     keyboard: true,
+    loop: false,
+    initialViewIndex: initialIndex,
     backdrop: true,
     movable: true,
     zoomable: true,
-    rotatable: true,
-    scalable: true,
+    // 图片查看器默认支持旋转/翻转，容易把误触当成操作；这里明确关闭，仅保留缩放、拖拽和 1:1。
+    rotatable: false,
+    rotateOnGesture: false,
+    rotateOnTouch: false,
+    scalable: false,
     zoomOnWheel: true,
     zoomRatio: 0.3,
     zoomOnTouch: true,
     zoomOnGesture: true,
-    slideOnTouch: false,
+    slideOnTouch: true,
+    slideOnWheel: false,
     toggleOnDblclick: true,
     tooltip: true,
-    toolbar: { zoomIn: true, zoomOut: true, oneToOne: true, reset: true, rotateLeft: true, rotateRight: true, prev: false, next: false, play: false, flipHorizontal: true, flipVertical: true },
-    hidden: () => { previewing.value = false; setTimeout(() => { if (!previewing.value) destroyPreview() }, 0) }
+    toolbar: { zoomIn: true, zoomOut: true, oneToOne: true, reset: true, prev: false, next: false, play: false },
+    view: event => {
+      // view fires when viewer.js commits a navigation (before image loading),
+      // so a close during a slide transition still captures the target index.
+      if (previewSession === session && !session.cleaned && !session.closing) session.currentIndex = event.detail.index
+    },
+    viewed: event => {
+      // Keep the final loaded index as a second guard for touch/keyboard races.
+      if (previewSession === session && !session.cleaned && !session.closing) session.currentIndex = event.detail.index
+    },
+    hidden: () => {
+      if (previewSession !== session || session.cleaned) return
+      // destroyPreview(false) already owns the main-viewer transition.  A late
+      // hidden event from that destroy must only clean up, never re-apply a stale page.
+      if (!session.closing) syncSessionPage()
+      session.closing = true
+      // hidden is the normal viewer.js close path; clean up the now-hidden
+      // instance once (destroy() will not dispatch hidden again).
+      destroyPreview(false)
+    },
   })
+  session.viewer = instance
+  previewSession = session
   preview = instance
+  previewToken = token
+  previewing.value = true
   instance.show()
   bindBackdropClose(host)
 }
@@ -496,14 +595,37 @@ function bindBackdropClose(host: HTMLElement) {
     if (target.classList.contains('viewer-container') || target.classList.contains('viewer-canvas')) destroyPreview()
   })
 }
-function destroyPreview() {
+function destroyPreview(sync = true) {
   if (previewDestroying) return
+  const session = previewSession
+  if (!session) {
+    preview?.destroy()
+    preview = undefined
+    previewToken?.remove()
+    previewToken = undefined
+    previewing.value = false
+    return
+  }
   previewDestroying = true
-  try { preview?.destroy() } catch { /* 浮层可能已经关闭 */ }
-  preview = undefined
-  previewToken?.remove()
-  previewToken = undefined
-  previewing.value = false
+  // Mark the session closing before viewer.js dispatches hidden synchronously;
+  // the callback then performs the final one-time sync and cleanup itself.
+  session.closing = true
+  if (sync) {
+    // When called by an explicit close, viewer.js's current index is authoritative.
+    // This path is also safe if hidden is delivered synchronously by destroy().
+    const viewed = session.assets[session.currentIndex]
+    if (viewed && viewed.pageIndex !== index.value) selectPage(viewed.pageIndex)
+  }
+  try { session.viewer.destroy() } catch { /* 浮层可能已经关闭 */ }
+  session.viewer = undefined as unknown as InstanceType<typeof Viewer>
+  session.cleaned = true
+  session.token.remove()
+  if (previewSession === session) {
+    previewSession = undefined
+    preview = undefined
+    previewToken = undefined
+    previewing.value = false
+  }
   previewDestroying = false
 }
 function selectPage(target: number) {
@@ -511,8 +633,9 @@ function selectPage(target: number) {
   index.value = target
 }
 function keyboard(event: KeyboardEvent) {
-  if (previewing.value) return
-  if ((event.target as HTMLElement).matches('input,textarea,video')) return
+  if (!isActive.value || previewing.value) return
+  const target = event.target
+  if (target instanceof HTMLElement && target.matches('input,textarea,video,button,select')) return
   if (event.key === 'ArrowRight') { event.preventDefault(); next(1) }
   if (event.key === 'ArrowLeft') { event.preventDefault(); next(-1) }
 }

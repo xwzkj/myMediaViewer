@@ -9,7 +9,7 @@ import FileRuleControl from './FileRuleControl.vue'
 import AppSelect from './AppSelect.vue'
 import { api } from '../api'
 const props = defineProps<{ modelValue: SourceRules; folder: string; name: string; disabled?: boolean }>()
-const emit = defineEmits<{ 'update:modelValue': [SourceRules]; 'preview-errors': [boolean]; busy: [boolean]; invalid: [boolean]; preset: [string] }>()
+const emit = defineEmits<{ 'update:modelValue': [SourceRules]; 'preview-errors': [boolean]; busy: [boolean]; 'ai-busy': [boolean]; invalid: [boolean]; preset: [string] }>()
 const preview = ref<SourcePreview | null>(null), error = ref(''), loading = ref(false), overrides = ref(''), overrideError = ref('')
 const calculating = ref<number | null>(null)
 const jsIssues = computed(() => scriptIssues(props.modelValue.script))
@@ -61,7 +61,8 @@ async function calculate(index: number) {
     <legend>文件分组与元信息</legend>
     <div class="preset-actions"><span>套用预设</span><button type="button" class="button text small" @click="applyPreset('pixiv')">Pixiv</button><button type="button" class="button text small" @click="applyPreset('telegram')">Telegram</button><button type="button" class="button text small" @click="applyPreset('custom')">自定义</button><button type="button" class="button text small" @click="pathExample">目录 / 文件名示例</button></div>
     <p class="helper">套用示例会替换规则和脚本。更改分组 ID 或范围可能产生新作品身份，旧收藏不会自动映射。</p>
-    <SourceAiPanel :folder="folder" :rules="modelValue" :disabled="disabled || loading" @apply="emit('update:modelValue',$event)" @busy="emit('busy',$event)" />
+    <!-- AI 生成期间不能禁用整个 fieldset：取消本轮、回答提问都必须在里面可用。 -->
+    <SourceAiPanel :folder="folder" :rules="modelValue" :disabled="disabled || loading" @apply="emit('update:modelValue',$event)" @busy="emit('ai-busy',$event)" />
     <section class="rule-guide">
       <h4>规则如何决定分组</h4>
       <p>规则从文件名或相对路径中提取字段。<code>id</code> 相同的媒体归为同一组；<code>page</code> 决定组内页码。作者、标题等其他字段保存在 <code>captures</code>，由脚本生成元信息。</p>

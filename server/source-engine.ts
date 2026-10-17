@@ -159,6 +159,34 @@ export async function previewSource(source: Source): Promise<SourcePreview> {
   return {...result, token}
 }
 
+export interface RulesPreviewGroup { id: string; directory: string; media: number; metadata: number; sample: string[] }
+export interface RulesPreviewSummary { enumerated: number; matched: number; groupCount: number; truncated: boolean; errors: string[]; groups: RulesPreviewGroup[] }
+
+/**
+ * 规则自检：只做分组，不读元文件、不跑脚本，返回紧凑摘要。
+ * 供 AI 的 preview_rules 工具与界面「自动预览」共用，不占用预览会话。
+ */
+export async function summarizeRules(folder: string, rules: SourceRules, options: { fileLimit?: number; groupLimit?: number; sampleLimit?: number } = {}): Promise<RulesPreviewSummary> {
+  const source: Source = { id: 'preview', name: '预览', path: folder, kind: 'custom', rules }
+  const collected = await collectGroups(source, options.fileLimit ?? 3000)
+  const groupLimit = options.groupLimit ?? 12, sampleLimit = options.sampleLimit ?? 8
+  const groups = collected.groups.filter(group => group.entries.some(entry => !entry.metadata))
+  return {
+    enumerated: collected.enumerated,
+    matched: groups.reduce((sum, group) => sum + group.entries.filter(entry => !entry.metadata).length, 0),
+    groupCount: groups.length,
+    truncated: collected.truncated || groups.length > groupLimit,
+    errors: collected.errors.slice(0, 20),
+    groups: groups.slice(0, groupLimit).map(group => ({
+      id: group.id,
+      directory: group.directory,
+      media: group.entries.filter(entry => !entry.metadata).length,
+      metadata: group.entries.filter(entry => entry.metadata).length,
+      sample: group.entries.filter(entry => !entry.metadata).slice(0, sampleLimit).map(entry => entry.relativePath),
+    })),
+  }
+}
+
 const previews = new Map<string, {source: Source; groups: Group[]; expires: number}>()
 function prunePreviews() { for (const [key, value] of previews) if (value.expires < Date.now()) previews.delete(key) }
 export async function calculatePreviewGroup(token: string, index: number): Promise<MetadataFields> {

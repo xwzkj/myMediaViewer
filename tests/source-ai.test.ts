@@ -39,7 +39,10 @@ test('AI 规则生成：受限目录树、复用设置、草稿配置、多轮�
     const first=await send('按作品 ID 分组',{currentRules:customRules()})
     assert.equal(first.statusCode,200,first.body)
     const conversationId=first.json().conversationId
-    assert.ok(conversationId);assert.equal(JSON.parse(calls[0].body.messages.at(-1).content).currentRules,undefined)
+    assert.ok(conversationId)
+    // 用户消息是纯文本 + TOON，不再用 JSON；空白预设不带当前配置。
+    assert.ok(calls[0].body.messages.at(-1).content.startsWith('用户要求：按作品 ID 分组'), calls[0].body.messages.at(-1).content)
+    assert.ok(!calls[0].body.messages.at(-1).content.includes('当前编辑器配置（TOON'))
     assert.equal(calls[0].url,'https://ai.example.test/v1/chat/completions')
     assert.equal(calls[0].headers.get('Authorization'),'Bearer test-private-token')
     assert.equal(calls[0].body.model,'test-model');assert.equal(calls[0].body.stream,false)
@@ -55,18 +58,23 @@ test('AI 规则生成：受限目录树、复用设置、草稿配置、多轮�
     const messages=calls.at(-1)!.body.messages
     assert.equal(messages.filter((m:any)=>m.role==='assistant').length,1)
     assert.ok(messages.some((m:any)=>m.content.includes('按作品 ID 分组')))
-    assert.deepEqual(JSON.parse(messages.at(-1).content).currentRules,draft)
+    // 草稿以 TOON 附在用户消息里，不是 JSON。
+    assert.ok(messages.at(-1).content.includes('当前编辑器配置（TOON'), messages.at(-1).content)
+    assert.ok(messages.at(-1).content.includes('mode: regex'))
+    assert.ok(!messages.at(-1).content.trim().startsWith('{'))
     const third=await send('改用文件名标题',{conversationId,currentRules:customRules()})
     assert.equal(third.statusCode,200,third.body)
-    assert.equal(JSON.parse(calls.at(-1)!.body.messages.at(-1).content).currentRules,undefined)
+    assert.ok(!calls.at(-1)!.body.messages.at(-1).content.includes('当前编辑器配置（TOON'))
     assert.ok(calls.at(-1)!.body.messages.some((m:any)=>m.role==='assistant' && m.content.includes('修复脚本')))
     assert.equal(await readFile(path.join(process.env.MEDIA_DATA_DIR,'sources.json'),'utf8'),sourceConfig)
     assert.equal((db.prepare('SELECT count(*) AS n FROM works').get() as {n:number}).n,0)
     assert.ok(!(await readdir(process.env.MEDIA_DATA_DIR)).some(n=>/conversation|chat|source-ai/.test(n)))
+    // 规则 Agent 的成果由 submit_rules 工具带回，翻译用的结构化输出模式不会套在它身上，
+    // 所以模型正文可以正常写 Markdown 说明；这里的 JSON 正文属于兼容路径，仍然可用。
     for(const output of ['json_object','json_schema']) {
       settings(output);reply={rules:output==='json_schema'?JSON.stringify(customRules()):customRules(),explanation:'结构化结果'}
       assert.equal((await send('生成',{currentRules:customRules()})).statusCode,200)
-      assert.equal(calls.at(-1)!.body.response_format.type,output)
+      assert.equal(calls.at(-1)!.body.response_format,undefined)
     }
     settings()
     // Generation must not execute even the module's top-level code.

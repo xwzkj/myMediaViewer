@@ -807,13 +807,28 @@ curl.exe -H "Range: bytes=0-1023" "http://localhost:3210/api/assets/ASSET_ID/fil
 
 ### AI 规则生成与多轮对话
 
-- `POST /api/sources/ai/sample`：`{ path: "绝对目录" }`，返回 `{token, tree, truncated, lines}`。仅列文件/目录名，最多 200 行/24 KiB/8 层，裁切标记 `...`，跳过符号链接/目录联接；不读取文件内容。样本在内存中保留 5 分钟。
-- `POST /api/sources/ai/chat`：`{sampleToken, conversationId?, message, currentRules?, ignoreCustomParams?}`。message 最多 4000 字符。首轮不传 conversationId，之后使用返回 ID。currentRules 是当前编辑草稿，允许含待修复语法错误；空白自定义预设自动省略。请求体最多 256 KiB。
-- 成功返回 `{conversationId, contextTrimmed, rules, explanation, model}`。规则和脚本经过静态/沙箱编译校验，但不执行代码。模型输出无效返回 502，过期会话/样本返回 410，目录样本不一致或同会话并发返回 409，并发总量超限返回 429。
+- `POST /api/sources/ai/sample`：`{ path: "绝对目录" }`，返回 `{token, tree, truncated, lines}`。仅列文件/目录名，最多 200 行/24 KiB/8 层，裁切标记 `...（目录树样本已截断）`，跳过符号链接/目录联接；不读取文件内容。样本在内存中保留 5 分钟。
+- `POST /api/sources/ai/chat`：`{sampleToken, conversationId?, message, currentRules?, ignoreCustomParams?, thinkingLevel?}`。message 最多 4000 字符。首轮不传 conversationId，之后使用返回 ID。currentRules 是当前编辑草稿，允许含待修复语法错误；空白自定义预设自动省略。请求体最多 256 KiB。
+- `POST /api/sources/ai/chat/stream`：请求体与 `/chat` 相同，返回 `text/event-stream`。事件依次为 `status`（阶段文本）、`reasoning_delta`（思维链增量，`text`）、`assistant_delta`（模型文本增量）、`question`（模型用 `ask_user` 向用户提问，`question` 含 `id`/`question`/`why`/`options[{summary, description}]`）、`tool_call` / `tool_result`（工具调用与结果，`call` 为完整工具调用对象，含 `reason` 目的与 `text` 回给模型的原文）、`result`（最终结果，同 `/chat` 的响应体）、`done`，出错为 `error`。模型用 `submit_rules` 提交成功后立即收到 `result` 与 `done`，不会再请求模型。客户端断开连接会中止上游请求和等待中的提问。
+- `POST /api/sources/ai/chat/answer`：`{questionId, answer}`，回答流式对话抛出的提问；answer 最多 2000 字符，成功返回 `{ok:true}`，问题已失效或不存在返回 404。回答会作为该工具的 TOON 结果回给模型，同一问题只能回答一次。
+- 成功返回 `{conversationId, contextTrimmed, rules, explanation, model, toolEvents, messages}`。规则和脚本经过静态/沙箱编译校验，但不执行代码。模型输出无效返回 502，过期会话/样本返回 410，目录样本不一致或同会话并发返回 409，并发总量超限返回 429。模型连续两轮请求完全相同的工具调用时以 502 中止，避免空转。
 - `DELETE /api/sources/ai/chat/:id`：清空内存对话，返回 `{ok:true}`；生成中返回 409。
 
-模型输入含规则语法/脚本契约、目录树、当前非空白配置、近期对话。复用已有 AI endpoint/token/model/timeout/params/outputMode，不使用翻译专用 appendPrompt。模型结果只作为候选，不自动保存来源、扫描或执行脚本。
+模型输入是纯文本：用户要求、目录树样本、当前配置（TOON 文本）。目录树每行 `|-- 名称`，目录以 `/` 结尾，行首缩进表示层级；出现「目录树样本已截断」即为截断。工具结果和当前配置统一用 TOON（Token-Oriented Object Notation，`shared/toon.ts`）而不是 JSON，省 token 且模型易读；含逗号、冒号、引号或换行的字符串会加引号。发送给模型的所有数据都不含文件内容，只有名称。
+
+模型可用的工具有四个，每次调用都必须带 `reason`（一句话目的，直接显示给用户）：
+
+- `read_directory`：按页读取来源目录名称（`path` / `offset` / `length`，length 最大 100），只能用来源内相对路径，越界、绝对路径和符号链接一律拒绝。整个任务最多 24 次。
+- `preview_rules`：用一组完整的 `SourceRules` 在真实目录上试跑分组，返回 `{enumerated, matched, groupCount, truncated, errors, groups[]}`（分组样例含 `id`、`directory`、`media`、`metadata`、`sample` 相对路径）。只做分组，不读元文件内容、不执行脚本，最多枚举 3000 个文件、每个任务最多调用 4 次；规则形状不合法时以工具错误返回，模型可据此修正。
+- `ask_user`：向用户提问并等待回答（`question`、`why?`、`options[{summary, description}]` 2–5 个，按推荐度从高到低，用户也可自行输入）。每个任务最多 3 次，等待上限 10 分钟；同一问题只能回答一次。仅流式接口支持，非流式 `/chat` 调用时立即以工具错误返回，模型据此自行选择方案。
+- `submit_rules`：结果工具。模型自检确认后用它提交 `rules`（完整 `SourceRules` 对象）和可选的 `summary`，成功即本轮结束，响应体里的 `rules` / `explanation` 就来自这次提交；返回给模型的是 `ok: true` 一句确认，不再回灌整份规则。因为成果是工具调用、参数可校验，模型正文可以照常写 Markdown 说明，不必再被迫只输出 JSON。规则形状或脚本校验失败时以字段级工具错误返回，模型改完再提交一次。
+
+规则 Agent 不发送 `response_format`：AI 设置里的输出模式（`json_object` / `json_schema`）只作用于翻译等功能，不套在规则 Agent 上；自定义参数里也无法注入。为兼容老提示词或不会调工具的模型，把 `{"rules":…,"explanation":…}` 直接写在正文里同样接受；提交工具没写 `summary` 时 `explanation` 退回本轮正文，工具和 JSON 都没有时返回 502「模型本轮没有提交规则」。
 
 对话不落盘，闲置 30 分钟失效，最多 8 个内存会话、两个并发请求。历史按完整往返截断，至多近期 6 轮并受 384 KiB 上限约束；截断时 contextTrimmed=true。发生 AI 请求/验证错误不会把失败回合追加到上下文。
 
-AI 规则对话可传 `ignoreCustomParams: true`，本次请求不合并 AI 设置中的自定义参数；默认 false，保留现有行为。接口、Token、模型、超时及输出模式不受影响，全局配置不变。
+AI 规则对话可传 `ignoreCustomParams: true`，本次请求不合并 AI 设置中的自定义参数；API 默认 false（前端「不使用自定义参数」默认勾选）。接口、Token、模型、超时及输出模式不受影响，全局配置不变。
+
+`thinkingLevel` 取 `default | low | medium | high | xhigh | max`，缺省为 `high`。`default` 挡位不额外传参，其余五档在请求体里加 `reasoning_effort`。思考深度独立于 `ignoreCustomParams`：即使跳过自定义参数，思考深度照旧生效。非法值在 `/chat` 由请求校验拒绝（400），在流式接口回落到缺省挡位。上游返回的思维链（`reasoning_content` / `reasoning`）以 `reasoning_delta` 实时转发给界面，不写入对话历史。
+
+前端把每轮结果挂在正文后面、互相独立：助手正文用 markdown-it 渲染（`html: false`，链接只允许 http/https/mailto 并加 `rel="noopener noreferrer nofollow"`，图片不渲染只留替代文字；只有正文里出现 `{"` 才截断，避免老模型把 JSON 吐进正文），思维链在流式中展开、出正文或工具调用后自动折叠（用户手动开合后不再自动动），工具行折叠时显示调用目的和结果摘要、展开后分「输入 / 输出」两块显示 TOON 原文。AI 工作期间只禁用「保存并扫描」，取消本轮、回答提问、关闭对话框都保持可用。

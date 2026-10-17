@@ -3,13 +3,13 @@ import { computed } from 'vue'
 import {
   mdiViewGalleryOutline, mdiHeartOutline, mdiHeart, mdiImageMultipleOutline, mdiPlayCircleOutline,
   mdiMotionPlayOutline, mdiMagnify, mdiClose, mdiPlus, mdiFolderOutline, mdiCogOutline,
-  mdiRefresh, mdiWeatherNight, mdiWhiteBalanceSunny, mdiArrowRight, mdiArrowLeft,
+  mdiRefresh, mdiWeatherNight, mdiWhiteBalanceSunny, mdiArrowRight, mdiArrowLeft, mdiArrowDown,
   mdiChevronLeft, mdiChevronRight, mdiChevronDown, mdiCheck, mdiDotsHorizontal,
   mdiArrowTopRight, mdiInformationOutline, mdiFullscreen, mdiDownload, mdiPause, mdiPlay,
   mdiPencilOutline, mdiTrashCanOutline, mdiLan, mdiCheckCircleOutline, mdiAlertCircleOutline,
   mdiSortVariant, mdiTuneVariant, mdiImageOutline, mdiAutoFix, mdiMenu, mdiMonitor,
   mdiContentCopy, mdiFolderPlusOutline, mdiLeaf, mdiFolderOpenOutline, mdiCloudOffOutline, mdiTagOutline,
-  mdiTranslate,
+  mdiTranslate, mdiEyeOutline, mdiHelpCircleOutline, mdiLightbulbOnOutline,
   mdiCloudOutline, mdiCloudCheckOutline, mdiSwapHorizontal,
 } from '@mdi/js'
 
@@ -20,6 +20,7 @@ const icons: Record<string, string> = {
   search: mdiMagnify, close: mdiClose, plus: mdiPlus, folder: mdiFolderOutline,
   settings: mdiCogOutline, refresh: mdiRefresh, moon: mdiWeatherNight, sun: mdiWhiteBalanceSunny,
   'arrow-right': mdiArrowRight, 'arrow-left': mdiArrowLeft, left: mdiChevronLeft, right: mdiChevronRight,
+  'arrow-down': mdiArrowDown, eye: mdiEyeOutline,
   down: mdiChevronDown, check: mdiCheck, more: mdiDotsHorizontal, external: mdiArrowTopRight,
   info: mdiInformationOutline, fullscreen: mdiFullscreen, download: mdiDownload,
   pause: mdiPause, play: mdiPlay, edit: mdiPencilOutline, delete: mdiTrashCanOutline,
@@ -27,7 +28,7 @@ const icons: Record<string, string> = {
   sort: mdiSortVariant, tune: mdiTuneVariant, image: mdiImageOutline, sparkle: mdiAutoFix,
   menu: mdiMenu, monitor: mdiMonitor, copy: mdiContentCopy, 'folder-plus': mdiFolderPlusOutline,
   leaf: mdiLeaf, 'folder-open': mdiFolderOpenOutline, offline: mdiCloudOffOutline, tag: mdiTagOutline,
-  translate: mdiTranslate,
+  translate: mdiTranslate, help: mdiHelpCircleOutline, bulb: mdiLightbulbOnOutline,
   cloud: mdiCloudOutline, 'cloud-heart': mdiCloudCheckOutline, swap: mdiSwapHorizontal,
 }
 const icon = computed(() => icons[props.name] || mdiImageOutline)

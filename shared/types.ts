@@ -235,4 +235,40 @@ export interface DirectoryListing {
 }
 
 export interface SourceAiSample { token: string; tree: string; truncated: boolean; lines: number }
-export interface SourceAiResult { conversationId: string; contextTrimmed: boolean; rules: SourceRules; explanation: string; model: string }
+/** read_directory 返回的一页目录列表。 */
+export interface SourceAiDirectoryRead { path: string; offset: number; length: number; total: number; hasMore: boolean; entries: Array<{ name: string; type: 'file' | 'directory' }> }
+/** preview_rules 与真实预览共用的紧凑分组摘要。 */
+export interface SourceAiPreviewSummary {
+  enumerated: number; matched: number; groupCount: number; truncated: boolean; errors: string[]
+  groups: Array<{ id: string; directory: string; media: number; metadata: number; sample: string[] }>
+}
+/** ask_user 工具抛给用户的问题：选项按推荐度从高到低排列。 */
+export interface SourceAiQuestionOption { summary: string; description: string }
+export interface SourceAiQuestion { id: string; question: string; why?: string; options: SourceAiQuestionOption[]; answer?: string }
+export interface SourceAiToolCall {
+  id: string
+  name: string
+  arguments: Record<string, unknown>
+  status: 'running' | 'complete' | 'error'
+  /** read_directory 为 SourceAiDirectoryRead；preview_rules 为 SourceAiPreviewSummary。 */
+  result?: unknown
+  error?: string
+  /** 这一轮已经调用过的次数，界面用来提示模型反复读取目录。 */
+  round?: number
+  /** 模型给这次调用写的目的，折叠状态也直接显示，方便回看。 */
+  reason?: string
+  /** 实际回给模型的紧凑文本（TOON），界面按原样展示输出。 */
+  text?: string
+}
+export interface SourceAiMessage { role: 'user' | 'assistant' | 'tool'; text: string; toolCall?: SourceAiToolCall; result?: SourceAiResult }
+export interface SourceAiResult { conversationId: string; contextTrimmed: boolean; rules: SourceRules; explanation: string; model: string; messages?: SourceAiMessage[]; toolEvents?: SourceAiToolCall[] }
+export type SourceAiStreamEvent =
+  | { type: 'status'; message?: string }
+  | { type: 'reasoning_delta'; text?: string }
+  | { type: 'assistant_delta'; text?: string }
+  | { type: 'tool_call'; call?: SourceAiToolCall }
+  | { type: 'tool_result'; call?: SourceAiToolCall }
+  | { type: 'question'; question?: SourceAiQuestion }
+  | { type: 'result'; result: SourceAiResult }
+  | { type: 'done' }
+  | { type: 'error'; message: string; status?: number }

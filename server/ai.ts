@@ -3,7 +3,10 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { dataDir } from './config.js'
 import { db } from './database.js'
-import type { AiSettings, AiTranslateFields } from '../shared/types.js'
+import type { AiSettings, AiTranslateFields, SourceAiToolCall } from '../shared/types.js'
+import { DEFAULT_AI_THINKING_LEVEL, asAiThinkingLevel, thinkingRequestParams, type AiThinkingLevel } from '../shared/ai-thinking.js'
+import { toon } from '../shared/toon.js'
+import OpenAI from 'openai'
 import { DEFAULT_APPEND_PROMPT, DEFAULT_MANGA_PROMPT, DEFAULT_TRANSLATE_PROMPT, fillPrompt } from '../shared/prompts.js'
 import { logRaw, logUpstream } from './log.js'
 
@@ -467,32 +470,180 @@ export function clearTranslationCache(): number {
 }
 
 /** Reuse the configured endpoint, model, token, timeout, params and structured-output mode. */
-export async function generateSourceRules(tree: string, turns: Array<{role: 'user' | 'assistant'; content: string}>, ignoreCustomParams = false) {
+export interface SourceRuleToolTurn { role: 'system' | 'user' | 'assistant' | 'tool'; content: string | null; tool_call_id?: string; tool_calls?: unknown[] }
+export interface SourceRuleToolContext { emit: SourceRuleStreamSink; signal?: AbortSignal; /** 有流式通道才能向用户提问；非流式调用里提问会立刻失败而不是干等。 */ interactive: boolean }
+export interface SourceRuleTool {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+  execute: (args: unknown, context: SourceRuleToolContext) => Promise<unknown>
+  /** 回给模型的紧凑文本；默认 TOON，避免 JSON 浪费 token。 */
+  serialize?: (result: unknown, args: Record<string, unknown>) => string
+  /** 结果工具：成功执行后本轮立即收尾，它的返回值就是本轮成果。 */
+  final?: boolean
+}
+export interface SourceRuleStreamEvent { type: 'assistant_delta' | 'reasoning_delta' | 'tool_call' | 'tool_result' | 'question' | 'status' | 'done'; text?: string; call?: unknown; result?: unknown; question?: unknown; message?: string }
+export type SourceRuleStreamSink = (event: SourceRuleStreamEvent) => void | Promise<void>
+
+export interface SourceRuleRunOptions {
+  /** 为 true 时完全不发送 settings.params，只用模型自身的默认行为。 */
+  ignoreCustomParams?: boolean
+  /** 思考深度；default 挡位不额外传参。省略时用默认挡位。 */
+  thinkingLevel?: AiThinkingLevel
+  sink?: SourceRuleStreamSink
+  /** 客户端断开时中止本轮的模型请求与等待中的提问。 */
+  signal?: AbortSignal
+}
+
+/** 结果工具返回的成果：规则加一句说明。 */
+function submissionOf(value: unknown): { rules: unknown; explanation: string } {
+  const record = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  return { rules: record.rules, explanation: typeof record.explanation === 'string' ? record.explanation.slice(0, 4000) : '' }
+}
+
+/** 模型给出的工具参数可能是 JSON 字符串或对象；非法 JSON 由调用方转成工具错误提示模型重试。 */
+function parseToolArguments(value: unknown): Record<string, unknown> {  if (value === undefined || value === null || value === '') return {}
+  if (typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
+  if (typeof value !== 'string') return {}
+  const parsed: unknown = JSON.parse(value)
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
+}
+
+/** Use the official OpenAI client for both JSON and streaming-compatible endpoints. */
+function openAiClient(settings: AiSettings): OpenAI {
+  const base = settings.baseUrl.trim().replace(/\/+$/, '')
+  const baseURL = /\/chat\/completions$/i.test(base) ? base.replace(/\/chat\/completions$/i, '') : /\/v1$/i.test(base) ? base : `${base}/v1`
+  return new OpenAI({ apiKey: settings.apiKey, baseURL, timeout: settings.timeoutMs, maxRetries: 0 })
+}
+
+export async function generateSourceRulesInteractive(
+  turns: SourceRuleToolTurn[], tools: SourceRuleTool[], options: SourceRuleRunOptions = {},
+) {
   const settings = configured()
   const { SOURCE_RULES_AI_PROMPT } = await import('../shared/source-ai-prompt.js')
-  const payload = bodyWithParams(ignoreCustomParams ? {} : settings.params, {
-    model: settings.model, stream: false,
-    messages: [
-      {role:'system',content:SOURCE_RULES_AI_PROMPT},
-      {role:'user',content:JSON.stringify({directoryTree:tree})},
-      ...turns,
-    ],
-    response_format: responseFormat(settings.outputMode, 'source_rules', {
-      // JSON text keeps strict schema portable while allowing arbitrary named captures/type overrides.
-      rules: {type:'string',description:'SourceRules 对象序列化后的 JSON 字符串'},
-      explanation: {type:'string'},
-    }),
-  }, ['model','messages','stream','response_format'])
-  const body = JSON.parse(payload)
-  if (settings.outputMode === 'json_schema') body.messages[0].content += '\n结构化输出模式：rules 字段请返回 SourceRules 的 JSON 字符串，而不是对象。'
+  const messages: any[] = [{ role: 'system', content: SOURCE_RULES_AI_PROMPT }, ...turns]
+  const toolSchemas = tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }))
   const label = '生成媒体分组规则'
-  const data = await requestJson(endpoints(settings.baseUrl).chat, {method:'POST',headers:headers(settings),body:JSON.stringify(body)},settings.timeoutMs,label)
-  const content = extractContent(data,label)
-  if (Buffer.byteLength(content) > 256 * 1024) throw new AiError('生成结果超过 256 KiB，请缩小需求后重试',502)
-  const result = parseJsonObject(content,label)
-  let rules: unknown = result.rules
-  if (typeof rules === 'string') {try {rules = JSON.parse(rules)} catch {throw new AiError('AI 返回的规则 JSON 无效',502)}}
+  const emit = options.sink || (async () => {})
+  // 思考深度独立于自定义参数：即使勾选了「不使用自定义参数」也照样生效。
+  const thinking = thinkingRequestParams(asAiThinkingLevel(options.thinkingLevel, DEFAULT_AI_THINKING_LEVEL))
+  const extraParams = options.ignoreCustomParams ? thinking : { ...settings.params, ...thinking }
+  let data: Record<string, unknown> = {}
+  const toolEvents: SourceAiToolCall[] = []
+  let lastToolSignature = ''
+  let repeatedToolCalls = 0
+  // 结果工具提交的成果；一旦拿到就不再请求模型。
+  let submitted: { rules: unknown; explanation: string } | null = null
+  for (let round = 0; round < 24 && !submitted; round++) {
+    if (options.signal?.aborted) throw new AiError('已取消本轮任务', 499)
+    const payload = bodyWithParams(extraParams, {
+      model: settings.model, stream: false, messages,
+      tools: toolSchemas, tool_choice: 'auto',
+    }, ['model','messages','stream','tools','tool_choice','response_format'])
+    const body = JSON.parse(payload)
+    // 没有结果工具时（老的非交互入口）退回 JSON 正文约定，免得提示词要求调用不存在的工具。
+    if (!tools.some(tool => tool.final)) body.messages[0].content += '\n本次没有提交工具，作为唯一例外：请在正文最后另起一行输出 {"rules": SourceRules 对象, "explanation": string}。'
+    await emit({ type: 'status', message: `正在请求模型（第 ${round + 1} 轮）` })
+    const client = openAiClient(settings)
+    if (!options.sink) {
+      data = await client.chat.completions.create({ ...(body as any), stream: false } as any, { signal: options.signal }) as unknown as Record<string, unknown>
+      // 非流式响应也可能带思维链，一次性交给界面，别让用户干等。
+      const reasoning = (data.choices as any)?.[0]?.message?.reasoning_content ?? (data.choices as any)?.[0]?.message?.reasoning
+      if (typeof reasoning === 'string' && reasoning) await emit({ type: 'reasoning_delta', text: reasoning })
+    } else {
+      const stream = await client.chat.completions.create({ ...body, stream: true } as any, { signal: options.signal })
+      const calls = new Map<number, any>()
+      let content = ''
+      for await (const chunk of stream as any) {
+        const choice = chunk.choices?.[0]
+        const delta = choice?.delta || {}
+        // 思维链：DeepSeek 用 reasoning_content，OpenRouter 等用 reasoning。
+        const reasoning = typeof delta.reasoning_content === 'string' ? delta.reasoning_content : typeof delta.reasoning === 'string' ? delta.reasoning : ''
+        if (reasoning) await emit({ type: 'reasoning_delta', text: reasoning })
+        if (typeof delta.content === 'string' && delta.content) {
+          content += delta.content
+          await emit({ type: 'assistant_delta', text: delta.content })
+        }
+        for (const item of (Array.isArray(delta.tool_calls) ? delta.tool_calls : [])) {
+          const index = Number.isInteger(item.index) ? item.index : calls.size
+          const current = calls.get(index) || { id: '', type: 'function', function: { name: '', arguments: '' } }
+          if (item.id) current.id = item.id
+          if (item.function?.name) current.function.name += item.function.name
+          if (item.function?.arguments) current.function.arguments += item.function.arguments
+          calls.set(index, current)
+        }
+        data = { model: chunk.model || settings.model, choices: [{ message: { content, tool_calls: [...calls.values()] } }] }
+      }
+      if (!data.choices) data = { model: settings.model, choices: [{ message: { content, tool_calls: [...calls.values()] } }] }
+    }
+    const choice = Array.isArray(data.choices) ? data.choices[0] as any : undefined
+    const assistant = choice?.message
+    const calls = Array.isArray(assistant?.tool_calls) ? assistant.tool_calls : []
+    if (!calls.length) break
+    // 同一组工具调用连续重复时提前收尾，避免把额度浪费在原地打转。
+    const signature = JSON.stringify(calls.map((call: any) => [call?.function?.name, call?.function?.arguments]))
+    repeatedToolCalls = signature === lastToolSignature ? repeatedToolCalls + 1 : 0
+    lastToolSignature = signature
+    if (repeatedToolCalls >= 2) throw new AiError('模型重复请求同一份目录数据，已中止本轮；请补充更具体的命名规律后重试', 502)
+    messages.push({ role: 'assistant', content: typeof assistant?.content === 'string' && assistant.content ? assistant.content : null, tool_calls: calls })
+    for (const call of calls) {
+      if (options.signal?.aborted) throw new AiError('已取消本轮任务', 499)
+      const name = typeof call?.function?.name === 'string' ? call.function.name : ''
+      const id = typeof call?.id === 'string' ? call.id : ''
+      let args: Record<string, unknown> = {}
+      let argumentError = ''
+      try { args = parseToolArguments(call?.function?.arguments) } catch (error) { argumentError = (error as Error).message }
+      const reason = typeof args.reason === 'string' ? args.reason.slice(0, 200) : ''
+      await emit({ type: 'tool_call', call: { id, name, arguments: args, status: 'running', round, reason } })
+      const tool = tools.find(item => item.name === name)
+      let result: unknown
+      let text = ''
+      let completed = false
+      try {
+        if (!tool) throw new Error(name ? `不支持的工具：${name}` : '模型没有给出工具名称')
+        if (argumentError) throw new Error(`工具参数不是合法 JSON（${argumentError}），请按参数结构重新调用`)
+        result = await tool.execute(args, { emit, signal: options.signal, interactive: Boolean(options.sink) })
+        text = tool.serialize ? tool.serialize(result, args) : toon(result)
+        completed = true
+        toolEvents.push({ id, name, arguments: args, status: 'complete', result, round, reason, text })
+        await emit({ type: 'tool_result', call: { id, name, arguments: args, status: 'complete', result, round, reason, text } })
+      } catch (error) {
+        const message = (error as Error).message
+        result = { error: message }
+        text = toon({ error: message })
+        toolEvents.push({ id, name, arguments: args, status: 'error', error: message, round, reason, text })
+        await emit({ type: 'tool_result', call: { id, name, arguments: args, status: 'error', error: message, round, reason, text } })
+      }
+      // 结果工具提交成功即收尾：正文可以随便写人话，成果由工具带回来。
+      if (completed && tool?.final) {
+        submitted = submissionOf(result)
+        // 没写 summary 时退回本轮正文，别让结果卡片空着。
+        if (!submitted.explanation) submitted.explanation = (typeof assistant?.content === 'string' ? assistant.content : '').slice(0, 4000)
+        break
+      }
+      if (Buffer.byteLength(text) > 64 * 1024) throw new AiError('目录读取结果过大，请缩小 length 后重试', 502)
+      messages.push({ role: 'tool', tool_call_id: id, content: text })
+    }
+  }
+  if (!submitted) {
+    // 兼容路径：模型没用结果工具，而是把 JSON 直接写在正文里（老提示词或不支持强制工具调用的模型）。
+    let content = ''
+    try { content = extractContent(data, label) } catch { throw new AiError('模型本轮没有提交规则：应当自检确认后调用工具提交，请重试或换个模型', 502) }
+    if (Buffer.byteLength(content) > 256 * 1024) throw new AiError('生成结果超过 256 KiB，请缩小需求后重试',502)
+    let parsed: Record<string, unknown>
+    try { parsed = parseJsonObject(content, label) } catch { throw new AiError('模型本轮没有提交规则：应当自检确认后调用工具提交，请重试或换个模型', 502) }
+    let rules: unknown = parsed.rules
+    if (typeof rules === 'string') { try { rules = JSON.parse(rules) } catch { throw new AiError('AI 返回的规则 JSON 无效',502) } }
+    submitted = { rules, explanation: typeof parsed.explanation === 'string' ? parsed.explanation.slice(0,4000) : '' }
+  }
   const { validateRules } = await import('./source-sandbox.js')
-  try {await validateRules(rules,true)} catch(error) {throw new AiError(`AI 生成的规则未通过校验：${(error as Error).message}`,502)}
-  return {rules: rules as import('../shared/types.js').SourceRules, explanation: typeof result.explanation === 'string' ? result.explanation.slice(0,4000) : '', model:asText(data.model,settings.model)}
+  try { await validateRules(submitted.rules,true) } catch(error) { throw new AiError(`AI 生成的规则未通过校验：${(error as Error).message}`,502) }
+  return { rules: submitted.rules as import('../shared/types.js').SourceRules, explanation: submitted.explanation, model: asText(data.model,settings.model), toolEvents }
+}
+
+/** 老的非交互入口：没有工具通道，模型只能把 JSON 写在正文里，靠兼容路径解析。 */
+export async function generateSourceRules(tree: string, turns: Array<{role: 'user' | 'assistant'; content: string}>, options: SourceRuleRunOptions = {}) {
+  return generateSourceRulesInteractive([
+    { role: 'user', content: `目录树样本（|-- 名称，目录以 / 结尾，... 表示截断）：\n${tree}` }, ...turns,
+  ], [], options)
 }
