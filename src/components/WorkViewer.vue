@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onBeforeUnmount, onUnmounted, onActivated, onDeactivated, onMounted, watch } from 'vue'
 import type { AiTranslateFields, AiTranslateResult, MangaJob, MangaPageResult, WorkDetail, Work } from '../../shared/types'
-import { Viewer } from 'v-viewer'
+import { showImagePreview } from 'vant'
+import type { ImagePreviewOptions } from 'vant'
 import { api, formatSize, kindLabel } from '../api'
 import Icon from './Icon.vue'
-import { nearbyImages, createViewerImageCache, revealThumbnail, nextTranslationDisplay, metadataVisibility } from '../viewer-media'
+import { nearbyImages, createViewerImageCache, revealThumbnail, nextTranslationDisplay, metadataVisibility, resolveAssetUrl, resolvePreviewSource, originalAssetUrl, rubberBandOffset, resolveSwipeRelease, swipeSettleDuration, swipeVelocity, constrainZoom, zoomAt, type ZoomState } from '../viewer-media'
+
 import { drawMangaRegion } from '../manga-layout'
 import { vReleaseVideo, releaseVideos } from '../video-lifecycle'
 import type { Notice, NoticeAction } from '../use-notice'
@@ -23,9 +25,24 @@ let drawVersion = 0
 const video = ref<HTMLVideoElement>()
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', keyboard)
+  document.removeEventListener('error', previewImageError, true)
+  document.removeEventListener('wheel', previewWheel)
+  document.removeEventListener('pointerdown', previewPointerDown)
+  document.removeEventListener('pointermove', previewPointerMove)
+  document.removeEventListener('pointerup', previewPointerUp)
+  document.removeEventListener('pointercancel', previewPointerUp)
   if (root.value) releaseVideos(root.value)
 })
-onMounted(() => window.addEventListener('keydown', keyboard))
+onMounted(() => {
+  window.addEventListener('keydown', keyboard)
+  // Vant ImagePreview 只处理触摸：桌面端的原图兜底、滚轮缩放与拖拽平移在这里补。
+  document.addEventListener('error', previewImageError, true)
+  document.addEventListener('wheel', previewWheel, { passive: false })
+  document.addEventListener('pointerdown', previewPointerDown)
+  document.addEventListener('pointermove', previewPointerMove)
+  document.addEventListener('pointerup', previewPointerUp)
+  document.addEventListener('pointercancel', previewPointerUp)
+})
 const detail = computed(() => props.work)
 const index = ref(0)
 const mediaError = ref(false)
@@ -121,7 +138,7 @@ function pauseMediaForLeave() {
   mangaTimer = undefined
   clearTimeout(conversionTimer)
   conversionTimer = undefined
-  destroyPreview()
+  closePreview(true)
 }
 // 可续查的在途任务：只记 GET 可恢复的 job 查询，不记 POST 提交。
 let resumableMangaJobId = ''
@@ -246,12 +263,22 @@ onDeactivated(() => {
 // 详情由作品页统一加载；切换作品后直接使用新资源，并回到第一张。
 // 跨作品清可续查句柄：旧 job 绝不串新作品；旧 timer 一并清除。
 watch(() => props.work.id, () => {
-  index.value = 0
-  slide.value = 1
-  dragX.value = 0
+  const direction: 1 | -1 = slide.value >= 0 ? 1 : -1
   gesture = null
   suppressClick = false
-  destroyPreview()
+  // 换作品时丢弃上一部的浮层与未落定的翻页，避免旧页码串到新作品。
+  closePreview(false)
+  settlePageImmediately()
+  index.value = 0
+  slide.value = 1
+  clearTimeout(pageCommitTimer)
+  clearTimeout(enteringTimer)
+  pendingPageCommit = undefined
+  pageAnimating.value = false
+  pageOffset.value = 0
+  settleWorkImmediately()
+  entering.value = prefersReducedMotion() ? '' : direction >= 0 ? 'next' : 'prev'
+  if (entering.value) enteringTimer = setTimeout(() => { entering.value = '' }, 260)
   mediaError.value = false
   mediaRetryToken.value = 0
   compatible.value = false
@@ -270,9 +297,10 @@ watch(() => props.work.id, () => {
   conversionTimer = undefined
   resetManga()
 })
-onUnmounted(() => { disposed = true; drawVersion++; images.clear(); destroyPreview(); stopSlideshowTimer(); clearTimeout(conversionTimer); clearTimeout(mangaTimer) })
 watch(index, async () => {
-  destroyPreview()
+  // 浮层自己发起的换页不能销毁浮层；其他来源换页必须把浮层关掉。
+  if (previewOwnsIndex) previewOwnsIndex = false
+  else closePreview(false)
   mediaError.value = false
   mediaRetryToken.value = 0
   compatible.value = false
@@ -365,70 +393,207 @@ function next(direction: number, auto = false) {
   const target = index.value + direction
   if (target < 0 || target >= count) { goWork(direction, auto); return }
   slide.value = direction
-  index.value = target
+  goToIndex(target, direction >= 0 ? 1 : -1)
 }
 // 手势：在图片 / 视频区域左右滑动切换分 P，在信息区等其他位置左右滑动切换上一个 / 下一个作品。
-const dragX = ref(0)
-// 切换分 P 或作品时的滑动方向，用来决定动画从哪边进出。
+// 位移分两段：拖动时 1:1 跟随指针（只有列表首尾之外做橡皮筋），松手后按位移 + 速度吸附到落定位。
 const slide = ref(1)
 const mediaKey = computed(() => `${props.work.id}:${asset.value?.id || 'empty'}:${mediaRetryToken.value}`)
-const slideName = computed(() => slide.value >= 0 ? 'media-next' : 'media-prev')
-let gesture: { pointerId: number; startX: number; startY: number; mode: 'page' | 'work' | 'ignore' } | null = null
+/** 一屏宽度；0 表示还没量到（此时直接落位，不播放位移）。 */
+const pageWidth = ref(0)
+/** 当前页相对居中的横向偏移：负值表示正在看下一张。 */
+const pageOffset = ref(0)
+const pageAnimating = ref(false)
+const pageSettleMs = ref(220)
+/** 信息区（mode === 'work'）拖动时整块内容的横向偏移。 */
+const workOffset = ref(0)
+const workAnimating = ref(false)
+const workSettleMs = ref(220)
+/** 新作品第一页的入场方向，沿用原来的 26px + 透明度动画。 */
+const entering = ref<'' | 'next' | 'prev'>('')
+let pageCommitTimer: ReturnType<typeof setTimeout> | undefined
+let pendingPageCommit: (() => void) | undefined
+let workSettleTimer: ReturnType<typeof setTimeout> | undefined
+let enteringTimer: ReturnType<typeof setTimeout> | undefined
+let gesture: {
+  pointerId: number
+  startX: number
+  startY: number
+  mode: 'page' | 'work' | 'ignore'
+  axis: 'none' | 'x' | 'y'
+  width: number
+  offset: number
+  samples: { x: number; t: number }[]
+} | null = null
 let suppressClick = false
-// viewer.js 浮层实例，以及给它提供图片的隐藏节点。
+function prefersReducedMotion() {
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches
+}
+/** 一屏宽度：优先量媒体舞台，量不到就退回窗口宽度。 */
+function stageWidth() {
+  return stage.value?.clientWidth || root.value?.clientWidth || window.innerWidth || 0
+}
+const pagerStyle = computed(() => ({
+  transform: `translateX(calc(-100% + ${pageOffset.value}px))`,
+  transition: pageAnimating.value && !prefersReducedMotion() ? `transform ${pageSettleMs.value}ms cubic-bezier(.2,.8,.3,1)` : 'none',
+}))
+const contentStyle = computed(() => workOffset.value !== 0 || workAnimating.value
+  ? { transform: `translateX(${workOffset.value}px)`, transition: workAnimating.value && !prefersReducedMotion() ? `transform ${workSettleMs.value}ms cubic-bezier(.2,.8,.3,1)` : 'none' }
+  : undefined)
+// 放大浮层（Vant ImagePreview）只保留我们自己的会话信息，浮层本体由 vant 托管。
 type PreviewAsset = { item: WorkDetail['assets'][number]; pageIndex: number }
 type PreviewSession = {
   id: number
   workId: string
-  viewer: InstanceType<typeof Viewer>
-  token: HTMLDivElement
   assets: PreviewAsset[]
-  currentIndex: number
+  images: string[]
+  index: number
   closing: boolean
-  cleaned: boolean
+  /** 原图地址 → 预览图地址；原图 403/404 时兜底换回。 */
+  fallbacks: Map<string, string>
+  /** 用 Canvas 译图代替原图的页（打开时的那一页）。 */
+  translatedIndex: number
 }
-let preview: InstanceType<typeof Viewer> | undefined
-let previewToken: HTMLDivElement | undefined
+/** showImagePreview 返回的实例（vant 的类型是 any，这里只声明用到的部分）。 */
+type ImagePreviewHandle = { close: () => void }
+/** function-call 的选项类型漏掉了这两个点击开关，组件本身是支持的。 */
+type MediaPreviewOptions = ImagePreviewOptions & { closeOnClickImage?: boolean; closeOnClickOverlay?: boolean }
 let previewSession: PreviewSession | undefined
+let previewHandle: ImagePreviewHandle | undefined
 let previewSessionId = 0
-let previewDestroying = false
+/** 由浮层发起的页码同步：此时主查看器换页不能反过来销毁浮层。 */
+let previewOwnsIndex = false
 const previewAssets = computed<PreviewAsset[]>(() => (detail.value?.assets || [])
   .map((item, pageIndex) => ({ item, pageIndex }))
   .filter(({ item }) => item.kind === 'image' && item.extension !== 'webm'))
+// 相邻页只渲染图片、最多当前 ±1 页，避免整部作品的媒体一起解码。
+function neighborUrl(at: number) {
+  const item = detail.value?.assets[at]
+  if (!item || item.kind !== 'image' || item.extension === 'webm') return undefined
+  return resolveAssetUrl(item, originalAssets.value, false)
+}
+const previousUrl = computed(() => neighborUrl(index.value - 1))
+const nextUrl = computed(() => neighborUrl(index.value + 1))
 function gestureMode(target: EventTarget | null): 'page' | 'work' | 'ignore' {
   if (!(target instanceof Element)) return 'ignore'
-  // viewer.js 浮层里的手势交给它自己处理。
-  if (target.closest('.viewer-container')) return 'ignore'
+  // 放大浮层（teleport 到 body）里的手势交给 Vant 自己处理。
+  if (target.closest('.media-gallery-preview') || target.closest('.van-image-preview')) return 'ignore'
   if (target.closest('.media-stage')) return 'page'
   if (target.closest('.filmstrip') || target.closest('button,a,input,select,textarea')) return 'ignore'
   return 'work'
 }
 function startGesture(target: EventTarget | null, x: number, y: number, id: number) {
   if (previewing.value) return
-  gesture = { pointerId: id, startX: x, startY: y, mode: gestureMode(target) }
-  dragX.value = 0
+  // 上一段落定动画先收尾，避免从半路开始拖动，或页码在拖动中被改写。
+  settlePageImmediately()
+  settleWorkImmediately()
+  gesture = { pointerId: id, startX: x, startY: y, mode: gestureMode(target), axis: 'none', width: stageWidth(), offset: 0, samples: [{ x, t: Date.now() }] }
+  if (gesture.width) pageWidth.value = gesture.width
 }
 function moveGesture(id: number, x: number, y: number) {
-  if (!gesture || gesture.pointerId !== id || gesture.mode !== 'page') return
-  const dx = x - gesture.startX
-  const dy = y - gesture.startY
-  if (Math.abs(dy) > Math.abs(dx)) { dragX.value = 0; return }
-  dragX.value = Math.max(-110, Math.min(110, dx))
+  const active = gesture
+  if (!active || active.pointerId !== id || active.mode === 'ignore') return
+  const dx = x - active.startX
+  const dy = y - active.startY
+  if (active.axis === 'none') {
+    if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return
+    // |dy| > |dx| 判定为纵向手势：取消拖动并把偏移归零，交回页面滚动 / 视频进度条。
+    active.axis = Math.abs(dy) > Math.abs(dx) ? 'y' : 'x'
+  }
+  if (active.axis === 'y') {
+    pageOffset.value = 0
+    workOffset.value = 0
+    return
+  }
+  active.samples.push({ x, t: Date.now() })
+  if (active.samples.length > 8) active.samples.shift()
+  active.offset = dx
+  if (active.mode === 'page') {
+    pageAnimating.value = false
+    const count = detail.value?.assets.length || 0
+    // 页内位移 1:1 跟手，只有列表首尾之外才做橡皮筋阻尼。
+    pageOffset.value = rubberBandOffset(dx, active.width, index.value > 0, index.value < count - 1)
+  } else {
+    workAnimating.value = false
+    workOffset.value = Math.max(-active.width, Math.min(active.width, dx))
+  }
 }
 function endGesture(id: number, x: number, y: number) {
-  if (!gesture || gesture.pointerId !== id) return
-  const { mode, startX, startY } = gesture
+  const active = gesture
+  if (!active || active.pointerId !== id) return
   gesture = null
-  dragX.value = 0
-  const dx = x - startX
-  const dy = y - startY
-  if (Math.abs(dx) < 56 || Math.abs(dx) < Math.abs(dy) * 1.5) return
-  const direction = dx < 0 ? 1 : -1
-  // 媒体区域滑到分 P 尽头后会继续切换作品；其他区域直接切换作品。
-  if (mode === 'page') next(direction)
-  else if (mode === 'work') goWork(direction)
+  if (active.mode === 'ignore' || active.axis !== 'x') { pageOffset.value = 0; workOffset.value = 0; return }
+  const velocity = swipeVelocity(active.samples)
+  const count = detail.value?.assets.length || 0
+  const release = resolveSwipeRelease({ offset: active.offset, velocity, width: active.width, index: index.value, count, mode: active.mode })
+  if (release.action === 'stay') { settleBack(active.mode); return }
+  // 一次成功滑动之后不能再触发 click 打开放大层。
   suppressClick = true
   setTimeout(() => { suppressClick = false }, 350)
+  if (release.action === 'work') { settleBack(active.mode); goWork(release.direction); return }
+  slide.value = release.direction
+  settleToPage(release.index, release.direction, velocity)
+}
+/** 松手但没有翻页：从松手时的偏移量平滑回弹到落定位，不跳变。 */
+function settleBack(mode: 'page' | 'work') {
+  if (mode === 'work') {
+    workSettleMs.value = prefersReducedMotion() ? 0 : 180
+    workAnimating.value = !prefersReducedMotion()
+    workOffset.value = 0
+    clearTimeout(workSettleTimer)
+    workSettleTimer = setTimeout(() => { workAnimating.value = false }, workSettleMs.value + 20)
+    return
+  }
+  const offset = pageOffset.value
+  if (!offset) { pageAnimating.value = false; return }
+  const duration = prefersReducedMotion() ? 0 : swipeSettleDuration(Math.abs(offset), 0, { min: 160, max: 300 })
+  pageSettleMs.value = duration
+  pageAnimating.value = duration > 0
+  pageOffset.value = 0
+  clearTimeout(pageCommitTimer)
+  if (duration) pageCommitTimer = setTimeout(() => { pageAnimating.value = false }, duration + 20)
+}
+function settleWorkImmediately() {
+  clearTimeout(workSettleTimer)
+  workAnimating.value = false
+  workOffset.value = 0
+}
+/** 翻页落定：先滑到相邻页的位置，再在同一帧提交页码并复位偏移（视觉上无缝）。 */
+function settleToPage(target: number, direction: 1 | -1, velocity: number) {
+  const width = stageWidth() || pageWidth.value
+  if (!width || prefersReducedMotion()) { commitPage(target); return }
+  const targetOffset = -direction * width
+  const duration = swipeSettleDuration(Math.abs(targetOffset - pageOffset.value), velocity)
+  pageSettleMs.value = duration
+  pageAnimating.value = true
+  pageOffset.value = targetOffset
+  clearTimeout(pageCommitTimer)
+  pendingPageCommit = () => commitPage(target)
+  pageCommitTimer = setTimeout(() => { const commit = pendingPageCommit; if (commit) commit() }, duration + 20)
+}
+/** 程序化翻页（箭头 / 键盘 / 缩略图 / 自动翻页）也走同一套落位动画。 */
+function goToIndex(target: number, direction: 1 | -1, animate = true) {
+  const count = detail.value?.assets.length || 0
+  if (target < 0 || target >= count || target === index.value) return
+  settlePageImmediately()
+  const width = stageWidth() || pageWidth.value
+  if (!animate || !width) { commitPage(target); return }
+  settleToPage(target, direction, width / 260)
+}
+function commitPage(target: number) {
+  pendingPageCommit = undefined
+  clearTimeout(pageCommitTimer)
+  pageAnimating.value = false
+  pageOffset.value = 0
+  index.value = target
+}
+/** 落定动画没播完就来了新手势 / 新导航：立即收尾，避免页码在半路被改。 */
+function settlePageImmediately() {
+  const commit = pendingPageCommit
+  if (!commit) return
+  pendingPageCommit = undefined
+  clearTimeout(pageCommitTimer)
+  commit()
 }
 // 鼠标：只在媒体区域拖动翻页，避开视频底部控制条。
 function pointerDown(event: PointerEvent) {
@@ -440,7 +605,7 @@ function pointerDown(event: PointerEvent) {
 }
 function pointerMove(event: PointerEvent) { if (event.pointerType === 'mouse') moveGesture(event.pointerId, event.clientX, event.clientY) }
 function pointerUp(event: PointerEvent) { if (event.pointerType === 'mouse') endGesture(event.pointerId, event.clientX, event.clientY) }
-function pointerCancel() { gesture = null; dragX.value = 0 }
+function pointerCancel() { gesture = null; pageOffset.value = 0; workOffset.value = 0 }
 function suppressGestureClick(event: MouseEvent) {
   if (!suppressClick) return
   event.preventDefault()
@@ -460,8 +625,7 @@ function touchEnd(event: TouchEvent) {
   const touch = Array.from(event.changedTouches).find(item => item.identifier === gesture?.pointerId)
   if (touch) endGesture(touch.identifier, touch.clientX, touch.clientY)
 }
-function touchCancel() { gesture = null; dragX.value = 0 }
-// 点按图片交给 viewer.js 打开浮层，缩放、拖动、双击、捏合都由它负责。
+function touchCancel() { gesture = null; pageOffset.value = 0; workOffset.value = 0 }
 function retryMedia() {
   mediaError.value = false
   ugoiraImageFallback.value = false
@@ -478,162 +642,239 @@ function handleVideoError(event: Event) {
   }
   mediaError.value = true
 }
+// 放大浮层：Vant ImagePreview（teleport 到 body，宽屏下不会被 .viewer-page 裁掉）。
 function openPreview() {
   if (suppressClick || !asset.value || asset.value.kind !== 'image') return
-  const host = root.value
-  if (!host) return
-  const assets = previewAssets.value
-  if (!assets.length) return
+  const entries = previewAssets.value
+  if (!entries.length) return
+  const found = entries.findIndex(entry => entry.item.id === asset.value?.id)
+  const initialIndex = found >= 0 ? found : 0
   const translated = mangaResult.value && mangaMode.value === 'translated' && mangaCanvas.value
-  if (!translated && asset.value.origin === 'pixiv') {
-    originalAssets.value = new Set([...originalAssets.value, asset.value.id])
-  }
-  // A main-viewer page change tears down the old preview without allowing its late
-  // hidden callback to put the old page back into the main viewer.
-  destroyPreview(false)
-  const currentId = asset.value.id
-  const currentIndex = assets.findIndex(({ item }) => item.id === currentId)
-  const initialIndex = currentIndex >= 0 ? currentIndex : 0
-  const token = document.createElement('div')
-  token.style.display = 'none'
-  assets.forEach(({ item }, pageIndex) => {
-    const image = document.createElement('img')
-    // 译图以 Canvas 叠加呈现，预览当前页时保留译图；其他页使用原图。
-    image.src = pageIndex === initialIndex && translated
-      ? translated.toDataURL('image/png')
-      : item.url
-    image.alt = `${props.work.title}，第 ${item.page + 1} 张`
-    token.appendChild(image)
+    ? mangaCanvas.value.toDataURL('image/png')
+    : ''
+  // Bug 1：浮层与主舞台共用同一套分辨率解析；正在放大的这一页按需升级到原图。
+  const originals = new Set(originalAssets.value)
+  const fallbacks = new Map<string, string>()
+  const urls = entries.map((entry, at) => {
+    if (translated && at === initialIndex) return translated
+    const source = resolvePreviewSource(entry.item, originals, { forceOriginal: at === initialIndex })
+    if (!source) return entry.item.url
+    if (source.fallback) fallbacks.set(source.src, source.fallback)
+    return source.src
   })
-  host.appendChild(token)
-
-  // Keep the filtered preview list and its mapping alive for the whole viewer
-  // session.  The computed list may change after the main page changes, which
-  // must never change the meaning of viewer.js's local index.
+  if (!translated && asset.value.origin === 'pixiv') originals.add(asset.value.id)
+  originalAssets.value = originals
+  closePreview(false)
   const session: PreviewSession = {
     id: ++previewSessionId,
     workId: props.work.id,
-    viewer: undefined as unknown as InstanceType<typeof Viewer>,
-    token,
-    assets,
-    currentIndex: initialIndex,
+    assets: entries,
+    images: urls,
+    index: initialIndex,
     closing: false,
-    cleaned: false,
+    fallbacks,
+    translatedIndex: translated ? initialIndex : -1,
   }
-  const syncSessionPage = () => {
-    if (session.cleaned || previewSession !== session || session.workId !== props.work.id) return
-    const viewed = session.assets[session.currentIndex]
-    if (viewed && viewed.pageIndex !== index.value) selectPage(viewed.pageIndex)
-  }
-  const instance = new Viewer(token, {
-    container: host,
-    zIndex: 2200,
-    className: 'media-preview',
-    navbar: false,
-    navigation: assets.length > 1,
-    title: false,
-    fullscreen: false,
-    keyboard: true,
-    loop: false,
-    initialViewIndex: initialIndex,
-    backdrop: true,
-    movable: true,
-    zoomable: true,
-    // 图片查看器默认支持旋转/翻转，容易把误触当成操作；这里明确关闭，仅保留缩放、拖拽和 1:1。
-    rotatable: false,
-    rotateOnGesture: false,
-    rotateOnTouch: false,
-    scalable: false,
-    zoomOnWheel: true,
-    zoomRatio: 0.3,
-    zoomOnTouch: true,
-    zoomOnGesture: true,
-    slideOnTouch: true,
-    slideOnWheel: false,
-    toggleOnDblclick: true,
-    tooltip: true,
-    toolbar: { zoomIn: true, zoomOut: true, oneToOne: true, reset: true, prev: false, next: false, play: false },
-    view: event => {
-      // view fires when viewer.js commits a navigation (before image loading),
-      // so a close during a slide transition still captures the target index.
-      if (previewSession === session && !session.cleaned && !session.closing) session.currentIndex = event.detail.index
-    },
-    viewed: event => {
-      // Keep the final loaded index as a second guard for touch/keyboard races.
-      if (previewSession === session && !session.cleaned && !session.closing) session.currentIndex = event.detail.index
-    },
-    hidden: () => {
-      if (previewSession !== session || session.cleaned) return
-      // destroyPreview(false) already owns the main-viewer transition.  A late
-      // hidden event from that destroy must only clean up, never re-apply a stale page.
-      if (!session.closing) syncSessionPage()
-      session.closing = true
-      // hidden is the normal viewer.js close path; clean up the now-hidden
-      // instance once (destroy() will not dispatch hidden again).
-      destroyPreview(false)
-    },
-  })
-  session.viewer = instance
   previewSession = session
-  preview = instance
-  previewToken = token
   previewing.value = true
-  instance.show()
-  bindBackdropClose(host)
+  previewHandle = showImagePreview(previewOptions(session, initialIndex)) as ImagePreviewHandle
 }
-// 点浮层空白处关闭，拖动过图片时不触发。
-function bindBackdropClose(host: HTMLElement) {
-  const overlay = host.querySelector<HTMLElement>('.viewer-container')
-  if (!overlay) return
-  let start: { x: number; y: number } | null = null
-  overlay.addEventListener('pointerdown', event => { start = { x: (event as PointerEvent).clientX, y: (event as PointerEvent).clientY } })
-  overlay.addEventListener('click', (event: MouseEvent) => {
-    const target = event.target as HTMLElement
-    const moved = start ? Math.abs(event.clientX - start.x) > 6 || Math.abs(event.clientY - start.y) > 6 : false
-    start = null
-    if (moved) return
-    if (target.classList.contains('viewer-container') || target.classList.contains('viewer-canvas')) destroyPreview()
-  })
+function previewOptions(session: PreviewSession, startPosition: number): MediaPreviewOptions {
+  return {
+    images: [...session.images],
+    startPosition,
+    loop: false,
+    closeable: true,
+    showIndex: true,
+    swipeDuration: 300,
+    className: 'media-gallery-preview',
+    teleport: 'body',
+    // 不要单独抬高遮罩：Vant 给遮罩和浮层同一个全局 z-index（2000+），浮层在 DOM 里靠后，
+    // 本来就压在遮罩上；只设 overlayStyle.zIndex 会把遮罩抬到浮层之上，整张图被 0.9 的黑罩
+    // 盖住（浮层内联 z-index 2001 无法被样式表覆盖）。2000+ 也远高于 app 自己的最高 z-index。
+    closeOnClickImage: false,
+    closeOnClickOverlay: true,
+    onChange: (at: number) => changePreviewPage(session, at),
+    onScale: (event: { scale: number }) => { if (event.scale > 1) void upgradePreviewPage(session, session.index) },
+    onClose: () => { if (previewSession === session) closePreview(true) },
+  }
 }
-function destroyPreview(sync = true) {
-  if (previewDestroying) return
+/** 重开只刷新 images / startPosition（浮层不会关闭），用来把某一页换成原图或按方向键翻页。 */
+function reopenPreview(session: PreviewSession) {
+  if (previewSession !== session || session.closing) return
+  resetPreviewZoom()
+  previewHandle = showImagePreview(previewOptions(session, session.index)) as ImagePreviewHandle
+}
+/** 浮层翻页：记录页码、复位缩放、按需升级原图，并同步主查看器。 */
+function changePreviewPage(session: PreviewSession, at: number) {
+  if (previewSession !== session || session.closing) return
+  session.index = at
+  resetPreviewZoom()
+  const entry = session.assets[at]
+  if (!entry) return
+  // 由浮层发起的换页：主查看器跟着换，但不能再把浮层销毁掉。
+  if (entry.pageIndex !== index.value && entry.pageIndex >= 0 && entry.pageIndex < (detail.value?.assets.length || 0)) {
+    previewOwnsIndex = true
+    selectPage(entry.pageIndex, false)
+  }
+  void upgradePreviewPage(session, at)
+}
+/** 方向键翻页：function-call 没暴露 prev/next，用 startPosition 跳到相邻页。 */
+function stepPreview(step: 1 | -1) {
   const session = previewSession
-  if (!session) {
-    preview?.destroy()
-    preview = undefined
-    previewToken?.remove()
-    previewToken = undefined
-    previewing.value = false
+  if (!session || session.closing) return
+  const target = session.index + step
+  if (target < 0 || target >= session.images.length) return
+  changePreviewPage(session, target)
+  reopenPreview(session)
+}
+/** 正在浏览 / 放大的 Pixiv 页按需取原图；拿不到就继续用预览图。 */
+async function upgradePreviewPage(session: PreviewSession, at: number) {
+  const entry = session.assets[at]
+  if (!entry || entry.item.origin !== 'pixiv' || session.translatedIndex === at) return
+  const url = originalAssetUrl(entry.item)
+  if (session.images[at] === url) return
+  const source = resolvePreviewSource(entry.item, originalAssets.value, { forceOriginal: true })
+  if (!source?.fallback) return
+  try {
+    await images.load(`preview:${entry.item.id}:${url}`, url)
+  } catch {
     return
   }
-  previewDestroying = true
-  // Mark the session closing before viewer.js dispatches hidden synchronously;
-  // the callback then performs the final one-time sync and cleanup itself.
-  session.closing = true
-  if (sync) {
-    // When called by an explicit close, viewer.js's current index is authoritative.
-    // This path is also safe if hidden is delivered synchronously by destroy().
-    const viewed = session.assets[session.currentIndex]
-    if (viewed && viewed.pageIndex !== index.value) selectPage(viewed.pageIndex)
-  }
-  try { session.viewer.destroy() } catch { /* 浮层可能已经关闭 */ }
-  session.viewer = undefined as unknown as InstanceType<typeof Viewer>
-  session.cleaned = true
-  session.token.remove()
-  if (previewSession === session) {
-    previewSession = undefined
-    preview = undefined
-    previewToken = undefined
-    previewing.value = false
-  }
-  previewDestroying = false
+  if (previewSession !== session || session.closing || session.assets[at] !== entry) return
+  session.images[at] = url
+  session.fallbacks.set(url, source.fallback)
+  originalAssets.value = new Set([...originalAssets.value, entry.item.id])
+  const element = previewItemElement(at)?.querySelector('img')
+  if (element) element.src = url
 }
-function selectPage(target: number) {
+function previewItemElement(at: number): HTMLElement | null {
+  const overlay = document.querySelector('.media-gallery-preview')
+  const items = overlay?.querySelectorAll<HTMLElement>('.van-image-preview__swipe-item')
+  return items?.item(at) || null
+}
+/** 原图 403/404：换回预览图并让 Vant 重新渲染这一页（src 变化会重置它自己的错误态）。 */
+function previewImageError(event: Event) {
+  const session = previewSession
+  const target = event.target
+  if (!session || session.closing || !(target instanceof HTMLImageElement)) return
+  if (!target.closest('.media-gallery-preview')) return
+  const src = target.getAttribute('src') || ''
+  const fallback = session.fallbacks.get(src)
+  if (!fallback) return
+  session.fallbacks.delete(src)
+  // 原图确实不可用：主舞台也不该再继续用它（否则 mediaUrl 会停在 403 的原图上）。
+  const failed = session.assets.filter(entry => originalAssetUrl(entry.item) === src)
+  if (failed.length) {
+    const next = new Set(originalAssets.value)
+    for (const entry of failed) next.delete(entry.item.id)
+    originalAssets.value = next
+  }
+  session.images = session.images.map(image => image === src ? fallback : image)
+  reopenPreview(session)
+}
+// Vant ImagePreview 只处理触摸：桌面端补上滚轮缩放与拖拽平移（不重写成第二个查看器）。
+let zoomElement: HTMLElement | null = null
+let zoomBaseTransform = ''
+let zoomState: ZoomState = { scale: 1, x: 0, y: 0 }
+let panPointerId: number | null = null
+let panOrigin: { x: number; y: number } | null = null
+function previewImageBox(): { el: HTMLElement; frame: HTMLElement } | null {
+  const session = previewSession
+  if (!session) return null
+  const el = previewItemElement(session.index)?.querySelector<HTMLElement>('.van-image-preview__image')
+  if (!el?.parentElement) return null
+  return { el, frame: el.parentElement }
+}
+function applyPreviewZoom() {
+  if (!zoomElement) return
+  zoomElement.style.transform = zoomState.scale === 1
+    ? zoomBaseTransform
+    : `matrix(${zoomState.scale},0,0,${zoomState.scale},${zoomState.x},${zoomState.y})`
+  zoomElement.style.transitionDuration = '0s'
+}
+function resetPreviewZoom() {
+  if (zoomElement) {
+    zoomElement.style.transform = zoomBaseTransform
+    zoomElement.style.transitionDuration = ''
+  }
+  zoomElement = null
+  zoomBaseTransform = ''
+  zoomState = { scale: 1, x: 0, y: 0 }
+  panPointerId = null
+  panOrigin = null
+}
+function previewWheel(event: WheelEvent) {
+  if (!previewing.value) return
+  const box = previewImageBox()
+  if (!box) return
+  event.preventDefault()
+  if (zoomElement !== box.el) {
+    resetPreviewZoom()
+    zoomElement = box.el
+    zoomBaseTransform = box.el.style.transform
+  }
+  const frame = box.frame.getBoundingClientRect()
+  const size = { width: box.el.offsetWidth || frame.width, height: box.el.offsetHeight || frame.height }
+  const cursor = { x: event.clientX - frame.left - size.width / 2, y: event.clientY - frame.top - size.height / 2 }
+  zoomState = zoomAt(zoomState, cursor, event.deltaY < 0 ? 1.15 : 1 / 1.15, size)
+  if (zoomState.scale <= 1) { resetPreviewZoom(); return }
+  applyPreviewZoom()
+}
+function previewPointerDown(event: PointerEvent) {
+  if (!previewing.value || event.button !== 0 || zoomState.scale <= 1 || !zoomElement) return
+  if (!(event.target instanceof Element) || !event.target.closest('.media-gallery-preview')) return
+  panPointerId = event.pointerId
+  panOrigin = { x: event.clientX, y: event.clientY }
+  event.preventDefault()
+}
+function previewPointerMove(event: PointerEvent) {
+  if (panPointerId !== event.pointerId || !panOrigin || !zoomElement) return
+  const size = { width: zoomElement.offsetWidth, height: zoomElement.offsetHeight }
+  zoomState = constrainZoom({
+    scale: zoomState.scale,
+    x: zoomState.x + event.clientX - panOrigin.x,
+    y: zoomState.y + event.clientY - panOrigin.y,
+  }, size)
+  panOrigin = { x: event.clientX, y: event.clientY }
+  applyPreviewZoom()
+}
+function previewPointerUp(event: PointerEvent) {
+  if (panPointerId !== event.pointerId) return
+  panPointerId = null
+  panOrigin = null
+}
+/** 关闭浮层：默认把浏览到的页码应用回主查看器。 */
+function closePreview(sync = true) {
+  const session = previewSession
+  previewSession = undefined
+  previewing.value = false
+  resetPreviewZoom()
+  if (sync && session) {
+    const entry = session.assets[session.index]
+    if (entry && entry.pageIndex !== index.value) {
+      previewOwnsIndex = true
+      selectPage(entry.pageIndex, false)
+    }
+  }
+  const handle = previewHandle
+  previewHandle = undefined
+  if (handle) { try { handle.close() } catch { /* 浮层可能已经关闭 */ } }
+}
+function selectPage(target: number, animate = true) {
+  if (target === index.value) return
   slide.value = target >= index.value ? 1 : -1
-  index.value = target
+  goToIndex(target, slide.value >= 0 ? 1 : -1, animate)
 }
 function keyboard(event: KeyboardEvent) {
-  if (!isActive.value || previewing.value) return
+  if (!isActive.value) return
+  if (previewing.value) {
+    // Vant 浮层只处理触摸：桌面端补回 Esc 关闭与方向键翻页。
+    if (event.key === 'Escape') { event.preventDefault(); closePreview(true); return }
+    if (event.key === 'ArrowRight') { event.preventDefault(); stepPreview(1); return }
+    if (event.key === 'ArrowLeft') { event.preventDefault(); stepPreview(-1); return }
+    return
+  }
   const target = event.target
   if (target instanceof HTMLElement && target.matches('input,textarea,video,button,select')) return
   if (event.key === 'ArrowRight') { event.preventDefault(); next(1) }
@@ -746,12 +987,14 @@ function closeRoot() {
 </script>
 
 <template>
-  <main ref="root" class="viewer-page" :aria-label="work.title" @keydown="keyboard" @click.capture="suppressGestureClick" @pointerdown="pointerDown" @pointermove="pointerMove" @pointerup="pointerUp" @pointercancel="pointerCancel" @touchstart.passive="touchStart" @touchmove.passive="touchMove" @touchend="touchEnd" @touchcancel="touchCancel">
-    <div class="viewer-content">
+  <main ref="root" class="viewer-page" :aria-label="work.title" @click.capture="suppressGestureClick" @pointerdown="pointerDown" @pointermove="pointerMove" @pointerup="pointerUp" @pointercancel="pointerCancel" @touchstart.passive="touchStart" @touchmove.passive="touchMove" @touchend="touchEnd" @touchcancel="touchCancel">
+    <div class="viewer-content" :style="contentStyle">
       <div class="viewer-main">
-        <div ref="stage" class="media-stage" :style="dragX ? { transform: `translateX(${dragX}px)`, transition: 'none' } : undefined">
-          <Transition :name="slideName" mode="out-in" @before-leave="releaseVideos">
-            <div :key="mediaKey" class="media-frame">
+        <div ref="stage" class="media-stage">
+          <div class="media-pager" :style="pagerStyle">
+            <div class="media-page" aria-hidden="true"><img v-if="previousUrl" :src="previousUrl" alt="" draggable="false" /></div>
+            <div class="media-page">
+              <div :key="mediaKey" class="media-frame" :class="entering ? 'enter-' + entering : undefined">
               <p v-if="!asset" class="inline-error">作品没有可显示的媒体</p>
               <template v-else>
                 <video v-if="isVideo" v-release-video ref="video" :key="mediaUrl" :src="mediaUrl" :poster="asset.thumbnail" controls playsinline preload="metadata" :autoplay="isActive && (slideshow || asset.kind === 'animation')" :muted="asset.kind === 'animation'" :loop="asset.kind === 'animation' && !slideshow" @error="handleVideoError" @ended="slideshow && isActive && next(1, true)" />
@@ -760,7 +1003,9 @@ function closeRoot() {
                 <div v-if="mediaError" class="media-error"><Icon name="warning" :size="32" /><p>{{ isVideo ? '浏览器无法播放这个视频' : '无法读取这张图片' }}</p><button v-if="asset?.origin === 'pixiv'" class="button tonal" @click="retryMedia"><Icon name="refresh" :size="18" />重试</button><button v-else-if="isVideo" class="button tonal" :disabled="converting" @click="makeCompatible">{{ converting ? '正在处理…' : '生成兼容版本' }}</button></div>
               </template>
             </div>
-          </Transition>
+          </div>
+            <div class="media-page" aria-hidden="true"><img v-if="nextUrl" :src="nextUrl" alt="" draggable="false" /></div>
+          </div>
           <button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow previous" aria-label="上一张" @click="next(-1)"><Icon name="left" :size="32" /></button><button v-if="(detail?.assets.length || 0) > 1" class="viewer-arrow next" aria-label="下一张" @click="next(1)"><Icon name="right" :size="32" /></button>
         </div>
         <div class="viewer-controls"><span class="viewer-media-info">{{ asset ? kindLabel(asset.kind) + (asset.size > 0 ? ' · ' + formatSize(asset.size) : '') : '' }}</span><div class="viewer-actions"><button v-if="work.hasLocal !== false" class="icon-button" :class="{ selected: work.favorite }" :aria-label="work.favorite ? '取消本地收藏' : '加入本地收藏'" :aria-pressed="work.favorite" @click="emit('favorite', work)"><Icon :name="work.favorite ? 'heart-filled' : 'heart'" :size="20" /></button><button v-if="cloudEnabled && work.pixivId" class="icon-button cloud-favorite" :class="{ selected: work.cloudBookmark?.bookmarked }" :aria-label="work.cloudBookmark?.bookmarked ? '取消 Pixiv 云端收藏' : '加入 Pixiv 云端收藏'" :aria-pressed="work.cloudBookmark?.bookmarked === true" @click="emit('cloudFavorite', work)"><Icon :name="work.cloudBookmark?.bookmarked ? 'cloud-heart' : 'cloud'" :size="20" /></button><button class="icon-button" :aria-label="slideshow ? '停止自动翻页' : '自动翻页'" :aria-pressed="slideshow" @click="slideshow = !slideshow"><Icon :name="slideshow ? 'pause' : 'play'" :size="22" /></button><button class="icon-button" aria-label="全屏" @click="fullscreen"><Icon name="fullscreen" :size="22" /></button><button class="icon-button" aria-label="返回上一页" @click="closeRoot"><Icon name="left" :size="22" /></button></div></div>

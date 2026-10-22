@@ -42,8 +42,7 @@
     "pinyin-pro": "^3.27.0",
     "quickjs-emscripten": "^0.32.0",
     "sharp": "^0.34.5",
-    "v-viewer": "^3.0.23",
-    "viewerjs": "^1.15.0",
+    "vant": "^4.10.2",
     "vue": "^3.5.22",
     "vue-router": "^5.3.1"
   },
