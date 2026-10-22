@@ -27,6 +27,7 @@ import { debugLogging, logApi, logError, logInfo, setLoggingEnabled } from './lo
 import { registerPixivRoutes } from './pixiv/routes.js'
 import { getPixivRuntime } from './pixiv/auth.js'
 import { buildUnifiedCatalog, pixivBookmarkCatalog, workMatchesSource, withLocalCloudBookmarks } from './pixiv/catalog.js'
+import { compareWorksByCollected, compareWorksByDate } from './work-order.js'
 import { getPixivBookmarkRestrict, getPixivWorkRecord } from './pixiv/store.js'
 import { getOrCachePixivResource, pixivCacheKey } from './pixiv/cache.js'
 
@@ -239,7 +240,7 @@ export async function createApp(logging = true) {
     return suggestTags(request.query.q || '')
   })
 
-  app.get<{ Querystring: { q?: string; source?: string; kind?: string; favorites?: string; page?: string; sort?: string; fuzzy?: string; by?: string; seed?: string } }>('/api/works', async request => {
+  app.get<{ Querystring: { q?: string; source?: string; kind?: string; favorites?: string; page?: string; sort?: string; fuzzy?: string; by?: string; seed?: string; localOnly?: string } }>('/api/works', async request => {
     const started = performance.now()
     const query = request.query
     const favorites = favoriteIds()
@@ -250,7 +251,7 @@ export async function createApp(logging = true) {
     // 切换来源时把本地作品和两个云书架再次合并一遍。
     const catalog = accountId && (query.source === 'pixiv:public' || query.source === 'pixiv:private')
       ? pixivBookmarkCatalog(accountId, query.source.endsWith(':private') ? 'private' : 'public')
-      : query.source && !query.source.startsWith('pixiv:')
+      : query.localOnly === 'true' || (query.source && !query.source.startsWith('pixiv:'))
         ? withLocalCloudBookmarks(accountId, localWorks)
         : buildUnifiedCatalog(accountId, localWorks)
     // kind 支持逗号分隔的多个值，例如 kind=video,animation：界面把视频和动图合并成了一个筛选。
@@ -263,7 +264,6 @@ export async function createApp(logging = true) {
       // 收藏编号只在同一个媒体目录内部可比：Pixiv 的 bmk_id 和 Telegram 的消息号含义与量级都不同，
       // 所以结果里涉及多个来源（混合显示）时忽略 by=collected，退回发布日期排序。
       const byCollected = query.by === 'collected' && new Set(results.map(({ work }) => work.sourceId)).size === 1
-      const collected = (work: { collected?: number }) => work.collected ?? 0
       // 随机顺序：用查询串里的 seed 做可复现的乱序，翻页时顺序保持稳定，不会重复或漏掉作品。
       const seed = query.seed || '0'
       const shuffleKey = (work: { id: string }) => {
@@ -272,14 +272,16 @@ export async function createApp(logging = true) {
         for (let i = 0; i < text.length; i++) { hash ^= text.charCodeAt(i); hash = Math.imul(hash, 16777619) }
         return hash >>> 0
       }
+      // 两个比较器都会把「不可用作品」排到最后；by=collected 还会把没有真实收藏序号的
+      // 作品排到有序号的作品之后（见 server/work-order.ts），可用作品的相对顺序不变。
       const compare = query.sort === 'random' ? (a: typeof results[number], b: typeof results[number]) => shuffleKey(a.work) - shuffleKey(b.work)
         : query.sort === 'title' ? (a: typeof results[number], b: typeof results[number]) => a.work.title.localeCompare(b.work.title, 'zh-CN')
         : query.sort === 'oldest' ? (a: typeof results[number], b: typeof results[number]) => byCollected
-          ? collected(a.work) - collected(b.work) || a.work.updated - b.work.updated
-          : a.work.date.localeCompare(b.work.date)
+          ? compareWorksByCollected(a.work, b.work, 'oldest')
+          : compareWorksByDate(a.work, b.work, 'oldest')
           : (a: typeof results[number], b: typeof results[number]) => byCollected
-            ? collected(b.work) - collected(a.work) || b.work.updated - a.work.updated
-            : b.work.date.localeCompare(a.work.date)
+            ? compareWorksByCollected(a.work, b.work, 'newest')
+            : compareWorksByDate(a.work, b.work, 'newest')
       results = results.sort(compare)
     }
     const pages = Math.max(1, Math.ceil(results.length / 48))

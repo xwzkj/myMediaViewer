@@ -177,6 +177,10 @@ export function savePixivWorkRecords(accountId: string, records: PixivStoredWork
         if (!meta.detailFetchedAt && existing.meta.detailFetchedAt) {
           meta.pages = existing.meta.pages
           meta.detailFetchedAt = existing.meta.detailFetchedAt
+          // 页面沿用旧详情后，可用性判定也要一起沿用，否则列表里的 placeholder 会把
+          // 一个仍有完整详情页的作品标成不可用。
+          if (existing.work.unavailable) work.unavailable = true
+          else delete work.unavailable
         }
         if (!meta.userCheckedAt && existing.meta.userCheckedAt) meta.userCheckedAt = existing.meta.userCheckedAt
         // Creator UID survives list rewrites that omit the author.

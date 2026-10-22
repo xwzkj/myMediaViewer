@@ -9,6 +9,45 @@ import type { PixivPageMeta, PixivRawIllust, PixivStoredWork, PixivUgoiraMeta, P
 export const PIXIV_PUBLIC_SOURCE = 'pixiv:public'
 export const PIXIV_PRIVATE_SOURCE = 'pixiv:private'
 
+/**
+ * 不在收藏夹里的云作品（详情直达 / 搜索 / 推荐）的来源。
+ *
+ * 过去没有收藏夹 restrict 的作品一律套用 pixivSourceName()，于是每个从搜索或推荐
+ * 点进来的作品都被标成「Pixiv 公开收藏」。这里给云作品一个中性来源，只在确实读过
+ * 收藏夹（restrict 已知）时才使用收藏夹来源名。
+ */
+export type PixivCloudOrigin = 'cloud' | 'search' | 'related'
+const CLOUD_SOURCES: Record<PixivCloudOrigin, { id: string; name: string }> = {
+  cloud: { id: 'pixiv:cloud', name: 'Pixiv 云作品' },
+  search: { id: 'pixiv:search', name: 'Pixiv 云搜索' },
+  related: { id: 'pixiv:related', name: 'Pixiv 云推荐' },
+}
+
+export function pixivCloudSource(origin: PixivCloudOrigin): { id: string; name: string } {
+  return CLOUD_SOURCES[origin]
+}
+
+export function asPixivCloudOrigin(value: unknown): PixivCloudOrigin {
+  return value === 'search' || value === 'related' || value === 'cloud' ? value : 'cloud'
+}
+
+/**
+ * Pixiv 对已删除 / 当前账号不可见的作品只返回 placeholder、limit 或 privacy 图 URL。
+ * 该判定只在这里实现一次，归一化、缓存合并与列表排序统一复用它。
+ */
+export function isPixivPlaceholder(url: string): boolean {
+  return !url || /pximg\.net\/common\/|limit[_-]?illust|privacy/i.test(url)
+}
+
+/**
+ * 页元数据里没有任何可用媒体：每一页的 preview 和 original 都是 placeholder，
+ * 或干脆没有页（pages 为空数组）。undefined 表示没有页元数据，不做判定，避免误伤。
+ */
+export function isUnavailablePages(pages?: PixivPageMeta[]): boolean {
+  if (!Array.isArray(pages)) return false
+  return !pages.some(page => !isPixivPlaceholder(page.preview) || !isPixivPlaceholder(page.original))
+}
+
 type CatalogCacheEntry = { key: string; at: number; works: Work[] }
 const catalogCache = new Map<string, CatalogCacheEntry>()
 const CATALOG_CACHE_MS = 1500
@@ -98,13 +137,18 @@ export function normalizePixivIllust(
     text(tag.name),
     text(tag.translated_name),
   ]).filter(Boolean))]
-  const sourceRestrict = restrict || 'public'
-  const sourceId = pixivSourceId(sourceRestrict)
-  const updated = Date.parse(raw.create_date || '') || Date.now()
+  // 只有真正读过收藏夹（restrict 已知）的作品才用收藏夹来源名；其余云作品用中性来源，
+  // 否则从搜索/推荐/详情点进来的作品会被错误地标成「Pixiv 公开收藏」。
+  const source = restrict ? { id: pixivSourceId(restrict), name: pixivSourceName(restrict) } : pixivCloudSource('cloud')
+  // 收藏接口对已删除/不可见的作品可能没有 create_date。不要用「现在」兜底：那会让
+  // 坏作品看起来永远是最新的。退到 0（1970-01-01）并标记 Work.unavailable，排序既有
+  // 分组兜底，日期本身也不再撒谎。
+  const unavailable = isUnavailablePages(pages)
+  const updated = Date.parse(raw.create_date || '') || 0
   const work: Work = {
     id: `pixiv:${illustId}`,
-    sourceId,
-    sourceName: pixivSourceName(sourceRestrict),
+    sourceId: source.id,
+    sourceName: source.name,
     sourceKind: 'pixiv',
     externalId: illustId,
     title: text(raw.title) || `Pixiv #${illustId}`,
@@ -122,9 +166,10 @@ export function normalizePixivIllust(
     hasLocal: false,
     pixivId: illustId,
     ...(pixivUserId ? { pixivUserId } : {}),
-    memberships: [{ id: sourceId, name: pixivSourceName(sourceRestrict), kind: 'pixiv', origin: 'pixiv' }],
+    ...(unavailable ? { unavailable: true } : {}),
+    memberships: [{ id: source.id, name: source.name, kind: 'pixiv', origin: 'pixiv' }],
     cloudBookmark: restrict
-      ? { bookmarked: true, restrict: sourceRestrict }
+      ? { bookmarked: true, restrict }
       : raw.is_bookmarked === undefined ? null : { bookmarked: raw.is_bookmarked === true, restrict: 'public' },
   }
   return { work, meta }
@@ -167,6 +212,14 @@ function localMembership(work: Work): WorkMembership {
   return { id: work.sourceId, name: work.sourceName, kind: work.sourceKind, origin: 'local' }
 }
 
+/**
+ * 读取镜像记录时回填媒体可用性。旧库里的 Work 还没有 unavailable 字段，
+ * 但页元数据已经能判定「已删除/当前账号不可见」的收藏，无需等下一次收藏夹同步。
+ */
+function withAvailability(work: Work, meta?: PixivWorkMeta): Work {
+  return isUnavailablePages(meta?.pages) ? { ...work, unavailable: true } : work
+}
+
 function mergeLocalAndCloud(local: Work, cloud: Work, records: Array<{ restrict: PixivBookmarkRestrict; work: Work }>): Work {
   const memberships = [localMembership(local)]
   const tags = new Set(local.tags.filter(Boolean))
@@ -207,12 +260,12 @@ export function buildUnifiedCatalog(accountId: string | null, localWorks?: Work[
 
   const cloudRecords = getPixivWorkRecords(accountId)
   const cloudById = new Map(cloudRecords.map(record => [record.work.pixivId || record.work.externalId, record]))
-  const bookmarkRecords = new Map<string, Array<{ restrict: PixivBookmarkRestrict; work: Work }>>()
+  const bookmarkRecords = new Map<string, Array<{ restrict: PixivBookmarkRestrict; work: Work; meta?: PixivWorkMeta }>>()
   for (const restrict of ['public', 'private'] as const) {
     for (const record of getPixivBookmarkRecords(accountId, restrict)) {
       const id = record.work.pixivId || record.work.externalId
       const list = bookmarkRecords.get(id) || []
-      list.push({ restrict, work: record.work })
+      list.push({ restrict, work: record.work, meta: record.meta })
       bookmarkRecords.set(id, list)
     }
   }
@@ -236,7 +289,7 @@ export function buildUnifiedCatalog(accountId: string | null, localWorks?: Work[
     }))
     const primary = memberships.some(item => item.id === PIXIV_PRIVATE_SOURCE) ? PIXIV_PRIVATE_SOURCE : PIXIV_PUBLIC_SOURCE
     output.push({
-      ...record.work,
+      ...withAvailability(record.work, record.meta),
       id: `pixiv:${id}`,
       sourceId: primary,
       sourceName: primary === PIXIV_PRIVATE_SOURCE ? pixivSourceName('private') : pixivSourceName('public'),
@@ -269,7 +322,7 @@ export function withLocalCloudBookmarks(accountId: string | null, works: Work[])
 
 export function pixivBookmarkCatalog(accountId: string, restrict: PixivBookmarkRestrict): Work[] {
   return getPixivBookmarkRecords(accountId, restrict).map(record => ({
-    ...record.work,
+    ...withAvailability(record.work, record.meta),
     id: `pixiv:${record.work.pixivId || record.work.externalId}`,
     sourceId: pixivSourceId(restrict),
     sourceName: pixivSourceName(restrict),

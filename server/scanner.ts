@@ -96,7 +96,10 @@ export async function scanLibrary(options: ScanOptions = {}): Promise<void> {
             id, externalId, sourceId: source.id, sourceName: source.name, sourceKind: source.kind,
             ...details, title: details.title || `${source.name} · ${externalId}`,
             date: details.date || new Date(updated).toISOString(), updated, count: visible.length,
-            collected: sequences.length ? sequences.reduce((max, n) => Math.max(max, n), 0) : updated,
+            // 解析不出收藏序号时不能拿 updated 当序号：毫秒时间戳远大于真实序号
+            // （Pixiv bmk_id 是亿级），会让这些作品永远霸占「收藏时间」排序的最前面。
+            // 统一写 0，交给 compareWorksByCollected 放进「无序号」档排到最后。
+            collected: sequences.length ? sequences.reduce((max, n) => Math.max(max, n), 0) : 0,
             kind: visible.some(a => a.kind === 'video') ? 'video' : visible.some(a => a.kind === 'animation') ? 'animation' : 'image',
             coverId: visible[0].id,
           })

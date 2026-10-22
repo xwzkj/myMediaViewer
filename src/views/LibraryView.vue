@@ -200,6 +200,7 @@ async function loadPage(target: number, silent = false) {
   moreFailed.value = false
   if (target <= 1) { if (!silent) loading.value = true; error.value = '' } else loadingMore.value = true
   const params = new URLSearchParams({ q: submittedQuery.value, source: source.value, kind: kind.value === 'video' ? 'video,animation' : kind.value, favorites: String(view.value === 'favorites'), page: String(target), sort: sort.value, fuzzy: String(fuzzy.value), by: effectiveOrder.value, seed: seed.value })
+  if (route.value.name === 'library' || route.value.name === 'source') params.set('localOnly', 'true')
   const cacheKey = params.toString()
   if (target === 1 && !silent) {
     const cached = pageCache.get(cacheKey)
@@ -709,22 +710,27 @@ function applyRoute() {
   view.value = name === 'favorites' ? 'favorites' : 'library'
   source.value = name === 'source'
     ? String(route.value.params.sourceId || '')
-    : typeof route.value.query.source === 'string' ? route.value.query.source : memory.source
+    : typeof route.value.query.source === 'string' ? route.value.query.source : name === 'library' ? '' : memory.source
   if (source.value.startsWith('pixiv:')) {
     const restrict = source.value === 'pixiv:private' ? 'private' : 'public'
     source.value = ''
     void replacePage(router, { name: 'cloudFavorites', query: { restrict } }, route.value)
     return
   }
-  kind.value = route.value.query.kind === 'image' || route.value.query.kind === 'video' ? route.value.query.kind : memory.kind
+  kind.value = route.value.query.kind === 'image' || route.value.query.kind === 'video' ? route.value.query.kind : name === 'library' ? '' : memory.kind
   fuzzy.value = memory.fuzzy
   sort.value = memory.sort
   order.value = memory.order
   seed.value = memory.seed || String(Date.now())
   applySubmittedQuery('')
 }
-// 切换视图时保留筛选选项；只有显式传入来源才改动来源（传空字符串代表全部来源）。
+// 媒体库入口显示全部本地媒体；重复点击当前页时也清除来源和类型筛选。
+// 收藏和具体来源入口继续保留各自的筛选。
 function navigate(next: 'library' | 'favorites', sourceId?: string) {
+  if (next === 'library' && sourceId === '' && route.value.name === 'library') {
+    source.value = ''
+    kind.value = ''
+  }
   const nextSource = sourceId !== undefined ? sourceId : source.value.startsWith('pixiv:') ? '' : source.value
   if (next === 'favorites') {
     void pushPage(router, { name: 'favorites', query: nextSource ? { source: nextSource } : {} })
@@ -1050,7 +1056,7 @@ onUnmounted(() => {
           <button v-if="!isUserEntity" ref="menuButton" class="icon-button menu-button" :class="{ active: filtersActive }" :aria-expanded="menuOpen" aria-haspopup="true" :title="filtersActive ? '筛选与排序（已应用筛选）' : '筛选与排序'" @click="menuOpen = !menuOpen"><Icon name="tune" :size="21" /><span v-if="filtersActive" class="menu-dot" /></button>
         </div>
         <Transition v-if="!isUserEntity" name="menu-pop"><div v-if="menuOpen" ref="menu" class="filter-menu" role="dialog" aria-label="筛选与排序">
-          <div v-if="!cloudSearchMode && !cloudFavoritesMode && sourceOptions.length > 1" class="menu-row"><span>来源</span><AppSelect v-model="source" compact label="筛选媒体来源" :options="[{ value: '', label: '全部来源' }, ...sourceOptions.map(item => ({ value: item.id, label: item.name }))]" /></div>
+          <div v-if="!cloudSearchMode && !cloudFavoritesMode && sourceOptions.length > 0" class="menu-row"><span>来源</span><AppSelect v-model="source" compact label="筛选媒体来源" :options="[{ value: '', label: '全部来源' }, ...sourceOptions.map(item => ({ value: item.id, label: item.name }))]" /></div>
           <div v-if="!isUserEntity" class="menu-row"><span>媒体类型</span><div class="menu-chips"><button v-for="filter in filters" :key="filter.id" class="filter-chip" :class="{ active: kind === filter.id }" :aria-pressed="kind === filter.id" @click="kind = filter.id"><Icon :name="kind === filter.id ? 'check' : filter.icon" :size="18" />{{ filter.label }}</button></div></div>
           <label v-if="!cloudSearchMode" class="menu-row"><span>模糊匹配</span><span class="fuzzy-toggle"><input v-model="fuzzy" type="checkbox" /><span class="mini-switch" /><span>{{ fuzzy ? '已开启' : '已关闭' }}</span></span></label>
           <div v-if="cloudSearchMode && !isUserEntity" class="menu-row"><span>匹配规则</span><AppSelect v-model="cloudTarget" compact label="云搜索匹配规则" :options="pixivSearchTargets" /></div>
@@ -1095,7 +1101,7 @@ onUnmounted(() => {
       </section>
       <footer class="page-footer"><span>拾光 MEDIA GARDEN</span><span>为每一份喜欢，留一处安放。</span></footer>
     </main>
-    <nav class="mobile-nav" aria-label="手机导航"><button :class="{ active: view === 'library' && !cloudFavoritesMode }" @click="navigate('library')"><span><Icon name="gallery" /></span>媒体库</button><button :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><span><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /></span>我的收藏</button><button :class="{ active: cloudFavoritesMode }" :disabled="!cloudEnabled" @click="openCloudFavorites(cloudFavoritesRestrict)"><span><Icon name="cloud" /></span>云端收藏</button><button @click="openSettings"><span><Icon name="settings" /></span>设置</button></nav>
+    <nav class="mobile-nav" aria-label="手机导航"><button :class="{ active: view === 'library' && !cloudFavoritesMode }" @click="navigate('library', '')"><span><Icon name="gallery" /></span>媒体库</button><button :class="{ active: view === 'favorites' }" @click="navigate('favorites')"><span><Icon :name="view === 'favorites' ? 'heart-filled' : 'heart'" /></span>我的收藏</button><button :class="{ active: cloudFavoritesMode }" :disabled="!cloudEnabled" @click="openCloudFavorites(cloudFavoritesRestrict)"><span><Icon name="cloud" /></span>云端收藏</button><button @click="openSettings"><span><Icon name="settings" /></span>设置</button></nav>
     <AppNotice :notice="toast" @dismiss="dismiss" @action="runAction" />
   </div>
 </template>

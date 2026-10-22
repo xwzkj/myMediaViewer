@@ -7,7 +7,8 @@ import { assertPixivSession, getPixivSessionVersion, clearPixivAccount, getPixiv
 import { pixivFetch, pixivForm } from './client.js'
 import { cleanCacheLimitDays, clearPixivCache, enforcePixivCacheLimit, getOrCachePixivResource, pixivCacheStatus, pixivCacheKey } from './cache.js'
 import { prepareUgoira } from './ugoira.js'
-import { buildUnifiedCatalog, clearUnifiedCatalogCache, cloudAssets, localRelatedWorks, normalizePixivIllust, pixivBookmarkTags } from './catalog.js'
+import { asPixivCloudOrigin, buildUnifiedCatalog, clearUnifiedCatalogCache, cloudAssets, localRelatedWorks, normalizePixivIllust, pixivBookmarkTags, pixivCloudSource, pixivSourceId, pixivSourceName } from './catalog.js'
+import type { PixivCloudOrigin } from './catalog.js'
 import { sendMedia } from '../media.js'
 import { resumePixivMirrors, startPixivMirror, stopPixivMirrors } from './mirror.js'
 import type { PixivRawIllust, PixivUgoiraMeta } from './types.js'
@@ -42,14 +43,20 @@ function decodeCursor(cursor: string | undefined, fallback: string): string {
   }
 }
 
-function normalizeSearchWorks(raw: PixivRawIllust[]): Work[] {
+/**
+ * 搜索与推荐都是「不在收藏夹里」的云作品，只按入口贴标签：搜索是「Pixiv 云搜索」，
+ * 推荐是「Pixiv 云推荐」。归一化出来的记录本身用中性的「Pixiv 云作品」，避免没有
+ * 收藏夹 restrict 的作品被误标成「Pixiv 公开收藏」。
+ */
+function normalizeCloudWorks(raw: PixivRawIllust[], origin: PixivCloudOrigin): Work[] {
   const records = raw.map(illust => normalizePixivIllust(illust))
   const uid = getPixivRuntime().account?.id
   if (uid) savePixivWorkRecords(uid, records)
+  const source = pixivCloudSource(origin)
   return records.map(record => ({
     ...record.work,
-    sourceId: 'pixiv:search',
-    sourceName: 'Pixiv 云搜索',
+    sourceId: source.id,
+    sourceName: source.name,
     memberships: undefined,
   }))
 }
@@ -137,7 +144,7 @@ export async function registerPixivRoutes(app: FastifyInstance): Promise<void> {
       response = pixivIllustPage(await pixivFetch(url))
       setPixivApiCache(cacheKey, response, SEARCH_CACHE_MS)
     }
-    return { items: normalizeSearchWorks(response.illusts || []), nextCursor: encodeCursor(response.next_url), elapsed: Math.round(performance.now() - started) }
+    return { items: normalizeCloudWorks(response.illusts || [], 'search'), nextCursor: encodeCursor(response.next_url), elapsed: Math.round(performance.now() - started) }
   })
 
   app.get<{ Querystring: { q?: string; cursor?: string } }>('/api/pixiv/users/search', async (request): Promise<PixivUserSearchResponse> => {
@@ -259,14 +266,29 @@ export async function registerPixivRoutes(app: FastifyInstance): Promise<void> {
     return result
   })
 
-  app.get<{ Params: { id: string } }>('/api/pixiv/works/:id', async (request): Promise<WorkDetail> => {
+  app.get<{ Params: { id: string }; Querystring: { from?: string } }>('/api/pixiv/works/:id', async (request): Promise<WorkDetail> => {
     requirePixivReady()
     const version = getPixivSessionVersion()
     const record = await fetchIllustRecord(request.params.id)
     assertPixivSession(version)
     const bookmark = await bookmarkState(request.params.id)
     assertPixivSession(version)
-    const work: Work = { ...record.work, cloudBookmark: bookmark ?? record.work.cloudBookmark ?? null }
+    const cloudBookmark = bookmark ?? record.work.cloudBookmark ?? null
+    // 详情接口是唯一不经过列表的来源入口：前端不把「从搜索/推荐进来」的上下文传给
+    // 服务端（route query 里的 from/list 不会带进来），所以这里按收藏状态重新标注，
+    // 收藏夹里的作品保留收藏夹来源名，其余用中性的「Pixiv 云作品」；调用方若确实知道
+    // 入口，可用 ?from=search|related|cloud 覆盖，但覆盖不了收藏夹来源。
+    const bookmarkedRestrict = cloudBookmark?.bookmarked ? cloudBookmark.restrict : null
+    const source = bookmarkedRestrict
+      ? { id: pixivSourceId(bookmarkedRestrict), name: pixivSourceName(bookmarkedRestrict) }
+      : pixivCloudSource(asPixivCloudOrigin(request.query.from))
+    const work: Work = {
+      ...record.work,
+      cloudBookmark,
+      sourceId: source.id,
+      sourceName: source.name,
+      memberships: [{ id: source.id, name: source.name, kind: 'pixiv', origin: 'pixiv' }],
+    }
     return {
       ...work,
       originalUrl: `https://www.pixiv.net/artworks/${request.params.id}`,
@@ -285,7 +307,7 @@ export async function registerPixivRoutes(app: FastifyInstance): Promise<void> {
       response = pixivIllustPage(await pixivFetch(url))
       setPixivApiCache(cacheKey, response, RELATED_CACHE_MS)
     }
-    return { items: normalizeSearchWorks(response.illusts || []), nextCursor: encodeCursor(response.next_url), elapsed: Math.round(performance.now() - started) }
+    return { items: normalizeCloudWorks(response.illusts || [], 'related'), nextCursor: encodeCursor(response.next_url), elapsed: Math.round(performance.now() - started) }
   })
 
   app.put<{ Params: { id: string }; Body: { bookmarked?: boolean } }>('/api/pixiv/works/:id/bookmark', async (request): Promise<PixivBookmarkUpdateResult> => {

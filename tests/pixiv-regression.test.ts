@@ -89,6 +89,8 @@ test('Pixiv 云服务回归', async t => {
       const result = await app.inject('/api/pixiv/search?q=test')
       assert.equal(result.statusCode, 200, result.body)
       assert.equal(result.json().items[0].id, 'pixiv:123')
+      assert.equal(result.json().items[0].sourceName, 'Pixiv 云搜索')
+      assert.equal(result.json().items[0].sourceId, 'pixiv:search')
       const cover = await app.inject('/api/pixiv/assets/123/0/preview')
       assert.equal(cover.statusCode, 200, cover.body)
       assert.equal(details, 0)
@@ -187,6 +189,9 @@ test('Pixiv 云服务回归', async t => {
       }
       const detail = await app.inject('/api/pixiv/works/456')
       assert.equal(detail.statusCode, 200, detail.body)
+      // 456 不在收藏夹里：详情不能再自称「Pixiv 公开收藏」。
+      assert.equal(detail.json().sourceName, 'Pixiv 云作品')
+      assert.equal(detail.json().sourceId, 'pixiv:cloud')
       assert.equal(detail.json().assets.length, 3)
       for (const asset of detail.json().assets) assert.equal((await app.inject(asset.url)).statusCode, 200)
       const seed = store.getPixivWorkRecord(uid, '456')!.work

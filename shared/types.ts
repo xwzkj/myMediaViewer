@@ -50,6 +50,11 @@ export interface Work {
   memberships?: WorkMembership[]
   /** null 表示状态未知；undefined 表示该作品不支持云收藏。 */
   cloudBookmark?: CloudBookmarkState | null
+  /**
+   * 服务端确认媒体已不可用（例如 Pixiv 收藏夹里已删除/不可见的作品只剩 placeholder 图）。
+   * 这类作品可能没有可用的发布日期，列表排序时一律排在可用作品之后。
+   */
+  unavailable?: boolean
 }
 export interface WorkDetail extends Work { assets: Asset[]; originalUrl: string }
 export interface ScanStatus {

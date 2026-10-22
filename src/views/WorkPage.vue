@@ -34,6 +34,11 @@ const favoriteRequests = new Set<string>()
 // 详情返回生命周期：前后翻页后工作 id 已变，回来源时标记 changed 供来源直接定位。
 const returnedChanged = ref(false)
 const savedScrollY = ref(0)
+// 宽屏（>700px）下 .viewer-page 固定 100dvh 且 overflow:hidden，滚动发生在 .work-info
+// 这个 overflow-y:auto 的独立容器里，window.scrollY 恒为 0。KeepAlive 失活会把子树从
+// 文档里摘掉，元素一旦脱离文档 scrollTop 即归零；所以 aside 的滚动位置必须和 window 的
+// 一样在离开前采集、回来渲染后恢复，否则从推荐作品返回时列表会跳回作品信息顶部。
+const savedAsideScroll = ref(0)
 let loadVersion = 0
 let pixivVersion = 0
 let retainedListKey = ''
@@ -50,6 +55,21 @@ function retainList(key: string) {
   retainLibrarySession(key)
 }
 
+// 云端作品详情的来源提示：服务端不知道用户是从哪儿点进来的，这里按来源路由补上，
+// 让「来源」字段能区分云搜索与云推荐；不可解析或来源是收藏夹/作者页时不带提示，
+// 服务端按收藏状态给中性来源。收藏夹里的作品由服务端按 restrict 覆盖，提示不生效。
+function cloudSourceHint(): string {
+  if (!cloudWork.value) return ''
+  const from = typeof route.value.query.from === 'string' ? route.value.query.from : ''
+  if (!from.startsWith('/')) return ''
+  try {
+    const resolved = router.resolve(from)
+    if (resolved.name === 'cloudSearch') return 'search'
+    if (resolved.name === 'cloudWork') return 'related'
+  } catch { /* from 不可解析时退回中性来源 */ }
+  return ''
+}
+
 async function load() {
   const version = ++loadVersion
   const requestVersion = workRequestVersion
@@ -63,7 +83,10 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const value = await api<WorkDetail>(cloudWork.value ? `/pixiv/works/${encodeURIComponent(id)}` : `/works/${encodeURIComponent(id)}`)
+    const hint = cloudSourceHint()
+    const value = await api<WorkDetail>(cloudWork.value
+      ? `/pixiv/works/${encodeURIComponent(id)}${hint ? `?from=${hint}` : ''}`
+      : `/works/${encodeURIComponent(id)}`)
     if (version === loadVersion && requestVersion === workRequestVersion) work.value = value
   } catch (e) {
     if (version !== loadVersion || requestVersion !== workRequestVersion) return
@@ -275,15 +298,34 @@ watch(workIdentity, () => {
 }, { immediate: true })
 watch(() => route.value.fullPath, () => { void refreshPixivStatus() }, { immediate: true })
 
-onActivated(() => {
+// 失活的 KeepAlive 子树会被移入游离容器，document 里只剩当前实例，querySelector 不会拿错页。
+function asideScroller(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('.work-info')
+}
+// 离开详情前采集滚动：窄屏滚 window，宽屏滚 .work-info，两套容器都要记。
+function captureScroll() {
+  savedScrollY.value = window.scrollY
+  savedAsideScroll.value = asideScroller()?.scrollTop ?? 0
+}
+// router scrollBehavior 对 from work 返回 false（不碰滚动），由页面统一在渲染后恢复；
+// nextTick+双 RAF 保证 DOM 高度就绪后才定位，避免被后续渲染覆盖。
+function restoreScroll() {
   const targetY = savedScrollY.value
-  // router scrollBehavior 对 from work 返回 false（不碰滚动），由页面统一在渲染后恢复；
-  // nextTick+双 RAF 保证 DOM 高度就绪后才定位，避免被后续渲染覆盖。
+  const targetAside = savedAsideScroll.value
   void nextTick(() => {
     requestAnimationFrame(() => {
-      requestAnimationFrame(() => { window.scrollTo(0, targetY) })
+      requestAnimationFrame(() => {
+        window.scrollTo(0, targetY)
+        // 首次挂载时 targetAside 为 0：不复位容器，避免覆盖别处刚恢复的位置。
+        const aside = asideScroller()
+        if (aside && targetAside > 0) aside.scrollTop = targetAside
+      })
     })
   })
+}
+
+onActivated(() => {
+  restoreScroll()
   // 统一父失效：auth 变化的旧父 work 已在 handleAuthChanged 清掉；
   // viewer unmount 由 WorkViewer 自身 onUnmounted 释放资源，这里只负责重载。
   // inactive 不 reload 只 dirty+clear，回来（activated）才 reload。
@@ -311,7 +353,7 @@ onUnmounted(() => {
 onBeforeRouteLeave(to => {
   // 离开详情前捕获滚动：唯一写入点。同作品 prev/next 内部导航同样经过这里，
   // 照常记录（router 对同 pid replace 返回 false，由 onActivated 恢复）。
-  savedScrollY.value = window.scrollY
+  captureScroll()
   if (!work.value) return
   const returnPath = typeof route.value.query.from === 'string' ? route.value.query.from : ''
   if (!returnPath) return

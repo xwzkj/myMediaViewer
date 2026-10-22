@@ -1,5 +1,5 @@
 import { assertPixivSession, getPixivRuntime, getPixivSessionVersion, requirePixivReady } from './auth.js'
-import { normalizePixivIllust } from './catalog.js'
+import { isPixivPlaceholder, normalizePixivIllust } from './catalog.js'
 import { pixivFetch } from './client.js'
 import { PixivApiError } from './errors.js'
 import { pixivIllustId } from './protocol.js'
@@ -17,9 +17,9 @@ export function pixivIllustPage(payload: PixivIllustPage): PixivIllustPage {
   return payload
 }
 
-export function isPixivPlaceholder(url: string): boolean {
-  return !url || /pximg\.net\/common\/|limit[_-]?illust|privacy/i.test(url)
-}
+// placeholder / limit / privacy 的判定实现在 catalog.ts：归一化时写 Work.unavailable、
+// 读取镜像合并页面时复用它。这里继续对外导出，保持既有导入路径不变。
+export { isPixivPlaceholder }
 
 export function fetchIllustRecord(value: string, fullDetail = true): Promise<PixivStoredWork> {
   const id = pixivIllustId(value)
