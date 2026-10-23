@@ -3,6 +3,7 @@ import { UGOIRA_ENCODING_VERSION } from '../../shared/ugoira.js'
 import { localPixivId } from './identity.js'
 import type { Asset, MediaKind, PixivBookmarkRestrict, Work, WorkMembership } from '../../shared/types.js'
 import { allWorks } from '../database.js'
+import { libraryRevision } from '../library-revision.js'
 import { getPixivBookmarkRecords, getPixivWorkRecords, getPixivBookmarkStates } from './store.js'
 import type { PixivPageMeta, PixivRawIllust, PixivStoredWork, PixivUgoiraMeta, PixivWorkMeta } from './types.js'
 
@@ -254,7 +255,9 @@ export function buildUnifiedCatalog(accountId: string | null, localWorks?: Work[
 
   // 来源切换会在短时间内连续请求 status、works 和 tags。镜像数据本身只在
   // 后台分页同步时变化，短 TTL 可以避免每个请求都反序列化整套 Pixiv 目录。
-  const cacheKey = `${accountId}|${local.map(work => `${work.id}:${work.updated}:${work.count}:${work.favorite ? 1 : 0}:${work.pixivId || ''}`).join(';')}`
+  // 版本号必须参与 key：详情抓取等写入会递增版本，若只靠 TTL，过期后的新目录
+  // 可能配上旧签名，让搜索索引一直停在旧元数据上。
+  const cacheKey = `${libraryRevision()}|${accountId}|${local.map(work => `${work.id}:${work.updated}:${work.count}:${work.favorite ? 1 : 0}:${work.pixivId || ''}`).join(';')}`
   const cached = catalogCache.get(accountId)
   if (cached && cached.key === cacheKey && Date.now() - cached.at < CATALOG_CACHE_MS) return cached.works
 

@@ -21,8 +21,10 @@ import { sourceTreeSample } from './source-tree.js'
 import { sourceAiTurn, forgetSourceAiConversation, answerSourceAiQuestion, type SourceAiTurn } from './source-ai.js'
 import { previewSource, calculatePreviewGroup } from './source-engine.js'
 import { listDirectories } from './directories.js'
-import { getAiSettings, saveAiSettings, testAiConnection, listAiModels, translateFields, clearTranslationCache } from './ai.js'
-import { getAutoMangaTranslation, getMangaJob, getMangaModelStatus, mangaBaseImagePath, startMangaTranslation } from './ai/manga/service.js'
+import { getAiSettings, saveAiSettings, testAiConnection, listAiModels, translateFields, clearTranslationCache, mergeLocalComputeSettings } from './ai.js'
+import { getAutoMangaTranslation, getMangaJob, getMangaModelStatus, mangaBaseImagePath, startMangaTranslation, clearMangaStatusCache } from './ai/manga/service.js'
+import { checkRemoteCompute } from './ai/manga/remote.js'
+import { libraryRevision, markLibraryChanged } from './library-revision.js'
 import { debugLogging, logApi, logError, logInfo, setLoggingEnabled } from './log.js'
 import { registerPixivRoutes } from './pixiv/routes.js'
 import { getPixivRuntime } from './pixiv/auth.js'
@@ -60,15 +62,21 @@ export async function createApp(logging = true) {
       }
     }
   })
-  app.setErrorHandler((error: Error & { statusCode?: number; expose?: boolean }, request, reply) => {
+  app.setErrorHandler((error: Error & { statusCode?: number; expose?: boolean; code?: unknown; retryable?: unknown; details?: unknown }, request, reply) => {
     const status = error.statusCode || 500
     // 业务错误（AiError 等）的 message 已经能说明问题，只记一行；其余异常附上调用栈。
     reportedErrors.add(request)
     logError('接口', `${request.method} ${request.url.split('?')[0]} · ${status} · ${error.message}`.trim(), error.expose ? undefined : error)
-    // expose 的错误（例如 AI 配置或上游返回问题）直接把原因告诉用户，其余保持笼统提示。
-    // 业务错误可以给用户看；未预期的 5xx 只返回笼统提示，避免泄露路径、SQL 或上游响应。
+    // expose 的错误（例如 AI 配置、上游返回或 Ugoira 资源限制）直接把原因告诉用户，
+    // 其余保持笼统提示；业务错误额外带上白名单字段，未知 5xx 不泄露任何内部信息。
     const message = error.expose === true || status < 500 ? error.message || '请求处理失败' : '服务器处理失败，请检查运行日志'
-    reply.code(status).send({ message })
+    const body: Record<string, unknown> = { message }
+    if (error.expose === true) {
+      if (typeof error.code === 'string' && error.code) body.code = error.code
+      if (typeof error.retryable === 'boolean') body.retryable = error.retryable
+      if (error.details && typeof error.details === 'object' && !Array.isArray(error.details)) body.details = error.details
+    }
+    reply.code(status).send(body)
   })
 
   // 接口调用日志：只保留人工触发的 API，前端轮询和媒体二进制请求交给各自的进度日志汇报。
@@ -226,6 +234,7 @@ export async function createApp(logging = true) {
       db.prepare('DELETE FROM works WHERE source_id = ?').run(request.params.id)
       db.exec('COMMIT')
     } catch (error) { db.exec('ROLLBACK'); throw error }
+    markLibraryChanged()
     refreshSearch()
     logInfo('目录', `移除「${removed.name}」，已清理该目录的索引和收藏记录`)
     return { ok: true }
@@ -235,14 +244,23 @@ export async function createApp(logging = true) {
     schema: { querystring: { type: 'object', additionalProperties: false, properties: { q: { type: 'string', maxLength: 500 } } } },
   }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store')
+    // 先读版本再建目录：扫描恰好落在中间时，宁可多重建一次，也不要把旧目录配上新签名。
+    const revision = libraryRevision()
     const pixiv = getPixivRuntime()
-    refreshSearch(buildUnifiedCatalog(!pixiv.localMode && pixiv.configured ? pixiv.account?.id || null : null, allWorks().map(work => toWork(work, favoriteIds()))))
+    const favorites = favoriteIds()
+    const catalog = buildUnifiedCatalog(
+      !pixiv.localMode && pixiv.configured ? pixiv.account?.id || null : null,
+      allWorks().map(work => toWork(work, favorites)),
+    )
+    // 索引只在数据变化时重建；标签建议与分页请求共用同一份派生数据。
+    refreshSearch(catalog, `${revision}:tags:${catalog.length}`)
     return suggestTags(request.query.q || '')
   })
 
   app.get<{ Querystring: { q?: string; source?: string; kind?: string; favorites?: string; page?: string; sort?: string; fuzzy?: string; by?: string; seed?: string; localOnly?: string } }>('/api/works', async request => {
     const started = performance.now()
     const query = request.query
+    const revision = libraryRevision()
     const favorites = favoriteIds()
     const pixiv = getPixivRuntime()
     const localWorks = allWorks().map(work => toWork(work, favorites))
@@ -256,7 +274,7 @@ export async function createApp(logging = true) {
         : buildUnifiedCatalog(accountId, localWorks)
     // kind 支持逗号分隔的多个值，例如 kind=video,animation：界面把视频和动图合并成了一个筛选。
     const kinds = (query.kind || '').split(',').map(value => value.trim()).filter(Boolean)
-    let results = searchWorks((query.q || '').slice(0, 500), query.fuzzy === 'true', catalog).filter(({ work }) =>
+    let results = searchWorks((query.q || '').slice(0, 500), query.fuzzy === 'true', catalog, `${revision}:${query.source || 'all'}:${query.localOnly === 'true' ? 'local' : 'all'}:${catalog.length}`).filter(({ work }) =>
       workMatchesSource(work, query.source || '') && (!kinds.length || kinds.includes(work.kind))
       && (query.favorites !== 'true' || favorites.has(work.id)))
     if (!query.q?.trim() || query.sort !== 'relevance') {
@@ -341,12 +359,24 @@ export async function createApp(logging = true) {
   app.get('/api/ai/settings', async () => getAiSettings())
   app.put<{ Body: Record<string, unknown> }>('/api/ai/settings', async request => {
     const saved = saveAiSettings(request.body)
+    clearMangaStatusCache()
     logInfo('配置', `AI 接口设置已更新 · 模型 ${saved.model || '未选择'} · ${saved.baseUrl}`)
     return saved
   })
   // 测试与模型列表允许带上设置页里还没保存的表单内容，避免必须“先保存才能测试”。
   app.post<{ Body?: unknown }>('/api/ai/test', async request => testAiConnection(request.body))
   app.post<{ Body?: unknown }>('/api/ai/models', async request => ({ items: await listAiModels(request.body) }))
+  // 测试连接使用表单里尚未保存的地址/Key，避免“必须先把错误地址存下来才能测”。
+  app.post<{ Body?: unknown }>('/api/ai/compute/test', async request => {
+    const config = mergeLocalComputeSettings(request.body)
+    if (!config.apiKey) throw Object.assign(new Error('请先填写远程计算端 API Key'), { statusCode: 400 })
+    if (!/^https?:\/\//i.test(config.baseUrl)) throw Object.assign(new Error('远程计算端地址需要以 http:// 或 https:// 开头'), { statusCode: 400 })
+    const status = await checkRemoteCompute(config)
+    return {
+      protocol: status.protocol, ready: status.ready, device: status.device,
+      models: status.models, ...(status.message ? { message: status.message } : {}),
+    }
+  })
   app.delete('/api/ai/cache', async () => {
     const removed = clearTranslationCache()
     logInfo('缓存', `已清空 ${removed} 条作品翻译缓存`)

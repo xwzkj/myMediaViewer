@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { dataDir } from './config.js'
 import { db } from './database.js'
-import type { AiSettings, AiTranslateFields, SourceAiToolCall } from '../shared/types.js'
+import type { AiSettings, AiTranslateFields, LocalComputeFallback, LocalComputeMode, LocalComputeSettings, SourceAiToolCall } from '../shared/types.js'
 import { DEFAULT_AI_THINKING_LEVEL, asAiThinkingLevel, thinkingRequestParams, type AiThinkingLevel } from '../shared/ai-thinking.js'
 import { toon } from '../shared/toon.js'
 import OpenAI from 'openai'
@@ -33,6 +33,15 @@ const defaults: AiSettings = {
   mangaPipelineMode: 'streaming',
   mangaConcurrency: 3,
   mangaAutoShowTranslated: true,
+  // 默认仍在本机（主服务所在机器）计算，升级后现有行为不变。
+  localCompute: {
+    mode: 'local',
+    baseUrl: 'http://127.0.0.1:3211',
+    fallback: 'error',
+    apiKeyConfigured: false,
+    connectTimeoutMs: 3000,
+    timeoutMs: 15 * 60_000,
+  },
 }
 
 function asText(value: unknown, fallback = ''): string {
@@ -77,24 +86,80 @@ function clampConcurrency(value: unknown, fallback: number): number {
   return Math.min(MAX_CONCURRENCY, Math.max(MIN_CONCURRENCY, Math.round(n)))
 }
 
-function normalize(input: unknown): AiSettings {
-  const raw = (input && typeof input === 'object' && !Array.isArray(input) ? input : {}) as Record<string, unknown>
+const MIN_COMPUTE_CONNECT = 500
+const MAX_COMPUTE_CONNECT = 30_000
+const MIN_COMPUTE_TIMEOUT = 10_000
+const MAX_COMPUTE_TIMEOUT = 60 * 60_000
+
+function clampRange(value: unknown, fallback: number, min: number, max: number): number {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(max, Math.max(min, Math.round(n)))
+}
+
+function asMode(value: unknown, fallback: LocalComputeMode): LocalComputeMode {
+  return value === 'remote' || value === 'local' ? value : fallback
+}
+
+function asFallback(value: unknown, fallback: LocalComputeFallback): LocalComputeFallback {
+  return value === 'local' || value === 'error' ? value : fallback
+}
+
+/** 解析并规范化本地计算设置；Key 单独取出，绝不放进返回给浏览器的对象。 */
+function parseLocalCompute(raw: unknown): { settings: LocalComputeSettings; apiKey: string } {
+  const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {}
+  const defaultsHere = defaults.localCompute
+  const apiKey = typeof value.apiKey === 'string' ? value.apiKey.trim() : ''
   return {
-    baseUrl: asText(raw.baseUrl, defaults.baseUrl) || defaults.baseUrl,
-    apiKey: typeof raw.apiKey === 'string' ? raw.apiKey.trim() : '',
-    model: asText(raw.model, defaults.model),
-    targetLanguage: asText(raw.targetLanguage, defaults.targetLanguage) || defaults.targetLanguage,
-    appendPrompt: asAppendPrompt(raw),
-    outputMode: asOutputMode(raw.outputMode, defaults.outputMode),
-    params: 'params' in raw ? asParams(raw.params) : structuredClone(defaults.params),
-    timeoutMs: clampTimeout(raw.timeoutMs, defaults.timeoutMs),
-    mangaPipelineMode: asPipelineMode(raw.mangaPipelineMode, defaults.mangaPipelineMode),
-    mangaConcurrency: clampConcurrency(raw.mangaConcurrency, defaults.mangaConcurrency),
-    mangaAutoShowTranslated: typeof raw.mangaAutoShowTranslated === 'boolean' ? raw.mangaAutoShowTranslated : defaults.mangaAutoShowTranslated,
+    settings: {
+      mode: asMode(value.mode, defaultsHere.mode),
+      baseUrl: asText(value.baseUrl, defaultsHere.baseUrl) || defaultsHere.baseUrl,
+      fallback: asFallback(value.fallback, defaultsHere.fallback),
+      apiKeyConfigured: Boolean(apiKey),
+      connectTimeoutMs: clampRange(value.connectTimeoutMs, defaultsHere.connectTimeoutMs, MIN_COMPUTE_CONNECT, MAX_COMPUTE_CONNECT),
+      timeoutMs: clampRange(value.timeoutMs, defaultsHere.timeoutMs, MIN_COMPUTE_TIMEOUT, MAX_COMPUTE_TIMEOUT),
+    },
+    apiKey,
   }
 }
 
-function readSettings(): AiSettings {
+/** 保存/合并时处理 Key：显式 apiKey 覆盖，clearApiKey 清除，缺省则沿用已保存的。 */
+function resolveLocalKey(input: unknown, previous: string): string {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return previous
+  const raw = input as Record<string, unknown>
+  const value = raw.localCompute
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return previous
+  const lc = value as Record<string, unknown>
+  if (lc.clearApiKey === true) return ''
+  if (typeof lc.apiKey === 'string') return lc.apiKey.trim()
+  return previous
+}
+
+interface ParsedSettings { settings: AiSettings; apiKey: string }
+
+function normalize(input: unknown): ParsedSettings {
+  const raw = (input && typeof input === 'object' && !Array.isArray(input) ? input : {}) as Record<string, unknown>
+  const local = parseLocalCompute(raw.localCompute)
+  return {
+    settings: {
+      baseUrl: asText(raw.baseUrl, defaults.baseUrl) || defaults.baseUrl,
+      apiKey: typeof raw.apiKey === 'string' ? raw.apiKey.trim() : '',
+      model: asText(raw.model, defaults.model),
+      targetLanguage: asText(raw.targetLanguage, defaults.targetLanguage) || defaults.targetLanguage,
+      appendPrompt: asAppendPrompt(raw),
+      outputMode: asOutputMode(raw.outputMode, defaults.outputMode),
+      params: 'params' in raw ? asParams(raw.params) : structuredClone(defaults.params),
+      timeoutMs: clampTimeout(raw.timeoutMs, defaults.timeoutMs),
+      mangaPipelineMode: asPipelineMode(raw.mangaPipelineMode, defaults.mangaPipelineMode),
+      mangaConcurrency: clampConcurrency(raw.mangaConcurrency, defaults.mangaConcurrency),
+      mangaAutoShowTranslated: typeof raw.mangaAutoShowTranslated === 'boolean' ? raw.mangaAutoShowTranslated : defaults.mangaAutoShowTranslated,
+      localCompute: local.settings,
+    },
+    apiKey: local.apiKey,
+  }
+}
+
+function readSettings(): ParsedSettings {
   if (!existsSync(settingsPath)) return normalize({})
   try {
     return normalize(JSON.parse(readFileSync(settingsPath, 'utf8')))
@@ -105,16 +170,87 @@ function readSettings(): AiSettings {
 }
 
 let current = readSettings()
+/** 计算端 API Key 只在服务进程内保存，读取设置时仅回传 apiKeyConfigured。 */
+let localComputeKey = current.apiKey
 
-export function getAiSettings(): AiSettings { return { ...current, params: { ...current.params } } }
+/**
+ * 已保存的 Key 优先；没有保存时用 COMPUTE_API_KEY 兜底。
+ *
+ * 这样两端可以共用仓库根目录的 .env：计算端用它启动，主服务用它连接，
+ * 不必在设置页再填一遍。兜底来源无法在界面上"清除"，清除只影响已保存的值。
+ */
+function effectiveComputeKey(): string {
+  if (localComputeKey) return localComputeKey
+  return (process.env.COMPUTE_API_KEY || '').trim()
+}
+
+export function getAiSettings(): AiSettings {
+  return {
+    ...current.settings,
+    params: { ...current.settings.params },
+    localCompute: { ...current.settings.localCompute, apiKeyConfigured: Boolean(effectiveComputeKey()) },
+  }
+}
+
+function assertHttpUrl(value: string, label: string): void {
+  if (!/^https?:\/\//i.test(value)) throw new AiError(`${label}需要以 http:// 或 https:// 开头`)
+}
 
 export function saveAiSettings(input: unknown): AiSettings {
-  const next = normalize(input)
-  if (!/^https?:\/\//i.test(next.baseUrl)) throw new AiError('接口地址需要以 http:// 或 https:// 开头')
-  writeFileSync(`${settingsPath}.tmp`, JSON.stringify(next, null, 2), 'utf8')
+  const parsed = normalize(input)
+  const next = parsed.settings
+  assertHttpUrl(next.baseUrl, '接口地址')
+  if (next.localCompute.mode === 'remote') assertHttpUrl(next.localCompute.baseUrl, '远程计算端地址')
+  const key = resolveLocalKey(input, localComputeKey)
+  // 这里记录的是"已保存的 Key"；公开设置里的 apiKeyConfigured 由 getAiSettings 重新计算（含 .env 兜底）。
+  next.localCompute.apiKeyConfigured = Boolean(key)
+  // Key 与设置一起落盘，但不会通过接口回传。
+  const stored = { ...next, localCompute: { ...next.localCompute, apiKey: key } }
+  writeFileSync(`${settingsPath}.tmp`, JSON.stringify(stored, null, 2), 'utf8')
   renameSync(`${settingsPath}.tmp`, settingsPath)
-  current = next
+  current = { settings: next, apiKey: key }
+  localComputeKey = key
   return getAiSettings()
+}
+
+/** 当前生效的本地计算配置（含 Key），只给服务端内部使用。 */
+export interface LocalComputeConfig {
+  mode: LocalComputeMode
+  baseUrl: string
+  fallback: LocalComputeFallback
+  connectTimeoutMs: number
+  timeoutMs: number
+  apiKey: string
+}
+
+export function getLocalComputeConfig(): LocalComputeConfig {
+  const lc = current.settings.localCompute
+  return {
+    mode: lc.mode,
+    baseUrl: lc.baseUrl,
+    fallback: lc.fallback,
+    connectTimeoutMs: lc.connectTimeoutMs,
+    timeoutMs: lc.timeoutMs,
+    apiKey: effectiveComputeKey(),
+  }
+}
+
+/** 设置页测试连接时可以带上尚未保存的表单内容。 */
+export function mergeLocalComputeSettings(input: unknown): LocalComputeConfig {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {}
+  const lc = raw.localCompute && typeof raw.localCompute === 'object' && !Array.isArray(raw.localCompute)
+    ? raw.localCompute as Record<string, unknown>
+    : {}
+  const base = current.settings.localCompute
+  const key = resolveLocalKey(input, effectiveComputeKey())
+  return {
+    mode: asMode(lc.mode, base.mode),
+    baseUrl: typeof lc.baseUrl === 'string' && lc.baseUrl.trim() ? lc.baseUrl.trim() : base.baseUrl,
+    fallback: asFallback(lc.fallback, base.fallback),
+    connectTimeoutMs: clampRange(lc.connectTimeoutMs, base.connectTimeoutMs, MIN_COMPUTE_CONNECT, MAX_COMPUTE_CONNECT),
+    timeoutMs: clampRange(lc.timeoutMs, base.timeoutMs, MIN_COMPUTE_TIMEOUT, MAX_COMPUTE_TIMEOUT),
+    apiKey: key,
+  }
 }
 
 // 合并「已保存配置」与「本次请求携带的配置」：只有请求里确实带了某字段才覆盖。
@@ -123,21 +259,32 @@ export function mergeAiSettings(input: unknown): AiSettings {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return getAiSettings()
   const raw = input as Record<string, unknown>
   const merged: AiSettings = {
-    baseUrl: typeof raw.baseUrl === 'string' && raw.baseUrl.trim() ? raw.baseUrl.trim() : current.baseUrl,
-    apiKey: typeof raw.apiKey === 'string' ? raw.apiKey.trim() : current.apiKey,
-    model: typeof raw.model === 'string' ? raw.model.trim() : current.model,
-    targetLanguage: typeof raw.targetLanguage === 'string' ? raw.targetLanguage.trim() : current.targetLanguage,
-    appendPrompt: typeof raw.appendPrompt === 'string' ? raw.appendPrompt : current.appendPrompt,
-    outputMode: asOutputMode(raw.outputMode, current.outputMode),
-    params: 'params' in raw ? asParams(raw.params) : { ...current.params },
-    timeoutMs: 'timeoutMs' in raw ? clampTimeout(raw.timeoutMs, current.timeoutMs) : current.timeoutMs,
+    baseUrl: typeof raw.baseUrl === 'string' && raw.baseUrl.trim() ? raw.baseUrl.trim() : current.settings.baseUrl,
+    apiKey: typeof raw.apiKey === 'string' ? raw.apiKey.trim() : current.settings.apiKey,
+    model: typeof raw.model === 'string' ? raw.model.trim() : current.settings.model,
+    targetLanguage: typeof raw.targetLanguage === 'string' ? raw.targetLanguage.trim() : current.settings.targetLanguage,
+    appendPrompt: typeof raw.appendPrompt === 'string' ? raw.appendPrompt : current.settings.appendPrompt,
+    outputMode: asOutputMode(raw.outputMode, current.settings.outputMode),
+    params: 'params' in raw ? asParams(raw.params) : { ...current.settings.params },
+    timeoutMs: 'timeoutMs' in raw ? clampTimeout(raw.timeoutMs, current.settings.timeoutMs) : current.settings.timeoutMs,
     mangaPipelineMode: 'mangaPipelineMode' in raw
-      ? asPipelineMode(raw.mangaPipelineMode, current.mangaPipelineMode)
-      : current.mangaPipelineMode,
+      ? asPipelineMode(raw.mangaPipelineMode, current.settings.mangaPipelineMode)
+      : current.settings.mangaPipelineMode,
     mangaConcurrency: 'mangaConcurrency' in raw
-      ? clampConcurrency(raw.mangaConcurrency, current.mangaConcurrency)
-      : current.mangaConcurrency,
-    mangaAutoShowTranslated: typeof raw.mangaAutoShowTranslated === 'boolean' ? raw.mangaAutoShowTranslated : current.mangaAutoShowTranslated,
+      ? clampConcurrency(raw.mangaConcurrency, current.settings.mangaConcurrency)
+      : current.settings.mangaConcurrency,
+    mangaAutoShowTranslated: typeof raw.mangaAutoShowTranslated === 'boolean' ? raw.mangaAutoShowTranslated : current.settings.mangaAutoShowTranslated,
+    localCompute: current.settings.localCompute,
+  }
+  // 设置页可能带着尚未保存的计算配置来测试连接，这里一并合并，但只保留公开字段。
+  const compute = mergeLocalComputeSettings(input)
+  merged.localCompute = {
+    mode: compute.mode,
+    baseUrl: compute.baseUrl,
+    fallback: compute.fallback,
+    apiKeyConfigured: Boolean(compute.apiKey),
+    connectTimeoutMs: compute.connectTimeoutMs,
+    timeoutMs: compute.timeoutMs,
   }
   if (!/^https?:\/\//i.test(merged.baseUrl)) throw new AiError('接口地址需要以 http:// 或 https:// 开头')
   return merged

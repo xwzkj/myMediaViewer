@@ -5,18 +5,26 @@
  *  - comic-text-detector（dmMaze/comic-text-detector 的 ONNX 导出）
  *  - manga-ocr-base（kha-white/manga-ocr-base 的 ONNX 导出）
  *
- * 模型不随仓库分发，首次翻译时按需下载到 data/models。访问不了 huggingface.co
- * 时，把 HF_ENDPOINT 指向镜像站（例如 https://hf-mirror.com）即可。
+ * 模型不随仓库分发，首次翻译时按需下载。访问不了 huggingface.co 时，把
+ * HF_ENDPOINT 指向镜像站（例如 https://hf-mirror.com）即可。
+ *
+ * 这里刻意不引用服务端配置模块：远程计算端也要复用同一套下载/加载逻辑，而它
+ * 不应该因此创建媒体目录或读取 sources.json。
  */
 import { createWriteStream, existsSync } from 'node:fs'
 import { mkdir, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { dataDir } from '../../config.js'
 import { logInfo, logWarn } from '../../log.js'
 
-export const modelRoot = path.join(dataDir, 'models')
+/**
+ * 模型根目录。默认 `data/models`（与媒体数据同目录），可用 MANGA_MODEL_DIR 单独指定；
+ * 计算端通常指向自己的模型目录。所有函数都接受显式 root，方便测试与双端复用。
+ */
+export const modelRoot = path.resolve(
+  process.env.MANGA_MODEL_DIR || path.join(process.env.MEDIA_DATA_DIR || 'data', 'models'),
+)
 
 /** 单个模型文件在 HuggingFace 上的位置，以及下载后的落盘位置。 */
 export interface ModelSpec {
@@ -59,16 +67,16 @@ export function requiredModels(): ModelSpec[] {
   return [detectorModel, encoderFp16Model, decoderModel, vocabModel]
 }
 
-export function modelPath(spec: ModelSpec): string {
-  return path.join(modelRoot, spec.target)
+export function modelPath(spec: ModelSpec, root = modelRoot): string {
+  return path.join(root, spec.target)
 }
 
-export function hasModel(spec: ModelSpec): boolean {
-  return existsSync(modelPath(spec))
+export function hasModel(spec: ModelSpec, root = modelRoot): boolean {
+  return existsSync(modelPath(spec, root))
 }
 
-export function missingModels(specs: ModelSpec[] = requiredModels()): ModelSpec[] {
-  return specs.filter(spec => !hasModel(spec))
+export function missingModels(specs: ModelSpec[] = requiredModels(), root = modelRoot): ModelSpec[] {
+  return specs.filter(spec => !hasModel(spec, root))
 }
 
 /** 一次下载最多等 20 分钟；大文件在慢速镜像上也要能下完。 */
@@ -87,8 +95,9 @@ export interface DownloadProgress {
 export async function downloadModel(
   spec: ModelSpec,
   onProgress?: (progress: DownloadProgress) => void,
+  root = modelRoot,
 ): Promise<void> {
-  const dest = modelPath(spec)
+  const dest = modelPath(spec, root)
   if (existsSync(dest)) return
   await mkdir(path.dirname(dest), { recursive: true })
   const temp = dest + '.part'
@@ -127,9 +136,10 @@ export async function downloadModel(
 export async function ensureMangaModels(
   specs: ModelSpec[] = requiredModels(),
   onProgress?: (progress: DownloadProgress) => void,
+  root = modelRoot,
 ): Promise<void> {
-  const missing = missingModels(specs)
+  const missing = missingModels(specs, root)
   if (!missing.length) return
   logInfo('模型', '缺少 ' + missing.length + ' 个本地识别模型，开始从 HuggingFace 下载')
-  for (const spec of missing) await downloadModel(spec, onProgress)
+  for (const spec of missing) await downloadModel(spec, onProgress, root)
 }

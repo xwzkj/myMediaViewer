@@ -2,7 +2,10 @@ node_modules/
 dist/
 dist-server/
 data/
+data-compute/
 .cache/
 .env
+.env.*
+!.env.example
 *.log
 test-results/

@@ -1,4 +1,5 @@
 import { db } from '../database.js'
+import { markLibraryChanged } from '../library-revision.js'
 import type { PixivBookmarkRestrict, PixivMirrorStatus, Work } from '../../shared/types.js'
 import type { PixivStoredWork, PixivWorkMeta } from './types.js'
 
@@ -121,6 +122,10 @@ function toPublicStatus(state: PixivMirrorState): PixivMirrorStatus {
   }
 }
 
+/**
+ * 只保存分页同步进度（下次 URL、页数、错误），不参与作品目录与搜索索引，
+ * 所以刻意不递增 library 版本：镜像每同步一页都会写这里，递增会让索引反复失效。
+ */
 export function savePixivMirrorState(accountId: string, state: PixivMirrorState): void {
   db.prepare(`
     INSERT INTO pixiv_mirror_state
@@ -161,6 +166,7 @@ export function savePixivWorkRecords(accountId: string, records: PixivStoredWork
       updated = excluded.updated,
       last_seen = excluded.last_seen
   `)
+  let written = 0
   db.exec('BEGIN')
   try {
     for (const record of records) {
@@ -187,12 +193,15 @@ export function savePixivWorkRecords(accountId: string, records: PixivStoredWork
         if (!work.pixivUserId && existing.work.pixivUserId) work.pixivUserId = existing.work.pixivUserId
       }
       statement.run(accountId, illustId, JSON.stringify({ work, meta }), work.updated || Date.now(), lastSeen)
+      written++
     }
     db.exec('COMMIT')
   } catch (error) {
     db.exec('ROLLBACK')
     throw error
   }
+  // 云端作品记录会合并进 /api/works 与标签索引（元数据、可见性、收藏标签都来自这里），写成功才失效。
+  if (written) markLibraryChanged()
 }
 
 export function savePixivWorks(accountId: string, works: Work[], lastSeen = Date.now()): void {
@@ -236,6 +245,7 @@ export function savePixivBookmarks(
       data = excluded.data,
       last_seen = excluded.last_seen
   `)
+  let written = 0
   db.exec('BEGIN')
   try {
     for (const { work: incoming, sequence, meta } of works) {
@@ -251,12 +261,15 @@ export function savePixivBookmarks(
         if (previous) work.pixivUserId = previous
       }
       statement.run(accountId, illustId, restrict, sequence, JSON.stringify({ work, sequence, meta }), lastSeen)
+      written++
     }
     db.exec('COMMIT')
   } catch (error) {
     db.exec('ROLLBACK')
     throw error
   }
+  // 新增、移除或换收藏夹（public ↔ private）都会改变目录里的作品来源。
+  if (written) markLibraryChanged()
 }
 
 export function getPixivBookmarkRecords(accountId: string, restrict: PixivBookmarkRestrict): Array<{ work: Work; sequence: number; meta?: PixivWorkMeta }> {
@@ -290,7 +303,9 @@ export function getPixivBookmarkStates(accountId: string): Map<string, PixivBook
 }
 
 export function removePixivBookmark(accountId: string, illustId: string): void {
-  db.prepare('DELETE FROM pixiv_bookmarks WHERE account_id = ? AND illust_id = ?').run(accountId, illustId)
+  const { changes } = db.prepare('DELETE FROM pixiv_bookmarks WHERE account_id = ? AND illust_id = ?').run(accountId, illustId)
+  // 没有命中任何行时目录没变化（例如取消一个本来就不存在的收藏）。
+  if (Number(changes) > 0) markLibraryChanged()
 }
 
 export function updatePixivBookmark(
@@ -337,20 +352,26 @@ export function removeMissingPixivBookmarks(
     db.exec('ROLLBACK')
     throw error
   }
+  // 全量清理删掉的收藏要从目录里消失；没有删除任何行时不动版本。
+  if (removed) markLibraryChanged()
   return removed
 }
 
 export function deletePixivDataForOtherAccounts(accountId: string): void {
   db.exec('BEGIN')
+  let removed = 0
   try {
-    db.prepare('DELETE FROM pixiv_works WHERE account_id <> ?').run(accountId)
-    db.prepare('DELETE FROM pixiv_bookmarks WHERE account_id <> ?').run(accountId)
+    const works = db.prepare('DELETE FROM pixiv_works WHERE account_id <> ?').run(accountId)
+    const bookmarks = db.prepare('DELETE FROM pixiv_bookmarks WHERE account_id <> ?').run(accountId)
     db.prepare('DELETE FROM pixiv_mirror_state WHERE account_id <> ?').run(accountId)
     db.exec('COMMIT')
+    // 只有作品/收藏被清掉才改变目录；镜像状态只是同步进度，不参与目录内容。
+    removed = Number(works.changes) + Number(bookmarks.changes)
   } catch (error) {
     db.exec('ROLLBACK')
     throw error
   }
+  if (removed > 0) markLibraryChanged()
 }
 
 export function getPixivApiCache<T>(cacheKey: string): T | null {

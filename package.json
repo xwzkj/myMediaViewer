@@ -9,9 +9,13 @@
   },
   "scripts": {
     "dev": "concurrently -k -n server,web \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
+    "dev:compute": "tsx watch server/compute/index.ts",
     "build": "vue-tsc --noEmit && tsc -p tsconfig.server.json && vite build",
+    "build:compute": "tsc -p tsconfig.server.json",
     "start": "pnpm run build && node dist-server/server/index.js",
     "serve": "node dist-server/server/index.js",
+    "start:compute": "pnpm run build:compute && node dist-server/server/compute/index.js",
+    "serve:compute": "node dist-server/server/compute/index.js",
     "test": "tsx --test tests/*.test.ts",
     "test:fixtures": "tsx tests/preview-fixtures.ts",
     "test:search": "tsx tests/search-benchmark.ts"

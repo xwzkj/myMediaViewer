@@ -2,6 +2,7 @@ import Fuse from 'fuse.js'
 import { Converter } from 'opencc-js'
 import { pinyin } from 'pinyin-pro'
 import { allWorks } from './database.js'
+import { libraryRevision } from './library-revision.js'
 import type { TagSuggestionsResponse, Work } from '../shared/types.js'
 import { searchTokens } from '../shared/search-query.js'
 
@@ -12,6 +13,11 @@ interface IndexedTag { name: string; normalized: string; count: number; phonetic
 let documents: Document[] = []
 let tags: IndexedTag[] = []
 let fuzzy: Fuse<Document>
+/**
+ * 上次建索引时使用的数据签名。`undefined` 表示这次索引由不提供签名的调用建立：
+ * 数据版本未知，下一次带签名的请求必须重建才能确认索引没有过期。
+ */
+let indexedSignature: string | undefined
 function fallbackLocalWorks(): Work[] {
   return allWorks().map(work => ({
     ...work,
@@ -22,8 +28,9 @@ function fallbackLocalWorks(): Work[] {
     pixivId: work.sourceKind === 'pixiv' && /^\d+$/.test(work.externalId) ? work.externalId : undefined,
   }))
 }
-export function refreshSearch(works?: Work[]): void {
-  documents = (works || fallbackLocalWorks()).map(work => {
+/** 用给定作品重建全部派生数据（简繁转换、拼音、标签聚合、Fuse），并记住这批数据的签名。 */
+function buildIndex(works: Work[], signature: string | undefined): void {
+  documents = works.map(work => {
     const labels = normalize(`${work.author} ${work.tags.join(' ')}`)
     const title = normalize(work.title)
     const names = `${title} ${labels}`
@@ -55,6 +62,14 @@ export function refreshSearch(works?: Work[]): void {
     includeScore: true, ignoreLocation: true, threshold: 0.3, minMatchCharLength: 2,
     keys: [{ name: 'title', weight: 0.5 }, { name: 'labels', weight: 0.35 }, { name: 'body', weight: 0.15 }],
   })
+  indexedSignature = signature
+}
+export function refreshSearch(works?: Work[], signature?: string): void {
+  // 无参调用（启动、扫描结束的 onScan）建的是本地库索引，签名只跟数据版本有关；
+  // 带 works 且给了 signature 的调用走同一套判断，数据没变就不重建。
+  const next = signature ?? (works ? undefined : `local:${libraryRevision()}`)
+  if (works && next !== undefined && next === indexedSignature && documents.length) return
+  buildIndex(works || fallbackLocalWorks(), next)
 }
 export function suggestTags(query: string): TagSuggestionsResponse {
   const term = normalize(query).replace(/^[#＃]/, '')
@@ -66,10 +81,15 @@ export function suggestTags(query: string): TagSuggestionsResponse {
   }).sort((a, b) => b.score - a.score || b.tag.count - a.tag.count || a.tag.name.localeCompare(b.tag.name, 'zh-CN'))
   return { total: matches.length, items: matches.slice(0, 12).map(({ tag }) => ({ name: tag.name, count: tag.count })) }
 }
-export function searchWorks(query: string, allowFuzzy: boolean, works?: Work[]): Array<{ work: Work; score: number; approximate: boolean }> {
-  if (works) refreshSearch(works)
+/**
+ * `signature` 是调用方按自己的数据版本算出的签名（例如 `${libraryRevision()}:${catalog.length}`）。
+ * 同时传入 works 和 signature 时，签名与上次建索引相同且索引非空就跳过重建；否则用这批 works 重建并记住签名。
+ */
+export function searchWorks(query: string, allowFuzzy: boolean, works?: Work[], signature?: string): Array<{ work: Work; score: number; approximate: boolean }> {
+  if (works) refreshSearch(works, signature)
   const tokens = searchTokens(query).map(token => ({ ...token, value: normalize(token.value) })).filter(token => token.value).slice(0, 12)
   const terms = tokens.map(token => token.value)
+  // 空查询直接返回全部文档（分数 0、不算近似匹配），不需要为它准备拼音或 Fuse 数据。
   if (!terms.length) return documents.map(doc => ({ work: doc.work, score: 0, approximate: false }))
   const fuzzyTerms = terms.map((term, i) => {
     if (!allowFuzzy || tokens[i].tag || [...term].length < 2) return new Map<string, number>()

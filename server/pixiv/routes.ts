@@ -5,7 +5,7 @@ import { allWorks, favoriteIds, toWork } from '../database.js'
 import { clearPixivApiCache, allPixivMirrorStates, savePixivWorkRecords, setPixivApiCache, getPixivApiCache, updatePixivBookmark } from './store.js'
 import { assertPixivSession, getPixivSessionVersion, clearPixivAccount, getPixivRuntime, getPixivSettings, requirePixivReady, savePixivSettings, PixivApiError } from './auth.js'
 import { pixivFetch, pixivForm } from './client.js'
-import { cleanCacheLimitDays, clearPixivCache, enforcePixivCacheLimit, getOrCachePixivResource, pixivCacheStatus, pixivCacheKey } from './cache.js'
+import { cleanCacheLimitDays, clearPixivCache, enforcePixivCacheLimit, getOrCachePixivResource, pixivCacheStatus, pixivCacheKey, type CachedResource } from './cache.js'
 import { prepareUgoira } from './ugoira.js'
 import { asPixivCloudOrigin, buildUnifiedCatalog, clearUnifiedCatalogCache, cloudAssets, localRelatedWorks, normalizePixivIllust, pixivBookmarkTags, pixivCloudSource, pixivSourceId, pixivSourceName } from './catalog.js'
 import type { PixivCloudOrigin } from './catalog.js'
@@ -378,34 +378,58 @@ export async function registerPixivRoutes(app: FastifyInstance): Promise<void> {
     return sendMedia(request, reply, resource.path, extensionForContentType(resource.contentType))
   })
 
-  app.get<{ Params: { illustId: string; variant: string }; Querystring: { format?: string } }>('/api/pixiv/ugoira/:illustId/:variant', async (request, reply) => {
+  /** 读取/补齐 Ugoira 元数据并转码；二进制 GET 与 JSON 准备接口共用这一条路径。 */
+  async function resolveUgoira(illustId: string, format: 'auto' | 'webp'): Promise<CachedResource> {
     requirePixivReady()
-    if (request.params.variant !== 'animation') throw new PixivApiError('Ugoira 资源类型无效', 400, 'invalid_asset')
-    const format = request.query.format || 'auto'
-    if (format !== 'auto' && format !== 'webp') throw new PixivApiError('Ugoira 格式无效', 400, 'invalid_asset')
     const version = getPixivSessionVersion()
     const uid = getPixivRuntime().account!.id
-    let record = await fetchIllustRecord(request.params.illustId, false)
+    let record = await fetchIllustRecord(illustId, false)
     assertPixivSession(version)
     if (record.work.kind !== 'animation') throw new PixivApiError('该作品不是 Ugoira 动图', 400, 'invalid_asset')
     if (!record.meta.ugoira) {
       const detail = await pixivFetch<{ ugoira_metadata?: { zip_urls?: { medium?: string }; frames?: Array<{ file?: string; delay?: number }> } }>(
-        `/v1/ugoira/metadata?illust_id=${encodeURIComponent(request.params.illustId)}`,
+        `/v1/ugoira/metadata?illust_id=${encodeURIComponent(illustId)}`,
       )
       const zipUrl = String(detail.ugoira_metadata?.zip_urls?.medium || '')
       const frames = (detail.ugoira_metadata?.frames || []).flatMap(frame => frame.file ? [{ file: frame.file, delay: Math.max(10, Number(frame.delay) || 100) }] : [])
-      if (!zipUrl || !frames.length) return reply.code(404).send({ message: 'Ugoira 元数据不可用' })
+      if (!zipUrl || !frames.length) throw new PixivApiError('Ugoira 元数据不可用', 404, 'invalid_asset')
       const meta: PixivUgoiraMeta = { zipUrl, frames }
       record = { ...record, meta: { ...record.meta, ugoira: meta } }
       assertPixivSession(version)
       savePixivWorkRecords(uid, [record])
     }
     const ugoira = record.meta.ugoira
-    if (!ugoira) return reply.code(404).send({ message: 'Ugoira 元数据不可用' })
-    const resource = await prepareUgoira(request.params.illustId, ugoira.zipUrl, ugoira.frames, format)
+    if (!ugoira) throw new PixivApiError('Ugoira 元数据不可用', 404, 'invalid_asset')
+    const resource = await prepareUgoira(illustId, ugoira.zipUrl, ugoira.frames, format)
     assertPixivSession(version)
     enforcePixivCacheLimit(getPixivSettings().cacheLimitMb * 1024 * 1024)
+    return resource
+  }
+
+  app.get<{ Params: { illustId: string; variant: string }; Querystring: { format?: string } }>('/api/pixiv/ugoira/:illustId/:variant', async (request, reply) => {
+    if (request.params.variant !== 'animation') throw new PixivApiError('Ugoira 资源类型无效', 400, 'invalid_asset')
+    const format = request.query.format || 'auto'
+    if (format !== 'auto' && format !== 'webp') throw new PixivApiError('Ugoira 格式无效', 400, 'invalid_asset')
+    const resource = await resolveUgoira(request.params.illustId, format)
     return sendMedia(request, reply, resource.path, extensionForContentType(resource.contentType))
+  })
+
+  // 播放器先问"能不能放、该用 video 还是 img"。准备失败时这里能返回具体原因
+  // （帧数、解压/像素上限、超时），而不是让 <video>/<img> 只报一个笼统的加载失败。
+  app.post<{ Params: { illustId: string }; Body: { format?: string } }>('/api/pixiv/ugoira/:illustId/prepare', {
+    schema: {
+      body: {
+        type: 'object', additionalProperties: false,
+        properties: { format: { type: 'string', enum: ['auto', 'webp'] } },
+      },
+    },
+  }, async request => {
+    const format = request.body?.format === 'webp' ? 'webp' : 'auto'
+    const resource = await resolveUgoira(request.params.illustId, format)
+    return {
+      url: `/api/pixiv/ugoira/${encodeURIComponent(request.params.illustId)}/animation${format === 'webp' ? '?format=webp' : ''}`,
+      contentType: resource.contentType,
+    }
   })
 
   app.get<{ Params: { id: string }; Querystring: { page?: string } }>('/api/works/:id/related', async request => {

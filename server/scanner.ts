@@ -3,6 +3,7 @@ import { setImmediate as yieldToRequests } from 'node:timers/promises'
 import { createHash } from 'node:crypto'
 import { sources } from './config.js'
 import { db, saveSource, type StoredAsset, type StoredWork } from './database.js'
+import { markLibraryChanged } from './library-revision.js'
 import { emptyMetadata, type Metadata } from './parsers.js'
 import { collectGroups, extractGroup, groupStamp, groupWorkId, rulesFor } from './source-engine.js'
 import type { ScanStatus } from '../shared/types.js'
@@ -25,6 +26,8 @@ export async function scanLibrary(options: ScanOptions = {}): Promise<void> {
   const started = Date.now()
   Object.assign(scanStatus, { running: true, phase: '正在读取目录', files: 0, works: 0, startedAt: started, errors: [] })
   logInfo('扫描', `开始检查 ${selected.length} 个媒体目录`)
+  // 一次扫描最多额外递增一次版本，不随目录数或作品数膨胀。
+  let wroteWorks = false
   try {
     for (const source of selected) {
       const sourceStarted = Date.now()
@@ -107,6 +110,7 @@ export async function scanLibrary(options: ScanOptions = {}): Promise<void> {
           if (groupIndex % 128 === 0) await yieldToRequests()
         }
         saveSource(source, works, assets, pendingCache)
+        wroteWorks = true
         sourceOnline.set(source.id, true)
         logInfo('扫描', `${source.name}：整理出 ${scanStatus.works - baseline} 组作品 · 用时 ${formatDuration(Date.now() - sourceStarted)}（枚举/匹配 ${formatDuration(collectedAt - sourceStarted)} · 元信息 ${formatDuration(extractedAt - collectedAt)} · 缓存 ${hits}/${collected.groups.length}）`)
       } catch (error) {
@@ -116,6 +120,9 @@ export async function scanLibrary(options: ScanOptions = {}): Promise<void> {
         logError('扫描', detail, error)
       }
     }
+    // saveSource() 已在每个目录写入成功后各递增一次版本；这里只在整个扫描确实写入过作品时
+    // 再补一次，且全程最多一次，避免版本号随目录/作品数量膨胀。
+    if (wroteWorks) markLibraryChanged()
     afterScan()
     scanStatus.phase = scanStatus.errors.length ? '扫描完成，部分文件需要检查' : '媒体库已更新'
   } finally {

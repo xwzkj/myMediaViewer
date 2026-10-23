@@ -1,32 +1,27 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { mkdir, readFile, rename, unlink } from 'node:fs/promises'
+import { createReadStream, existsSync } from 'node:fs'
+import { mkdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import sharp from 'sharp'
 import type { MangaJob, MangaModelStatus, MangaPageResult, MangaPipelineMode, MangaRegion } from '../../../shared/types.js'
-import { getAiSettings, translateMangaTexts } from '../../ai.js'
+import { getAiSettings, getLocalComputeConfig, translateMangaTexts } from '../../ai.js'
 import { cacheDir } from '../../config.js'
 import { db, type StoredAsset } from '../../database.js'
-import { ComicTextDetector } from './detector.js'
 import { createTranslationLimiter } from './concurrency.js'
-import { eraseTranslatedRegions, type EraseRegion } from './erase.js'
-import { judgeRegion, mangaReadingOrder, trimTrailingNoise } from './pipeline.js'
-import { MangaOcrRecognizer } from './recognizer.js'
-import { formatDuration, logError, logInfo } from '../../log.js'
-import { boxToRect, paddedRect, type OcrRegion, type TextMask } from './types.js'
-import { encoderFp16Model, decoderModel, detectorModel, ensureMangaModels, hasModel, missingModels, modelPath, modelRoot, vocabModel } from './models.js'
+import { MangaEngine, PIPELINE_VERSION, type EnginePage } from './engine.js'
+import { checkRemoteCompute, RemoteComputeError, runRemoteMangaJob } from './remote.js'
+import { formatDuration, logError, logInfo, logWarn } from '../../log.js'
+import { modelRoot } from './models.js'
 
 const mangaCacheDir = path.join(cacheDir, 'manga')
-const PIPELINE_VERSION = 1
-const MAX_REGIONS = 80
 
-const detector = new ComicTextDetector()
-const recognizer = new MangaOcrRecognizer()
-let loading: Promise<void> | null = null
+/** 本地计算核心与远程计算端共用同一份实现。 */
+const localEngine = new MangaEngine({ modelRoot })
 
 interface PreparedAsset {
   key: string
   targetLanguage: string
+  /** 原图内容哈希；同时作为远程任务幂等 ID。 */
+  hash: string
   cached?: MangaPageResult
 }
 
@@ -40,33 +35,60 @@ const jobLabel = (job: InternalJob) => `漫画翻译 #${job.id.slice(0, 6)}`
 // 只有真正需要模型的页面才占用这个队列。缓存查询不排队，也不会被 GPU 任务挡住。
 let inferenceQueue: Promise<void> = Promise.resolve()
 
-/** 检查自动下载的固定模型文件是否就位。 */
-export function getMangaModelStatus(): MangaModelStatus {
-  const encoderReady = hasModel(encoderFp16Model)
-  const encoderNames = [path.basename(encoderFp16Model.target)]
-  const detectorReady = hasModel(detectorModel)
-  const decoderReady = hasModel(decoderModel)
-  const vocabReady = hasModel(vocabModel)
+/** 远程状态检查带 10 秒缓存，设置页轮询时不会每次都打计算端。 */
+let remoteStatus: { at: number; value: MangaModelStatus } | null = null
 
-  const detectorFiles = [path.basename(detectorModel.target)]
-  const ocrFiles = [...encoderNames, path.basename(decoderModel.target), path.basename(vocabModel.target)]
-  const detectorMissing = detectorReady ? [] : detectorFiles
-  const ocrMissing = [
-    ...(encoderReady ? [] : encoderNames),
-    ...(decoderReady ? [] : [path.basename(decoderModel.target)]),
-    ...(vocabReady ? [] : [path.basename(vocabModel.target)]),
-  ]
+/** 保存计算设置后清掉状态缓存，避免设置页仍显示旧地址的检查结果。 */
+export function clearMangaStatusCache(): void {
+  remoteStatus = null
+}
 
-  const models = [
-    { name: 'comic-text-detector', ready: detectorReady, files: detectorFiles, missing: detectorMissing },
-    { name: 'manga-ocr', ready: encoderReady && decoderReady && vocabReady, files: ocrFiles, missing: ocrMissing },
-  ]
-  const ready = models.every(model => model.ready)
-  return {
-    ready,
-    device: providers()[0] === 'dml' ? 'DirectML（不可用时回退 CPU）' : 'CPU',
-    models,
-    message: ready ? undefined : `首次翻译会自动下载模型到 ${modelRoot}；网络不通时设置 HF_ENDPOINT 指向镜像站`,
+/**
+ * 当前执行位置的模型状态。
+ *
+ * 本地模式只看模型文件是否就位；远程模式做一次带缓存的连接检查，失败原因原样
+ * 返回给设置页，但不影响翻译任务本身（任务失败时会给出同一条原因）。
+ */
+export async function getMangaModelStatus(): Promise<MangaModelStatus> {
+  const compute = getLocalComputeConfig()
+  if (compute.mode !== 'remote') return { ...localEngine.modelStatus(), location: 'local' }
+
+  const configured = Boolean(compute.baseUrl && compute.apiKey)
+  if (!configured) {
+    return {
+      ready: false,
+      device: '远程计算端',
+      models: [],
+      location: 'remote',
+      remote: { configured: false, connected: false, message: '还没有填写远程计算端地址或 API Key' },
+      message: '请先在 AI 设置里填写远程计算端的地址和 API Key',
+    }
+  }
+  if (remoteStatus && Date.now() - remoteStatus.at < 10_000) return remoteStatus.value
+  try {
+    const status = await checkRemoteCompute(compute)
+    const value: MangaModelStatus = {
+      ready: status.ready,
+      device: status.device,
+      models: status.models,
+      location: 'remote',
+      remote: { configured: true, connected: true, device: status.device },
+      ...(status.message ? { message: status.message } : {}),
+    }
+    remoteStatus = { at: Date.now(), value }
+    return value
+  } catch (error) {
+    const message = (error as Error).message
+    const value: MangaModelStatus = {
+      ready: false,
+      device: `远程计算端（${compute.baseUrl}）`,
+      models: [],
+      location: 'remote',
+      remote: { configured: true, connected: false, message },
+      message,
+    }
+    remoteStatus = { at: Date.now(), value }
+    return value
   }
 }
 
@@ -149,119 +171,93 @@ export function mangaBaseImagePath(key: string): string | undefined {
 }
 
 /**
- * 单页的本地识别结果（检测 + OCR + 筛选后的待翻译文本）。
+ * 单页的本地计算结果（检测 + OCR + 擦字后的底图）。
  * 批量模式下先收集这些结果，再统一进入翻译阶段。
  */
 interface PreparedPage {
   asset: StoredAsset
   key: string
   targetLanguage: string
-  pageWidth: number
-  pageHeight: number
-  textMask: TextMask | null
-  kept: OcrRegion[]
-  eraseRegions: EraseRegion[]
-  detectionMs: number
-  ocrMs: number
+  page: EnginePage
   /** 没有可翻译文本时直接返回的空结果。 */
   empty?: MangaPageResult
 }
 
-/**
- * 各流水线共用「本地识别」这一段：检测 + OCR + 筛选。
- * 不涉及大模型调用，也不写任何缓存。
- */
-async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void): Promise<PreparedPage> {
-  setStage('准备本地识别模型')
-  await ensureModels(setStage)
-
-  setStage('识别气泡区域')
-  const detectStarted = Date.now()
-  const detection = await detector.detect(asset.path)
-  const detectionMs = Date.now() - detectStarted
-  if (!detection.boxes.length) {
-    setStage('没有检测到气泡文字')
-    return {
-      asset, key: info.key, targetLanguage: info.targetLanguage,
-      pageWidth: detection.pageWidth, pageHeight: detection.pageHeight,
-      textMask: detection.textMask, kept: [], eraseRegions: [],
-      detectionMs, ocrMs: 0,
-      empty: emptyResult(asset, info.key, info.targetLanguage),
-    }
-  }
-
-  setStage(`准备提取 ${detection.boxes.length} 处气泡文本`)
-  const pageRaw = await sharp(asset.path, { limitInputPixels: 500_000_000 })
-    .removeAlpha().toColourspace('srgb').raw().toBuffer()
-  const crops = detection.boxes.map(box => paddedRect(boxToRect(box, detection.pageWidth, detection.pageHeight), detection.pageWidth, detection.pageHeight))
-  setStage(`提取气泡文本 0/${crops.length}`)
-  const ocrStarted = Date.now()
-  const ocrResults = await recognizer.recognizeBatch(
-    pageRaw,
-    detection.pageWidth,
-    detection.pageHeight,
-    crops,
-    (completed, total) => setStage(`提取气泡文本 ${completed}/${total}`),
-  )
-  const ocrMs = Date.now() - ocrStarted
-
-  setStage('筛选气泡文本')
-  const candidates: OcrRegion[] = detection.boxes.map((box, index) => ({
-    text: trimTrailingNoise(ocrResults[index]?.text || ''),
-    cx: box.cx, cy: box.cy, width: box.width, height: box.height,
-    prob: box.confidence,
-    confidence: ocrResults[index]?.confidence || 0,
-  }))
-  const shortEdge = Math.min(detection.pageWidth, detection.pageHeight)
-  const kept = mangaReadingOrder(candidates.filter(region => judgeRegion(region, shortEdge).keep)).slice(0, MAX_REGIONS)
-  const eraseRegions = kept.map(region => boxToRect({ ...region, classId: 0 }, detection.pageWidth, detection.pageHeight))
-  if (!kept.length) setStage('没有可翻译的气泡文本')
-
+/** 缓存命中或空页占位：这些页面不需要再计算，也不持有任何像素数据。 */
+function placeholderPage(): EnginePage {
   return {
-    asset, key: info.key, targetLanguage: info.targetLanguage,
-    pageWidth: detection.pageWidth, pageHeight: detection.pageHeight,
-    textMask: detection.textMask, kept, eraseRegions, detectionMs, ocrMs,
-    empty: kept.length ? undefined : emptyResult(asset, info.key, info.targetLanguage),
+    width: 0, height: 0, regions: [], engine: '',
+    timings: { detectionMs: 0, ocrMs: 0, eraseMs: 0, encodeMs: 0 },
   }
 }
 
-/** 把一页的译文写进缓存并返回最终结果（擦字 + 生成译图底图）。 */
+/**
+ * 把一页交给当前选择的计算位置。
+ *
+ * 只有「任务还没被接收」的连接失败才允许回退到本地主机；鉴权、协议、资源超限、
+ * 模型错误都直接抛给调用方，避免同一页悄悄算两遍。
+ */
+async function computePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void): Promise<EnginePage> {
+  const compute = getLocalComputeConfig()
+  if (compute.mode === 'remote') {
+    try {
+      return await runRemoteMangaJob(compute, { imagePath: asset.path, onStage: setStage })
+    } catch (error) {
+      const remote = error instanceof RemoteComputeError ? error : null
+      if (compute.fallback === 'local' && remote?.phase === 'connect') {
+        logWarn('计算', `远程计算端不可用，回退本地主机：${remote.message}`)
+        setStage('远程计算端不可用，改用本地主机')
+        return runInference(() => localEngine.process(asset.path, setStage))
+      }
+      throw error
+    }
+  }
+  return runInference(() => localEngine.process(asset.path, setStage))
+}
+
+/**
+ * 各流水线共用「本地识别」这一段：检测 + OCR + 擦字 + 底图编码。
+ * 不涉及大模型调用，也不写任何缓存结果。
+ */
+async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void): Promise<PreparedPage> {
+  const page = await computePage(asset, info, setStage)
+  const prepared: PreparedPage = { asset, key: info.key, targetLanguage: info.targetLanguage, page }
+  if (!page.regions.length) prepared.empty = emptyResult(asset, info.key, info.targetLanguage)
+  return prepared
+}
+
+/** 把一页的译文写进缓存并返回最终结果（底图在本地或远程计算阶段已经生成）。 */
 async function finalizePage(
   page: PreparedPage, translations: string[], model: string, setStage?: (stage: string) => void,
 ): Promise<MangaPageResult> {
   if (page.empty) return page.empty
-  setStage?.('擦除原文')
-  const erased = await eraseTranslatedRegions(page.asset.path, page.pageWidth, page.pageHeight, page.textMask, page.eraseRegions)
+  const base = page.page.base
+  if (!base) throw new Error('这一页缺少译图底图，请重试')
   await mkdir(mangaCacheDir, { recursive: true })
   const imagePath = path.join(mangaCacheDir, `${page.key}.png`)
   const temp = `${imagePath}.tmp.png`
-  setStage?.('生成译图文件')
+  setStage?.('写入译图文件')
   try {
-    await sharp(erased.data, { raw: { width: erased.width, height: erased.height, channels: 3 } })
-      .png({ compressionLevel: 7, adaptiveFiltering: true })
-      .toFile(temp)
+    await writeFile(temp, base)
     await rename(temp, imagePath)
   } finally {
     await unlink(temp).catch(() => {})
   }
 
-  const regions: MangaRegion[] = page.kept.map((region, index) => {
-    const rect = page.eraseRegions[index]!
-    return {
-      id: index + 1,
-      x: rect.left, y: rect.top, width: rect.width, height: rect.height,
-      source: region.text,
-      translation: translations[index] || region.text,
-      detection: region.prob,
-      confidence: region.confidence,
-      background: erased.colors[index]?.background || '#ffffff',
-      textColor: erased.colors[index]?.textColor || '#111111',
-    }
-  })
+  const regions: MangaRegion[] = page.page.regions.map((region, index) => ({
+    id: region.id,
+    x: region.x, y: region.y, width: region.width, height: region.height,
+    source: region.source,
+    translation: translations[index] || region.source,
+    detection: region.detection,
+    confidence: region.confidence,
+    background: region.background,
+    textColor: region.textColor,
+  }))
   const result: MangaPageResult = {
     key: page.key,
-    width: page.pageWidth,
-    height: page.pageHeight,
+    width: page.page.width,
+    height: page.page.height,
     baseUrl: `/api/ai/manga/cache/${page.key}/base.png`,
     regions,
     cached: false,
@@ -284,7 +280,7 @@ async function translateMerged(pages: PreparedPage[], setStage: (stage: string) 
   if (!pending.length) return { translations: [], model: '' }
   const targetLanguage = pending[0]!.targetLanguage
   const texts: string[] = []
-  for (const page of pending) texts.push(...page.kept.map(region => region.text))
+  for (const page of pending) texts.push(...page.page.regions.map(region => region.source))
 
   // 单次请求的文本量上限：太长容易被模型的输出长度或超时截断，按批切开。
   const CHUNK = 200
@@ -325,7 +321,7 @@ async function translateParallel(
       if (page.empty) { results[index] = { translations: [], model: '' }; continue }
       try {
         const translated = await translateMangaTexts({
-          texts: page.kept.map(region => region.text),
+          texts: page.page.regions.map(region => region.source),
           targetLanguage: page.targetLanguage,
         })
         results[index] = { translations: translated.translations, model: translated.model }
@@ -431,7 +427,7 @@ async function runStreaming(job: InternalJob, assets: StoredAsset[], force: bool
   const finishPage = async (page: PreparedPage, prefix: string) => {
     try {
       const translated = await translate(() => translateMangaTexts({
-        texts: page.kept.map(region => region.text),
+        texts: page.page.regions.map(region => region.source),
         targetLanguage: page.targetLanguage,
       }))
       const result = await finalizePage(page, translated.translations, translated.model)
@@ -456,11 +452,11 @@ async function runStreaming(job: InternalJob, assets: StoredAsset[], force: bool
         if (info.cached) {
           pushResult(job, asset.id, info.cached, assets.length)
         } else {
-          const page = await runInference(() => recognizePage(asset, info, stage => {
+          const page = await recognizePage(asset, info, stage => {
             recognitionStage = `${prefix}${stage}`
             updateStage()
-          }))
-          logInfo('任务', `${jobLabel(job)} ${prefix}识别完成 · ${page.kept.length} 处文本 · 检测 ${formatDuration(page.detectionMs)} / OCR ${formatDuration(page.ocrMs)}`)
+          })
+          logInfo('任务', `${jobLabel(job)} ${prefix}识别完成 · ${page.page.regions.length} 处文本 · 检测 ${formatDuration(page.page.timings.detectionMs)} / OCR ${formatDuration(page.page.timings.ocrMs)}`)
           if (page.empty) pushResult(job, asset.id, page.empty, assets.length)
           else pending.push(finishPage(page, prefix))
         }
@@ -497,15 +493,14 @@ async function runBatched(job: InternalJob, assets: StoredAsset[], force: boolea
         // 已缓存的页不需要重新识别，直接算完成。
         prepared.push({
           asset, key: info.key, targetLanguage: info.targetLanguage,
-          pageWidth: 0, pageHeight: 0, textMask: null, kept: [], eraseRegions: [],
-          detectionMs: 0, ocrMs: 0, empty: info.cached,
+          page: placeholderPage(), empty: info.cached,
         })
         continue
       }
       job.stage = `${prefix}本地识别`
-      const page = await runInference(() => recognizePage(asset, info, stage => { job.stage = `${prefix}${stage}` }))
+      const page = await recognizePage(asset, info, stage => { job.stage = `${prefix}${stage}` })
       prepared.push(page)
-      logInfo('任务', `${jobLabel(job)} ${prefix}识别完成 · ${page.kept.length} 处文本 · 检测 ${formatDuration(page.detectionMs)} / OCR ${formatDuration(page.ocrMs)}`)
+      logInfo('任务', `${jobLabel(job)} ${prefix}识别完成 · ${page.page.regions.length} 处文本 · 检测 ${formatDuration(page.page.timings.detectionMs)} / OCR ${formatDuration(page.page.timings.ocrMs)}`)
     } catch (error) {
       recordFailure(job, asset, error, stage => { job.stage = `${prefix}${stage}` }, prefix)
     }
@@ -539,8 +534,8 @@ async function runBatched(job: InternalJob, assets: StoredAsset[], force: boolea
     let cursor = 0
     for (const page of prepared) {
       if (page.empty) { pushResult(job, page.asset.id, page.empty, assets.length); continue }
-      const slice = merged.translations.slice(cursor, cursor + page.kept.length)
-      cursor += page.kept.length
+      const slice = merged.translations.slice(cursor, cursor + page.page.regions.length)
+      cursor += page.page.regions.length
       job.stage = `生成译图 ${job.completed + 1}/${assets.length}`
       try {
         const result = await finalizePage(page, slice, merged.model)
@@ -606,24 +601,75 @@ async function processAsset(
   }
 
   setStage('等待本地识别资源')
-  // 逐页模式仍在同一次排队中走完整页，完成回填后才处理下一页。
-  return runInference(async () => {
-    const page = await recognizePage(asset, info, setStage)
-    if (page.empty) return page.empty
-    setStage(`AI 翻译 ${page.kept.length} 处文字`)
-    const translated = await translateMangaTexts({
-      texts: page.kept.map(region => region.text), targetLanguage: page.targetLanguage,
-    })
-    return finalizePage(page, translated.translations, translated.model, setStage)
+  // 计算本身（本地或远程）由 computePage 串行化；这里只负责翻译与落盘。
+  const page = await recognizePage(asset, info, setStage)
+  if (page.empty) return page.empty
+  setStage(`AI 翻译 ${page.page.regions.length} 处文字`)
+  const translated = await translateMangaTexts({
+    texts: page.page.regions.map(region => region.source), targetLanguage: page.targetLanguage,
   })
+  return finalizePage(page, translated.translations, translated.model, setStage)
 }
 
+/**
+ * 定位这一页的结果缓存。
+ *
+ * 快速路径只做一次 stat + 索引查询：原图内容没变就直接沿用上次算出的 key，不再
+ * 重读整张图片。未翻译过的页同样会留下指纹，所以反复翻页不会反复哈希原图。
+ * 只有文件真的变了、或用户强制重译时才重新读文件计算内容哈希。
+ */
 async function prepareAsset(asset: StoredAsset, force: boolean): Promise<PreparedAsset> {
-  const hash = createHash('sha256').update(await readFile(asset.path)).digest('hex')
   const targetLanguage = getAiSettings().targetLanguage
+  if (!force) {
+    const known = await readAssetFingerprint(asset, targetLanguage)
+    if (known) {
+      const cached = readCachedResult(known.key)
+      return { key: known.key, targetLanguage, hash: known.hash, ...(cached ? { cached } : {}) }
+    }
+  }
+  const info = await stat(asset.path)
+  const hash = await hashFile(asset.path)
   const key = createHash('sha256').update(JSON.stringify({ version: PIPELINE_VERSION, hash, targetLanguage })).digest('hex')
-  const cached = force ? undefined : readCachedResult(key)
-  return { key, targetLanguage, cached }
+  writeAssetFingerprint(asset, targetLanguage, key, hash, info.size, Math.trunc(info.mtimeMs))
+  if (force) return { key, targetLanguage, hash }
+  const cached = readCachedResult(key)
+  return { key, targetLanguage, hash, ...(cached ? { cached } : {}) }
+}
+
+/** 原图指纹：大小与修改时间足够便宜，用来判断是否还需要重新哈希。 */
+async function readAssetFingerprint(asset: StoredAsset, targetLanguage: string) {
+  let info
+  try { info = await stat(asset.path) } catch { return null }
+  const row = db.prepare(
+    'SELECT key, size, mtime, content_hash FROM manga_asset_cache WHERE asset_id = ? AND language = ? AND version = ?',
+  ).get(asset.id, targetLanguage, PIPELINE_VERSION) as { key: string; size: number; mtime: number; content_hash: string } | undefined
+  if (!row) return null
+  if (row.size !== info.size || row.mtime !== Math.trunc(info.mtimeMs)) return null
+  return { key: row.key, hash: row.content_hash }
+}
+
+function writeAssetFingerprint(
+  asset: StoredAsset, targetLanguage: string, key: string, hash: string, size: number, mtime: number,
+): void {
+  const now = Date.now()
+  db.prepare(`
+    INSERT INTO manga_asset_cache (asset_id, language, version, key, size, mtime, content_hash, created, last_used)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(asset_id, language, version) DO UPDATE SET
+      key = excluded.key, size = excluded.size, mtime = excluded.mtime,
+      content_hash = excluded.content_hash, last_used = excluded.last_used
+  `).run(asset.id, targetLanguage, PIPELINE_VERSION, key, size, mtime, hash, now, now)
+}
+
+/** 流式计算原图内容哈希，避免把整张图读进内存。 */
+function hashFile(file: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(file)
+    stream.on('data', chunk => hash.update(chunk))
+    stream.on('error', reject)
+    stream.on('end', () => resolve(hash.digest('hex')))
+  })
 }
 
 /** 只把真正需要模型/翻译/擦字的页面串行化；缓存查询可以在队列外立即完成。 */
@@ -631,39 +677,6 @@ function runInference<T>(task: () => Promise<T>): Promise<T> {
   const result = inferenceQueue.then(task, task)
   inferenceQueue = result.then(() => undefined, () => undefined)
   return result
-}
-
-/**
- * 保证模型就位并加载进内存。模型是懒加载的：首次翻译时才下载、加载，之后
- * 一直复用同一份会话，直到进程退出，不会每次翻译都重建。
- */
-async function ensureModels(setStage?: (stage: string) => void): Promise<void> {
-  if (detector.isLoaded && recognizer.isLoaded) return
-  if (!loading) {
-    loading = (async () => {
-      // 只下载真正缺失的文件；全部就位时这一步不做任何网络请求。
-      if (missingModels().length) {
-        setStage?.('下载本地识别模型')
-        logInfo('任务', '首次调用需要下载本地识别与 OCR 模型，耗时会长一些')
-        await ensureMangaModels(undefined, progress => {
-          if (!progress.total) return
-          const percent = Math.round(progress.received / progress.total * 100)
-          setStage?.(`下载本地识别模型 ${percent}%`)
-        })
-      }
-      setStage?.('加载本地识别模型')
-      await Promise.all([
-        detector.load(modelPath(detectorModel), { executionProviders: providers() }),
-        recognizer.load(path.join(modelRoot, 'manga-ocr'), { encoderProviders: providers(), decoderProviders: ['cpu'] }),
-      ])
-      logInfo('任务', `本地 OCR encoder：${recognizer.encoderFileUsed}`)
-    })().finally(() => { loading = null })
-  }
-  return loading
-}
-
-function providers(): string[] {
-  return process.platform === 'win32' ? ['dml', 'cpu'] : ['cpu']
 }
 
 function emptyResult(asset: StoredAsset, key: string, targetLanguage: string): MangaPageResult {

@@ -2,6 +2,7 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { PixivAccount, PixivBookmarkRestrict, PixivSettings } from '../../shared/types.js'
 import { dataDir } from '../config.js'
+import { markLibraryChanged } from '../library-revision.js'
 import { pixivHeaders } from './protocol.js'
 import { pixivJson, pixivRequest } from './transport.js'
 import { PixivApiError, pixivErrorMessage } from './errors.js'
@@ -231,6 +232,9 @@ async function saveSettings(input: unknown): Promise<PixivSettings> {
     next.accessTokenExpiresAt = Date.now() + tokens.expiresIn * 1000
   }
   if (!next.account?.id || !next.refreshToken) next.localMode = true
+  // 本地模式和账号决定云端作品是否出现在目录里；默认收藏夹、缓存上限等设置不影响作品数据，
+  // 不必让搜索索引失效。
+  const visibleChanged = next.localMode !== current.localMode || next.accountId !== current.accountId
   if (tokens || next.localMode !== current.localMode) sessionVersion++
   current = next
   persist()
@@ -239,6 +243,7 @@ async function saveSettings(input: unknown): Promise<PixivSettings> {
     deletePixivDataForOtherAccounts(next.accountId)
     clearPixivApiCache()
   }
+  if (visibleChanged) markLibraryChanged()
   return getPixivSettings()
 }
 
@@ -249,9 +254,12 @@ export function savePixivSettings(input: unknown): Promise<PixivSettings> {
 }
 
 export function clearPixivAccount(): void {
+  // 本来就没有账号时，登出不改变目录内容。
+  const hadAccount = Boolean(current.account?.id || current.refreshToken)
   sessionVersion++
   current = { ...current, localMode: true, account: null, accountId: '', refreshToken: '', accessToken: '', accessTokenExpiresAt: 0 }
   persist()
+  if (hadAccount) markLibraryChanged()
 }
 
 export function requirePixivReady(): void {

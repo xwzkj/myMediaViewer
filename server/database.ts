@@ -3,6 +3,7 @@ import path from 'node:path'
 import { dataDir } from './config.js'
 import type { Work, MediaKind, Source } from '../shared/types.js'
 import { localPixivId } from './pixiv/identity.js'
+import { markLibraryChanged } from './library-revision.js'
 
 export interface StoredAsset {
   id: string; workId: string; path: string; filename: string; page: number; kind: MediaKind;
@@ -24,6 +25,14 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS translations (key TEXT PRIMARY KEY, data TEXT NOT NULL, created INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS manga_translations (
     key TEXT PRIMARY KEY, data TEXT NOT NULL, image_path TEXT, created INTEGER NOT NULL
+  );
+  -- 原图指纹 → 结果 key 的映射：自动查询只做一次 stat 就能定位缓存，不必重读整张原图。
+  -- 指纹是 size + mtime：刻意保留两者不变的替换无法识别，强制重译会重新校验内容。
+  CREATE TABLE IF NOT EXISTS manga_asset_cache (
+    asset_id TEXT NOT NULL, language TEXT NOT NULL, version INTEGER NOT NULL,
+    key TEXT NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL, content_hash TEXT NOT NULL,
+    created INTEGER NOT NULL, last_used INTEGER NOT NULL,
+    PRIMARY KEY (asset_id, language, version)
   );
 `)
 
@@ -48,6 +57,7 @@ export function favoriteIds(): Set<string> {
 export function setFavorite(id: string, favorite: boolean): void {
   if (favorite) db.prepare('INSERT OR IGNORE INTO favorites VALUES (?, ?)').run(id, Date.now())
   else db.prepare('DELETE FROM favorites WHERE work_id = ?').run(id)
+  markLibraryChanged()
 }
 export function saveSource(source: Source, works: StoredWork[], assets: StoredAsset[], metadata: Array<{key: string; stamp: string; data: string}> = []): void {
   const addWork = db.prepare('INSERT INTO works VALUES (?, ?, ?)')
@@ -62,6 +72,7 @@ export function saveSource(source: Source, works: StoredWork[], assets: StoredAs
     for (const row of metadata) cache.run(row.key, row.stamp, row.data)
     db.exec('COMMIT')
   } catch (error) { db.exec('ROLLBACK'); throw error }
+  markLibraryChanged()
 }
 export function toWork(work: StoredWork, favorites: Set<string>): Work {
   const { coverId, originalUrl: _url, ...data } = work

@@ -1,3 +1,5 @@
+// 必须最先导入：配置模块在加载时就读取 process.env，.env 要先就位。
+import './env.js'
 import { createApp } from './app.js'
 import { host, port, sources, allowPublicAccess } from './config.js'
 import { scanLibrary } from './scanner.js'

@@ -1,12 +1,20 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import type { AiConnectionResult, AiSettings } from '../../shared/types'
+import { computed, onMounted, ref } from 'vue'
+import type { AiConnectionResult, AiSettings, LocalComputeFallback, LocalComputeMode, LocalComputeSettings } from '../../shared/types'
 import { DEFAULT_APPEND_PROMPT } from '../../shared/prompts'
 import Icon from './Icon.vue'
 import AppSelect from './AppSelect.vue'
 import { api } from '../api'
 
 const emit = defineEmits<{ notice: [message: string] }>()
+
+// POST /api/ai/compute/test 成功时返回的公开状态。
+interface ComputeTestResult {
+  protocol: number
+  ready: boolean
+  device: string
+  message?: string
+}
 
 const settings = ref<AiSettings | null>(null)
 const loading = ref(true)
@@ -23,6 +31,21 @@ const showKey = ref(false)
 const timeoutSeconds = ref(120)
 const pipelineMode = ref<AiSettings['mangaPipelineMode']>('streaming')
 const concurrency = ref(3)
+// 本地 AI 执行位置：本地主机或同一项目的远程计算端。Key 只在提交时上传，接口不回传明文。
+const computeMode = ref<LocalComputeMode>('local')
+const computeBaseUrl = ref('')
+const computeFallback = ref<LocalComputeFallback>('error')
+const computeKeyDraft = ref('')
+const computeKeyConfigured = ref(false)
+const computeClearKey = ref(false)
+const testingCompute = ref(false)
+const computeResult = ref<ComputeTestResult | null>(null)
+const computeError = ref('')
+
+const computeKeyPlaceholder = computed(() => {
+  if (computeClearKey.value) return '保存后将清除已保存的 Key'
+  return computeKeyConfigured.value ? '已保存，留空则不修改' : '填写远程计算端的 API Key'
+})
 
 const paramsExample = '{\n  "reasoning_effort": "low",\n  "thinking": { "type": "disabled" },\n  "thinking_budget": 1024,\n  "temperature": 0.3\n}'
 
@@ -40,6 +63,13 @@ function apply(data: AiSettings) {
   timeoutSeconds.value = Math.max(5, Math.round((data.timeoutMs || 120000) / 1000))
   pipelineMode.value = data.mangaPipelineMode || 'streaming'
   concurrency.value = Math.min(10, Math.max(1, data.mangaConcurrency || 3))
+  computeMode.value = data.localCompute.mode === 'remote' ? 'remote' : 'local'
+  computeBaseUrl.value = data.localCompute.baseUrl || ''
+  computeFallback.value = data.localCompute.fallback === 'local' ? 'local' : 'error'
+  computeKeyConfigured.value = Boolean(data.localCompute.apiKeyConfigured)
+  // 保存成功后也走这里：清空未提交的 Key 草稿和清除标记。
+  computeKeyDraft.value = ''
+  computeClearKey.value = false
 }
 
 function parseParams(): Record<string, unknown> {
@@ -61,12 +91,28 @@ function buildPayload() {
   const params = parseParams()
   const sec = Number(timeoutSeconds.value)
   const timeoutMs = Number.isFinite(sec) ? Math.min(600, Math.max(5, Math.round(sec))) * 1000 : 120000
+  // 连接/总时限沿用已加载值；本地模式也保留已保存的远程地址，避免被清空。
+  const local = current.localCompute
+  const key = computeKeyDraft.value.trim()
+  const localCompute: LocalComputeSettings = {
+    mode: computeMode.value,
+    baseUrl: computeBaseUrl.value.trim() || local.baseUrl,
+    fallback: computeFallback.value,
+    apiKeyConfigured: computeClearKey.value ? false : Boolean(key) || local.apiKeyConfigured,
+    connectTimeoutMs: local.connectTimeoutMs,
+    timeoutMs: local.timeoutMs,
+  }
   return {
     ...current,
     params,
     timeoutMs,
     mangaPipelineMode: pipelineMode.value,
     mangaConcurrency: Math.min(10, Math.max(1, Math.round(Number(concurrency.value) || 3))),
+    localCompute: {
+      ...localCompute,
+      // 清除优先：带了 clearApiKey 就不再上传 apiKey。
+      ...(computeClearKey.value ? { clearApiKey: true } : key ? { apiKey: key } : {}),
+    },
   }
 }
 
@@ -104,6 +150,39 @@ async function test() {
     emit('notice', '模型响应正常')
   } catch (e) { error.value = (e as Error).message }
   finally { testing.value = false }
+}
+
+async function testCompute() {
+  const current = settings.value
+  if (!current) return
+  computeError.value = ''; computeResult.value = null
+  const key = computeKeyDraft.value.trim()
+  testingCompute.value = true
+  try {
+    // 使用当前表单值测试，不先保存；Key 留空时由服务端沿用已保存的。
+    const result = await api<ComputeTestResult>('/ai/compute/test', {
+      method: 'POST',
+      body: JSON.stringify({
+        localCompute: {
+          mode: computeMode.value,
+          baseUrl: computeBaseUrl.value.trim() || current.localCompute.baseUrl,
+          fallback: computeFallback.value,
+          connectTimeoutMs: current.localCompute.connectTimeoutMs,
+          timeoutMs: current.localCompute.timeoutMs,
+          ...(key ? { apiKey: key } : {}),
+        },
+      }),
+    })
+    computeResult.value = result
+    emit('notice', result.ready ? '远程计算端已就绪' : '远程计算端已连接，模型尚未就绪')
+  } catch (e) { computeError.value = (e as Error).message }
+  finally { testingCompute.value = false }
+}
+
+function toggleComputeClearKey() {
+  computeClearKey.value = !computeClearKey.value
+  // 已标记清除时不再保留未提交的 Key，避免保存时被静默忽略。
+  if (computeClearKey.value) computeKeyDraft.value = ''
 }
 
 async function loadModels() {
@@ -184,6 +263,62 @@ function pickModel(model: string) {
           </label>
         </div>
         <label v-if="pipelineMode === 'parallel' || pipelineMode === 'streaming'" class="concurrency-field">并发数<input v-model.number="concurrency" type="number" min="1" max="10" step="1" /><span>同时进行的翻译请求数，1 - 10，默认 3。接口限流时调小。</span></label>
+      </div>
+      <div class="field">
+        <span>本地 AI 执行位置</span>
+        <div class="pipeline-options">
+          <label class="pipeline-option" :class="{ active: computeMode === 'local' }">
+            <input v-model="computeMode" name="local-compute" type="radio" value="local" />
+            <span class="pipeline-copy">
+              <span class="pipeline-name">本地主机</span>
+              <span class="pipeline-desc">检测、识别与擦字都在运行主服务的这台机器上完成。</span>
+            </span>
+          </label>
+          <label class="pipeline-option" :class="{ active: computeMode === 'remote' }">
+            <input v-model="computeMode" name="local-compute" type="radio" value="remote" />
+            <span class="pipeline-copy">
+              <span class="pipeline-name">远程计算端</span>
+              <span class="pipeline-desc">把原图交给同一项目的远程计算端处理，减轻本机算力压力。</span>
+            </span>
+          </label>
+        </div>
+        <template v-if="computeMode === 'remote'">
+          <label class="field">远程 API 地址<input v-model="computeBaseUrl" placeholder="http://192.168.1.10:3211" spellcheck="false" autocomplete="off" /><span>填写计算端的基础地址，默认端口 3211。</span></label>
+          <label class="field">API Key
+            <div class="key-field">
+              <input v-model="computeKeyDraft" type="password" :placeholder="computeKeyPlaceholder" spellcheck="false" autocomplete="off" @input="computeClearKey = false" />
+              <button v-if="computeKeyConfigured || computeClearKey" type="button" class="button text small" @click="toggleComputeClearKey">{{ computeClearKey ? '撤销清除' : '清除' }}</button>
+            </div>
+            <span v-if="computeClearKey" role="status">已标记清除，保存设置后生效。</span>
+            <span v-else-if="computeKeyConfigured">已保存 Key，留空表示不修改。</span>
+            <span v-else>尚未配置 Key，远程模式需要填写后才能测试连接。</span>
+          </label>
+          <div class="field">
+            <span>连接失败策略</span>
+            <div class="pipeline-options">
+              <label class="pipeline-option" :class="{ active: computeFallback === 'error' }">
+                <input v-model="computeFallback" name="local-compute-fallback" type="radio" value="error" />
+                <span class="pipeline-copy">
+                  <span class="pipeline-name">直接报错</span>
+                  <span class="pipeline-desc">连不上远程计算端时直接提示失败，不改用本机。</span>
+                </span>
+              </label>
+              <label class="pipeline-option" :class="{ active: computeFallback === 'local' }">
+                <input v-model="computeFallback" name="local-compute-fallback" type="radio" value="local" />
+                <span class="pipeline-copy">
+                  <span class="pipeline-name">回退本地主机</span>
+                  <span class="pipeline-desc">任务还没被接收就连不上时，改用运行主服务的这台机器继续处理。</span>
+                </span>
+              </label>
+            </div>
+          </div>
+          <div class="ai-actions">
+            <button type="button" class="button tonal small" :disabled="testingCompute" @click="testCompute"><Icon name="refresh" :class="{ spinning: testingCompute }" :size="17" />{{ testingCompute ? '正在测试…' : '测试连接' }}</button>
+          </div>
+          <p v-if="computeResult" class="ai-result" role="status"><Icon name="success" :size="17" />协议 v{{ computeResult.protocol }} · 设备 {{ computeResult.device }} · {{ computeResult.ready ? '已就绪' : '尚未就绪' }}{{ computeResult.message ? ' · ' + computeResult.message : '' }}</p>
+          <p v-if="computeError" class="inline-error" role="alert"><Icon name="warning" :size="19" />{{ computeError }}</p>
+        </template>
+        <span>本地主机指运行主服务的这台机器；远程计算端只做检测、识别与擦字，在线翻译仍由主服务发起。</span>
       </div>
       <label class="manga-auto-setting">
         <input v-model="settings.mangaAutoShowTranslated" type="checkbox" />

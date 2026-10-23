@@ -151,6 +151,24 @@ export interface TagSuggestionsResponse { items: TagSuggestion[]; total: number 
  */
 export type MangaPipelineMode = 'sequential' | 'merged' | 'parallel' | 'streaming'
 
+// 本地 AI 计算位置：默认在主服务所在机器执行，也可以交给同项目的远程计算端。
+export type LocalComputeMode = 'local' | 'remote'
+// 远程计算端在任务被接收前就连不上时，是否回退到本地主机。
+export type LocalComputeFallback = 'error' | 'local'
+
+export interface LocalComputeSettings {
+  mode: LocalComputeMode
+  /** 远程计算端基础地址，例如 http://192.168.1.10:3211；本地模式下可为空。 */
+  baseUrl: string
+  fallback: LocalComputeFallback
+  /** 只告诉界面是否已保存 Key，Key 本身不回传浏览器。 */
+  apiKeyConfigured: boolean
+  /** 建连超时：只有这段内的连接失败才可能触发回退。 */
+  connectTimeoutMs: number
+  /** 远程任务总时限，与在线 AI 超时相互独立。 */
+  timeoutMs: number
+}
+
 // AI 翻译：服务端保存的接口配置。
 export interface AiSettings {
   baseUrl: string; apiKey: string; model: string; targetLanguage: string;
@@ -162,6 +180,8 @@ export interface AiSettings {
   // parallel 和 streaming 模式同时发出的翻译请求数上限。
   mangaConcurrency: number
   mangaAutoShowTranslated: boolean
+  // 本地 AI 计算位置（本地主机 / 远程计算端）与回退策略。
+  localCompute: LocalComputeSettings
 }
 // 可供翻译的文字字段，键名与模型输出的 JSON 保持一致。
 export interface AiTranslateFields {
@@ -231,6 +251,10 @@ export interface MangaModelStatus {
   device: string
   models: Array<{ name: string; ready: boolean; files: string[]; missing: string[] }>
   message?: string
+  /** 当前实际生效的计算位置。 */
+  location?: LocalComputeMode
+  /** 远程模式下的连接状态；本地模式省略。 */
+  remote?: { configured: boolean; connected: boolean; device?: string; message?: string }
 }
 
 export interface DirectoryEntry { name: string; path: string }

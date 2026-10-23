@@ -100,6 +100,20 @@ test('Ugoira 转码、格式回退与 Range 响应', async t => {
         assert.deepEqual(partial.rawPayload, full.rawPayload.subarray(0, 32))
         assert.equal((await app.inject('/api/pixiv/ugoira/456/animation?format=invalid')).statusCode, 400)
       })
+      await t.test('准备接口返回真实 MIME 与可播放地址，且复用同一份缓存', async () => {
+        const prepared = await app.inject({
+          url: '/api/pixiv/ugoira/456/prepare',
+          method: 'POST',
+          payload: { format: 'webp' },
+        })
+        assert.equal(prepared.statusCode, 200)
+        const body = prepared.json() as { url: string; contentType: string }
+        assert.equal(body.contentType, 'image/webp')
+        assert.equal(body.url, '/api/pixiv/ugoira/456/animation?format=webp')
+        const media = await app.inject(body.url)
+        assert.equal(media.statusCode, 200)
+        assert.equal(media.headers['content-type'], 'image/webp')
+      })
     } finally {
       await app.close()
       db.close()
