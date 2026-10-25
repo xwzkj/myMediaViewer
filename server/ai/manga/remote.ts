@@ -79,17 +79,30 @@ function phaseForStatus(status: number): RemotePhase {
   return status === 401 || status === 403 ? 'auth' : 'protocol'
 }
 
+/** 调用方取消与本次请求超时合并：任一方触发都会中止请求。 */
+function withTimeout(ms: number, signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(ms)
+  return signal ? AbortSignal.any([signal, timeout]) : timeout
+}
+
+/** 主动取消不是连接故障，不能被归类成可回退的「远程不可用」。 */
+function rethrowIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return
+  throw signal.reason instanceof Error ? signal.reason : new Error('任务已取消')
+}
+
 /** 读取计算端状态：鉴权、协议版本、模型就位情况和实际设备。 */
-export async function checkRemoteCompute(config: RemoteComputeConfig): Promise<ComputeStatus> {
+export async function checkRemoteCompute(config: RemoteComputeConfig, signal?: AbortSignal): Promise<ComputeStatus> {
   if (!config.apiKey) throw new RemoteComputeError('尚未填写远程计算端 API Key', 400, 'compute_key_missing', 'auth')
   if (!/^https?:\/\//i.test(config.baseUrl)) throw new RemoteComputeError('远程计算端地址需要以 http:// 或 https:// 开头', 400, 'compute_url_invalid', 'protocol')
   let response: Response
   try {
     response = await fetch(`${baseUrlOf(config)}/v1/status`, {
       headers: authHeaders(config),
-      signal: AbortSignal.timeout(config.connectTimeoutMs),
+      signal: withTimeout(config.connectTimeoutMs, signal),
     })
   } catch (error) {
+    rethrowIfAborted(signal)
     throw connectError(error, config.connectTimeoutMs)
   }
   if (!response.ok) {
@@ -113,8 +126,15 @@ function sha256(buffer: Buffer): string {
   return createHash('sha256').update(buffer).digest('hex')
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+/** 轮询间隔也必须能被取消，否则暂停/停止要等到下一次 sleep 结束才生效。 */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // 事件回调里必须 reject：在监听器里 throw 会变成未捕获异常，而不是取消等待。
+    const abort = () => reject(signal?.reason instanceof Error ? signal.reason : new Error('任务已取消'))
+    if (signal?.aborted) { abort(); return }
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve() }, ms)
+    signal?.addEventListener('abort', abort, { once: true })
+  })
 }
 
 export interface RemoteJobInput {
@@ -122,6 +142,8 @@ export interface RemoteJobInput {
   imagePath: string
   /** 阶段回调，用于把任务进度透传给界面。 */
   onStage?: (stage: string) => void
+  /** 暂停/停止信号：会中止上传、轮询与下载。 */
+  signal?: AbortSignal
 }
 
 /**
@@ -131,7 +153,17 @@ export interface RemoteJobInput {
  */
 export async function runRemoteMangaJob(config: RemoteComputeConfig, input: RemoteJobInput): Promise<EnginePage> {
   const setStage = input.onStage ?? (() => {})
+  const signal = input.signal
   if (!config.apiKey) throw new RemoteComputeError('尚未填写远程计算端 API Key', 400, 'compute_key_missing', 'auth')
+  // 健康检查先于任务提交：/v1/status 失败即视为计算端离线，只有这一步的连接失败才允许回退本地。
+  const health = await checkRemoteCompute(config, signal)
+  if (!health.ready) {
+    throw new RemoteComputeError(
+      health.message || '远程计算端模型尚未就绪，请先在计算端完成模型下载',
+      503, 'compute_not_ready', 'protocol',
+    )
+  }
+  signal?.throwIfAborted()
 
   const image = await readFile(input.imagePath)
   if (!image.length) throw new MangaEngineError('图片文件为空', 422, 'invalid_image')
@@ -157,9 +189,10 @@ export async function runRemoteMangaJob(config: RemoteComputeConfig, input: Remo
       }),
       body: new Uint8Array(image),
       // 上传本身可能比建连久，这里给一个足够宽的独立时限。
-      signal: AbortSignal.timeout(Math.max(config.connectTimeoutMs, 60_000)),
+      signal: withTimeout(Math.max(config.connectTimeoutMs, 60_000), signal),
     })
   } catch (error) {
+    rethrowIfAborted(signal)
     throw connectError(error, config.connectTimeoutMs)
   }
   if (!response.ok) {
@@ -182,9 +215,10 @@ export async function runRemoteMangaJob(config: RemoteComputeConfig, input: Remo
     try {
       poll = await fetch(`${base}/v1/jobs/${encodeURIComponent(jobId)}`, {
         headers: authHeaders(config),
-        signal: AbortSignal.timeout(Math.max(config.connectTimeoutMs, 15_000)),
+        signal: withTimeout(Math.max(config.connectTimeoutMs, 15_000), signal),
       })
     } catch (error) {
+      rethrowIfAborted(signal)
       throw connectErrorAfterAccept(error, config.connectTimeoutMs)
     }
     if (!poll.ok) {
@@ -204,7 +238,7 @@ export async function runRemoteMangaJob(config: RemoteComputeConfig, input: Remo
     }
     if (status.state === 'ready') break
     if (status.stage) setStage(`远程：${status.stage}`)
-    await sleep(interval)
+    await sleep(interval, signal)
     interval = Math.min(interval * 1.5, 2000)
   }
   if (!status || status.state !== 'ready') {
@@ -216,25 +250,26 @@ export async function runRemoteMangaJob(config: RemoteComputeConfig, input: Remo
   const result = status.result
   if (!result) throw new RemoteComputeError('远程计算端没有返回结果', 502, 'compute_invalid_response', 'job')
 
-  let baseImage: Buffer | undefined
-  if (result.baseBytes > 0) {
-    setStage('下载译图底图')
+  let overlay: Buffer | undefined
+  if (result.overlayBytes > 0) {
+    setStage('下载擦字覆盖层')
     let download: Response
     try {
-      download = await fetch(`${base}/v1/jobs/${encodeURIComponent(jobId)}/base`, {
+      download = await fetch(`${base}/v1/jobs/${encodeURIComponent(jobId)}/overlay`, {
         headers: authHeaders(config),
-        signal: AbortSignal.timeout(Math.max(config.connectTimeoutMs, 60_000)),
+        signal: withTimeout(Math.max(config.connectTimeoutMs, 60_000), signal),
       })
     } catch (error) {
+      rethrowIfAborted(signal)
       throw connectErrorAfterAccept(error, config.connectTimeoutMs)
     }
     if (!download.ok) {
       const failure = await describeFailure(download)
       throw new RemoteComputeError(failure.message, download.status, failure.code, 'download', failure.retryable)
     }
-    baseImage = Buffer.from(await download.arrayBuffer())
-    if (baseImage.length !== result.baseBytes || sha256(baseImage) !== result.baseSha256) {
-      throw new RemoteComputeError('远程计算端返回的底图校验失败，请重试', 502, 'compute_checksum_mismatch', 'download', true)
+    overlay = Buffer.from(await download.arrayBuffer())
+    if (overlay.length !== result.overlayBytes || sha256(overlay) !== result.overlaySha256) {
+      throw new RemoteComputeError('远程计算端返回的覆盖层校验失败，请重试', 502, 'compute_checksum_mismatch', 'download', true)
     }
   }
 
@@ -249,7 +284,7 @@ export async function runRemoteMangaJob(config: RemoteComputeConfig, input: Remo
     width: result.width,
     height: result.height,
     regions: result.regions,
-    base: baseImage,
+    overlay,
     engine: result.engine,
     timings: result.timings,
   }

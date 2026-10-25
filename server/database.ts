@@ -23,8 +23,22 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS group_metadata_cache (key TEXT PRIMARY KEY, stamp TEXT NOT NULL, data TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS metadata_cache (path TEXT PRIMARY KEY, stamp TEXT NOT NULL, data TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS translations (key TEXT PRIMARY KEY, data TEXT NOT NULL, created INTEGER NOT NULL);
+  -- CLIP vectors are model-specific, little-endian Float32 blobs (512 dimensions).
+  -- Keep across unchanged rescans; stale/deleted assets are excluded by the semantic store.
+  CREATE TABLE IF NOT EXISTS semantic_embeddings (
+    asset_id TEXT NOT NULL, model TEXT NOT NULL, fingerprint TEXT NOT NULL,
+    dimensions INTEGER NOT NULL CHECK (dimensions = 512),
+    vector BLOB NOT NULL CHECK (length(vector) = 2048), created INTEGER NOT NULL,
+    PRIMARY KEY (asset_id, model)
+  );
+  CREATE INDEX IF NOT EXISTS semantic_embeddings_model ON semantic_embeddings(model);
+  -- image_path 是旧版的整页擦字底图；新结果只写 overlay_path（透明擦字覆盖层）。
   CREATE TABLE IF NOT EXISTS manga_translations (
-    key TEXT PRIMARY KEY, data TEXT NOT NULL, image_path TEXT, created INTEGER NOT NULL
+    key TEXT PRIMARY KEY, data TEXT NOT NULL, image_path TEXT, overlay_path TEXT, source_path TEXT, created INTEGER NOT NULL
+  );
+  -- OCR/擦字预热：只存识别结果与覆盖层，不写译文，因此不会被误当成已翻译缓存。
+  CREATE TABLE IF NOT EXISTS manga_prepared_pages (
+    key TEXT PRIMARY KEY, data TEXT NOT NULL, image_path TEXT, overlay_path TEXT, source_path TEXT, created INTEGER NOT NULL
   );
   -- 原图指纹 → 结果 key 的映射：自动查询只做一次 stat 就能定位缓存，不必重读整张原图。
   -- 指纹是 size + mtime：刻意保留两者不变的替换无法识别，强制重译会重新校验内容。
@@ -35,6 +49,22 @@ db.exec(`
     PRIMARY KEY (asset_id, language, version)
   );
 `)
+
+/**
+ * 旧库补列。
+ *
+ * `CREATE TABLE IF NOT EXISTS` 对已存在的表不会生效，新版本增加的列必须在启动时
+ * 显式补上，否则老用户的插入语句会直接报「no column named ...」。
+ * 表名与列名都是本文件里的字面量，不接受外部输入。
+ */
+function ensureColumn(table: string, column: string, definition: string): void {
+  const columns = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(row => row.name)
+  if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+}
+ensureColumn('manga_translations', 'overlay_path', 'TEXT')
+ensureColumn('manga_translations', 'source_path', 'TEXT')
+ensureColumn('manga_prepared_pages', 'overlay_path', 'TEXT')
+ensureColumn('manga_prepared_pages', 'source_path', 'TEXT')
 
 export function allWorks(): StoredWork[] {
   return (db.prepare('SELECT data FROM works').all() as { data: string }[]).map(row => JSON.parse(row.data))
@@ -68,6 +98,9 @@ export function saveSource(source: Source, works: StoredWork[], assets: StoredAs
     db.prepare('DELETE FROM works WHERE source_id = ?').run(source.id)
     for (const work of works) addWork.run(work.id, source.id, JSON.stringify(work))
     for (const asset of assets) addAsset.run(asset.id, asset.workId, JSON.stringify(asset))
+    // 必须在资产重新写入之后再清理：此时表里只剩真正被删除的资源，
+    // 否则重扫会把自己刚删掉的这一来源的全部语义向量清空。
+    db.prepare('DELETE FROM semantic_embeddings WHERE asset_id NOT IN (SELECT id FROM assets)').run()
     const cache = db.prepare('INSERT OR REPLACE INTO group_metadata_cache VALUES (?, ?, ?)')
     for (const row of metadata) cache.run(row.key, row.stamp, row.data)
     db.exec('COMMIT')

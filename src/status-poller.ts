@@ -12,8 +12,10 @@ export function createStatusPoller<T>(load: () => Promise<T>, receive: (value: T
       catch (error) { if (!stopped && generation === run) fail(error) }
       finally {
         pending = undefined
-        if (!stopped && generation === run) {
-          const immediate = again; again = false
+        if (!stopped) {
+          // Reactivation may occur while the old generation is still pending. Its response
+          // stays discarded, but the newly active generation must still schedule a request.
+          const immediate = again || generation !== run; again = false
           timer = setTimeout(() => { void refresh() }, immediate ? 0 : delay)
         }
       }

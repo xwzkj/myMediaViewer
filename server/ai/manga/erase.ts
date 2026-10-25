@@ -9,14 +9,19 @@ export interface EraseRegion {
 }
 
 export interface ErasedPage {
-  data: Buffer
+  /** RGBA 覆盖层原始像素：被擦除处不透明，其余像素完全透明。 */
+  overlay: Buffer
   width: number
   height: number
   colors: Array<{ background: string; textColor: string }>
 }
 
 /**
- * 擦除已翻译的漫画文字。
+ * 生成漫画擦字覆盖层。
+ *
+ * 原图只读，绝不改写：这里产出的是一张与页面同尺寸的 RGBA 覆盖层，只有被擦除的
+ * 像素带颜色和 alpha=255，其余像素 alpha=0。前端用「原图 + 覆盖层 + 译文」合成，
+ * 缓存体积只跟译文面积有关，而不是整页重新编码一遍。
  *
  * CTD 的 seg mask 已经很贴笔画，但抗锯齿边缘常留下一圈灰。这里按 8 邻域膨胀
  * 1px（不做多轮，避免把相邻笔画和气泡边线粘成块），再用每个框边缘的非文字像素
@@ -41,6 +46,8 @@ export async function eraseTranslatedRegions(
   const channels = info.channels
   const mask = textMask && textMask.width === pageWidth && textMask.height === pageHeight ? textMask.data : null
   const colors: Array<{ background: string; textColor: string }> = []
+  // Buffer.alloc 全部归零，未擦除的像素天然保持 alpha=0。
+  const overlay = Buffer.alloc(pageWidth * pageHeight * 4)
 
   for (const region of regions) {
     const rect = clampRect(region, pageWidth, pageHeight)
@@ -50,10 +57,10 @@ export async function eraseTranslatedRegions(
     }
     const fill = estimateBackground(data, channels, pageWidth, pageHeight, rect, mask)
     colors.push({ background: rgbToHex(fill), textColor: luminance(fill) > 160 ? '#111111' : '#ffffff' })
-    fillRegion(data, channels, pageWidth, pageHeight, rect, mask, fill)
+    paintOverlay(overlay, pageWidth, pageHeight, rect, mask, fill)
   }
 
-  return { data, width: pageWidth, height: pageHeight, colors }
+  return { overlay, width: pageWidth, height: pageHeight, colors }
 }
 
 function clampRect(region: EraseRegion, width: number, height: number): EraseRegion {
@@ -115,9 +122,8 @@ function estimateBackground(
   return [Math.round(best.r / best.count), Math.round(best.g / best.count), Math.round(best.b / best.count)]
 }
 
-function fillRegion(
-  data: Buffer,
-  channels: number,
+function paintOverlay(
+  overlay: Buffer,
   pageWidth: number,
   pageHeight: number,
   rect: EraseRegion,
@@ -127,11 +133,11 @@ function fillRegion(
   for (let y = rect.top; y < rect.top + rect.height; y++) {
     for (let x = rect.left; x < rect.left + rect.width; x++) {
       if (!maskedNear(mask, pageWidth, pageHeight, x, y)) continue
-      const offset = (y * pageWidth + x) * channels
-      data[offset] = fill[0]
-      data[offset + 1] = fill[1]
-      data[offset + 2] = fill[2]
-      if (channels > 3) data[offset + 3] = 255
+      const offset = (y * pageWidth + x) * 4
+      overlay[offset] = fill[0]
+      overlay[offset + 1] = fill[1]
+      overlay[offset + 2] = fill[2]
+      overlay[offset + 3] = 255
     }
   }
 }

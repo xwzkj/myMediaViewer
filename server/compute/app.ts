@@ -9,6 +9,8 @@ import {
 } from '../../shared/compute.js'
 import { PIPELINE_VERSION, type EnginePage } from '../ai/manga/engine.js'
 import { formatDuration, logError, logInfo, logWarn, oneLine } from '../log.js'
+import { registerSemanticComputeRoutes } from '../semantic/compute-routes.js'
+import type { SemanticProvider } from '../semantic/provider.js'
 
 /**
  * 远程计算端：只做本地 AI 计算的独立 HTTP 服务。
@@ -16,7 +18,7 @@ import { formatDuration, logError, logInfo, logWarn, oneLine } from '../log.js'
  * 与主服务同属一个项目、共用计算核心，但**不导入**主服务的配置、数据库、媒体库或
  * 在线 AI 客户端。它只认识三样东西：原图、模型、临时目录。
  *
- * 所有接口（含状态、结果、底图）都要求 Bearer Key。错误只回传白名单字段，
+ * 所有接口（含状态、结果、覆盖层）都要求 Bearer Key。错误只回传白名单字段，
  * 不暴露本地路径、堆栈或 FFmpeg/ONNX 内部信息。
  */
 
@@ -43,6 +45,8 @@ export interface ComputeAppOptions {
   maxDiskBytes?: number
   /** 测试可以关掉日志，避免刷屏。 */
   quiet?: boolean
+  /** 语义编码 provider；不传时按默认模型目录懒加载，首次使用自动下载。 */
+  semanticProvider?: SemanticProvider
 }
 
 interface JobRecord {
@@ -54,9 +58,9 @@ interface JobRecord {
   createdAt: number
   updatedAt: number
   inputPath: string
-  basePath: string
-  baseBytes: number
-  baseSha256: string
+  overlayPath: string
+  overlayBytes: number
+  overlaySha256: string
   result?: ComputeJobResult
   error?: ComputeError
 }
@@ -120,6 +124,7 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
   app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: COMPUTE_MAX_UPLOAD_BYTES }, (_request, body, done) => {
     done(null, body)
   })
+  registerSemanticComputeRoutes(app, options.semanticProvider)
 
   app.addHook('onRequest', async (request, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff')
@@ -154,6 +159,16 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
         retryable: false,
       })
     }
+    // 明确标注可公开的 5xx（例如语义模型正在下载/繁忙）要保留真实状态码与原因，
+    // 否则主服务只能看到笼统的 500，既无法重试也无法提示用户。
+    if ((error as { expose?: boolean }).expose === true) {
+      warn(`请求暂不可用 · ${request.method} ${request.url.split('?')[0]} · ${status} · ${(error as Error).message}`)
+      return reply.code(status).send({
+        code: code || 'compute_unavailable',
+        message: (error as Error).message || '计算端暂时不可用',
+        retryable: status === 503 || status === 504,
+      })
+    }
     // 未预期异常只在计算端日志里保留完整堆栈，返回给主服务的仍是笼统提示。
     fail(`内部错误 · ${request.method} ${request.url.split('?')[0]} · 500`, error)
     return reply.code(500).send({ code: 'compute_failed', message: '计算端处理失败，请查看计算端日志', retryable: false })
@@ -174,7 +189,7 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
 
   function totalBytes(): number {
     let total = 0
-    for (const job of jobs.values()) total += job.baseBytes
+    for (const job of jobs.values()) total += job.overlayBytes
     return total
   }
 
@@ -183,7 +198,7 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
     byRequest.delete(job.requestId)
     await Promise.all([
       rm(job.inputPath, { force: true }).catch(() => undefined),
-      job.baseBytes ? rm(job.basePath, { force: true }).catch(() => undefined) : Promise.resolve(),
+      job.overlayBytes ? rm(job.overlayPath, { force: true }).catch(() => undefined) : Promise.resolve(),
     ])
   }
 
@@ -206,7 +221,7 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
       await removeJob(oldest)
     }
     if (!removed.length) return
-    const freed = removed.reduce((total, job) => total + job.baseBytes, 0)
+    const freed = removed.reduce((total, job) => total + job.overlayBytes, 0)
     info(`清理 ${removed.length} 个任务 · 释放 ${megabytes(freed)} · 当前结果 ${megabytes(totalBytes())}`)
   }
 
@@ -230,22 +245,22 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
     }
     try {
       const page = await options.engine.process(job.inputPath, publishStage)
-      const base = page.base
-      let baseBytes = 0
-      let baseSha256 = ''
-      if (base?.length) {
-        baseBytes = base.length
-        baseSha256 = sha256(base)
-        await writeFile(job.basePath, base)
+      const overlay = page.overlay
+      let overlayBytes = 0
+      let overlaySha256 = ''
+      if (overlay?.length) {
+        overlayBytes = overlay.length
+        overlaySha256 = sha256(overlay)
+        await writeFile(job.overlayPath, overlay)
       }
-      job.baseBytes = baseBytes
-      job.baseSha256 = baseSha256
+      job.overlayBytes = overlayBytes
+      job.overlaySha256 = overlaySha256
       job.result = {
         width: page.width,
         height: page.height,
         regions: page.regions,
-        baseBytes,
-        baseSha256,
+        overlayBytes,
+        overlaySha256,
         engine: page.engine,
         pipelineVersion: PIPELINE_VERSION,
         timings: page.timings,
@@ -258,7 +273,7 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
         `完成 ${shortId(job.id)} · ${page.width}×${page.height} · ${page.regions.length} 处文本`
         + ` · 检测 ${formatDuration(timings.detectionMs)} / OCR ${formatDuration(timings.ocrMs)}`
         + ` / 擦字 ${formatDuration(timings.eraseMs)} / 编码 ${formatDuration(timings.encodeMs)}`
-        + ` · 底图 ${baseBytes ? megabytes(baseBytes) : '无（本页没有文本）'}`
+        + ` · 覆盖层 ${overlayBytes ? megabytes(overlayBytes) : '无（本页没有文本）'}`
         + ` · 总 ${formatDuration(Date.now() - startedAt)}`,
       )
     } catch (error) {
@@ -350,9 +365,9 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
       createdAt: Date.now(),
       updatedAt: Date.now(),
       inputPath: path.join(options.workDir, `${id}.input`),
-      basePath: path.join(options.workDir, `${id}.png`),
-      baseBytes: 0,
-      baseSha256: '',
+      overlayPath: path.join(options.workDir, `${id}.png`),
+      overlayBytes: 0,
+      overlaySha256: '',
     }
     await writeFile(job.inputPath, body)
     jobs.set(id, job)
@@ -378,17 +393,17 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
     return job.result
   })
 
-  app.get<{ Params: { id: string } }>('/v1/jobs/:id/base', async (request, reply) => {
+  app.get<{ Params: { id: string } }>('/v1/jobs/:id/overlay', async (request, reply) => {
     const job = jobs.get(request.params.id)
     if (!job || !job.result) return reply.code(404).send({ code: 'job_not_found', message: '计算任务不存在或尚未完成', retryable: false })
-    if (!job.baseBytes) return reply.code(404).send({ code: 'no_base_image', message: '这一页没有可翻译文本，没有底图', retryable: false })
+    if (!job.overlayBytes) return reply.code(404).send({ code: 'no_overlay', message: '这一页没有可翻译文本，没有擦字覆盖层', retryable: false })
     try {
-      const fileInfo = await stat(job.basePath)
+      const fileInfo = await stat(job.overlayPath)
       reply.header('Content-Type', 'image/png').header('Content-Length', fileInfo.size).header('Cache-Control', 'no-store')
-      return reply.send(createReadStream(job.basePath))
+      return reply.send(createReadStream(job.overlayPath))
     } catch {
-      warn(`底图丢失 ${shortId(job.id)} · ${job.basePath}`)
-      return reply.code(404).send({ code: 'no_base_image', message: '底图文件已被清理', retryable: true })
+      warn(`覆盖层丢失 ${shortId(job.id)} · ${job.overlayPath}`)
+      return reply.code(404).send({ code: 'no_overlay', message: '覆盖层文件已被清理', retryable: true })
     }
   })
 

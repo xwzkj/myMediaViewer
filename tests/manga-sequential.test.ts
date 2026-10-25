@@ -1,6 +1,7 @@
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { setImmediate as nextTurn } from 'node:timers/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -13,7 +14,7 @@ const { saveAiSettings, getAiSettings } = await import('../server/ai.js')
 const { db } = await import('../server/database.js')
 const { ComicTextDetector } = await import('../server/ai/manga/detector.js')
 const { MangaOcrRecognizer } = await import('../server/ai/manga/recognizer.js')
-const { startMangaTranslation, getMangaJob, mangaBaseImagePath, getAutoMangaTranslation } = await import('../server/ai/manga/service.js')
+const { startMangaTranslation, getMangaJob, mangaOverlayPath, getAutoMangaTranslation } = await import('../server/ai/manga/service.js')
 after(() => db.close())
 
 async function asset(id: string, color: string): Promise<StoredAsset> {
@@ -63,11 +64,15 @@ test('逐页模式复用识别和回填，保持串行、缓存、空页和失�
 
   const first = await asset('first', '#ffffff')
   const second = await asset('second', '#eeeeee')
-  await t.test('下一页识别开始前，上一页已经生成底图并写入缓存', async () => {
+  // 只有 first 进资产表：用来同时覆盖「本地资产走 /api/assets」和「云端页走 /source」两条底图分支。
+  db.prepare('INSERT OR REPLACE INTO assets (id, work_id, data) VALUES (?, ?, ?)').run(first.id, first.workId, JSON.stringify(first))
+  const assets = new Map([[first.id, first], [second.id, second]])
+  const originals = new Map([[first.id, await readFile(first.path)], [second.id, await readFile(second.path)]])
+  await t.test('下一页识别开始前，上一页已经生成覆盖层并写入缓存', async () => {
     beforeDetect = () => {
       if (events.includes('translate')) {
-        const row = db.prepare('SELECT image_path FROM manga_translations').get() as { image_path: string }
-        assert.ok(row && existsSync(row.image_path), '下一页识别前应完成前一页回填')
+        const row = db.prepare('SELECT overlay_path FROM manga_translations').get() as { overlay_path: string }
+        assert.ok(row && existsSync(row.overlay_path), '下一页识别前应完成前一页回填')
       }
     }
     const job = await finished((await startMangaTranslation([first, second])).id)
@@ -76,12 +81,29 @@ test('逐页模式复用识别和回填，保持串行、缓存、空页和失�
     assert.equal(job.completed, 2)
     assert.deepEqual(events, ['detect:first.png', 'translate', 'detect:second.png', 'translate'])
     assert.deepEqual(job.results?.map(item => item.assetId), ['first', 'second'])
-    for (const { result } of job.results!) {
+    for (const { assetId, result } of job.results!) {
       assert.equal(result.regions[0]?.source, 'こんにちは')
       assert.equal(result.regions[0]?.translation, '你好')
       assert.equal(result.model, 'test-model')
       assert.equal(result.targetLanguage, '简体中文')
-      assert.equal((await sharp(mangaBaseImagePath(result.key)!).metadata()).width, 80)
+      const overlay = await sharp(mangaOverlayPath(result.key)!).metadata()
+      assert.equal(overlay.width, 80)
+      assert.equal(overlay.height, 100)
+      assert.equal(overlay.hasAlpha, true, '擦字结果是带 alpha 的透明覆盖层')
+      // 逐像素确认：只有擦除区域不透明，页面大部分仍然是透明的。
+      const raw = await sharp(mangaOverlayPath(result.key)!).raw().toBuffer({ resolveWithObject: true })
+      const alphaAt = (x: number, y: number) => raw.data[(y * raw.info.width + x) * raw.info.channels + raw.info.channels - 1]
+      assert.equal(alphaAt(0, 0), 0, '页面角落必须完全透明')
+      assert.equal(alphaAt(40, 50), 255, '文字区域必须被覆盖层盖住')
+      let opaque = 0
+      for (let i = 3; i < raw.data.length; i += raw.info.channels) if (raw.data[i]) opaque++
+      assert.ok(opaque > 0 && opaque < raw.info.width * raw.info.height / 2, '覆盖层只占页面一小部分')
+      assert.equal(result.overlayUrl, `/api/ai/manga/cache/${result.key}/overlay.png`)
+      // 底图永远是原图：本地资产走资产接口，不在资产表里的云端页走 source 路由。
+      assert.equal(result.baseUrl, assetId === 'first'
+        ? `/api/assets/${first.id}/file`
+        : `/api/ai/manga/cache/${result.key}/source`)
+      assert.deepEqual(await readFile(assets.get(assetId)!.path), originals.get(assetId), '原图未被改写')
     }
   })
 

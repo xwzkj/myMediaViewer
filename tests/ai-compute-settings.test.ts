@@ -35,6 +35,16 @@ test('本地计算设置：Key 不回传、缺省保留、显式清除', async t
     assert.equal(settings.localCompute.apiKeyConfigured, false)
   })
 
+  await t.test('本地线程默认为 1，保存与测试配置始终限制在 1–16', () => {
+    assert.equal(getLocalComputeConfig().localThreads, 1)
+    saveAiSettings({ ...base, localCompute: { mode:'local', localThreads:2 } })
+    assert.equal(getLocalComputeConfig().localThreads, 2)
+    assert.equal(mergeLocalComputeSettings({}).localThreads, 2)
+    assert.equal(mergeLocalComputeSettings({ localCompute:{localThreads:999} }).localThreads, 16)
+    assert.equal(mergeLocalComputeSettings({ localCompute:{localThreads:0} }).localThreads, 1)
+    assert.equal(getLocalComputeConfig().localThreads, 2, '测试配置不能改动已保存限制')
+  })
+
   await t.test('保存远程模式后，公开设置只有 apiKeyConfigured', () => {
     const saved = saveAiSettings({
       ...base,

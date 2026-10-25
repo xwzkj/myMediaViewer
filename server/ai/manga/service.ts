@@ -5,24 +5,43 @@ import path from 'node:path'
 import type { MangaJob, MangaModelStatus, MangaPageResult, MangaPipelineMode, MangaRegion } from '../../../shared/types.js'
 import { getAiSettings, getLocalComputeConfig, translateMangaTexts } from '../../ai.js'
 import { cacheDir } from '../../config.js'
-import { db, type StoredAsset } from '../../database.js'
-import { createTranslationLimiter } from './concurrency.js'
+import { db, getAsset, type StoredAsset } from '../../database.js'
 import { MangaEngine, PIPELINE_VERSION, type EnginePage } from './engine.js'
 import { checkRemoteCompute, RemoteComputeError, runRemoteMangaJob } from './remote.js'
 import { formatDuration, logError, logInfo, logWarn } from '../../log.js'
 import { modelRoot } from './models.js'
+import { createTranslationLimiter } from './concurrency.js'
+import { createPriorityQueue } from './priority.js'
 
 const mangaCacheDir = path.join(cacheDir, 'manga')
 
-/** 本地计算核心与远程计算端共用同一份实现。 */
-const localEngine = new MangaEngine({ modelRoot })
+/** Local ONNX sessions are rebuilt when the configured CPU thread count changes. */
+let localEngineThreads: number | undefined = getLocalComputeConfig().localThreads
+let localEngine = new MangaEngine({ modelRoot, intraOpNumThreads: localEngineThreads })
+
+function currentLocalEngine(): MangaEngine {
+  const configured = getLocalComputeConfig().localThreads
+  if (configured !== localEngineThreads) {
+    const previous = localEngine
+    localEngineThreads = configured
+    localEngine = new MangaEngine({ modelRoot, intraOpNumThreads: configured })
+    void previous.release().catch(() => {})
+  }
+  return localEngine
+}
+
+/** OCR/擦字预热结果使用的模型标记；这类缓存不含译文，不能当成已翻译结果返回。 */
+const OCR_ONLY_MODEL = 'OCR 预热'
 
 interface PreparedAsset {
   key: string
   targetLanguage: string
   /** 原图内容哈希；同时作为远程任务幂等 ID。 */
   hash: string
+  /** 同一语言下已完成的译图；只可能来自真实翻译结果。 */
   cached?: MangaPageResult
+  /** 只有识别与底图的预热结果，可以直接跳过 OCR 进入翻译。 */
+  prepared?: MangaPageResult
 }
 
 interface InternalJob extends MangaJob {
@@ -33,7 +52,8 @@ const jobs = new Map<string, InternalJob>()
 /** 日志里用短编号指代任务，长 UUID 只会占地方。 */
 const jobLabel = (job: InternalJob) => `漫画翻译 #${job.id.slice(0, 6)}`
 // 只有真正需要模型的页面才占用这个队列。缓存查询不排队，也不会被 GPU 任务挡住。
-let inferenceQueue: Promise<void> = Promise.resolve()
+const inferenceQueue = createPriorityQueue()
+const manualJobs = new Set<string>()
 
 /** 远程状态检查带 10 秒缓存，设置页轮询时不会每次都打计算端。 */
 let remoteStatus: { at: number; value: MangaModelStatus } | null = null
@@ -120,6 +140,8 @@ export async function startMangaTranslation(input: StoredAsset | StoredAsset[], 
     prepared: new Map(),
   }
   jobs.set(job.id, job)
+  // 手动任务必须立刻登记：后台调度靠 hasManualMangaWork() 判断是否让位。
+  manualJobs.add(job.id)
 
   // 单页请求先做一次缓存 preflight：命中时直接返回 ready，不再进入任务队列。
   if (uniqueAssets.length === 1) {
@@ -135,6 +157,7 @@ export async function startMangaTranslation(input: StoredAsset | StoredAsset[], 
         job.progress = 100
         job.stage = '读取缓存结果'
         job.state = 'ready'
+        manualJobs.delete(job.id)
         logInfo('任务', `${jobLabel(job)} 命中缓存，直接返回`)
         return publicJob(job)
       }
@@ -144,12 +167,13 @@ export async function startMangaTranslation(input: StoredAsset | StoredAsset[], 
       job.progress = 100
       job.message = error instanceof Error ? error.message : '读取漫画缓存失败'
       logError('任务', `${jobLabel(job)} 读取缓存失败：${job.message}`)
+      manualJobs.delete(job.id)
       return publicJob(job)
     }
   }
 
   logInfo('任务', `${jobLabel(job)} 入队 · ${job.total} 张图片${force ? ' · 强制重译' : ''}`)
-  void runJob(job, uniqueAssets, force)
+  void runJob(job, uniqueAssets, force).finally(() => manualJobs.delete(job.id))
   return publicJob(job)
 }
 
@@ -164,6 +188,77 @@ export async function getAutoMangaTranslation(asset: StoredAsset): Promise<Manga
   return (await prepareAsset(asset, false)).cached || null
 }
 
+/** True while an explicitly requested manga job is queued or processing. */
+export function hasManualMangaWork(): boolean {
+  for (const id of manualJobs) {
+    const job = jobs.get(id)
+    if (job && (job.state === 'queued' || job.state === 'processing')) return true
+  }
+  return false
+}
+
+/**
+ * Background OCR/prewarm entry point. It intentionally never creates a user-visible job.
+ * Translation is opt-in and its caller reserves the paid-request budget immediately before
+ * the HTTP call via beforeTranslate.
+ */
+export async function runBackgroundMangaAsset(
+  asset: StoredAsset, options: { translate: boolean; signal?: AbortSignal; beforeTranslate?: () => void },
+): Promise<MangaPageResult> {
+  options.signal?.throwIfAborted()
+  const info = await prepareAsset(asset, false)
+  // 只有真实译文才能直接返回；OCR 预热结果仅用于跳过重复识别。
+  if (info.cached) return info.cached
+  if (!options.translate && info.prepared) return info.prepared
+  const page = info.prepared
+    ? await hydratePrepared(asset, info)
+    : await recognizePage(asset, info, () => {}, 'background', options.signal)
+  options.signal?.throwIfAborted()
+  if (page.empty) return page.empty
+  // 预热只缓存「识别 + 底图」，不写 manga_translations，避免被当成已翻译结果。
+  if (!options.translate) return persistPrepared(page)
+  const translated = await translateMangaTexts({
+    texts: page.page.regions.map(region => region.source),
+    targetLanguage: page.targetLanguage,
+    // 预算预留与请求中止都必须挂在真正的 HTTP 调用上，而不是提前手动调用。
+    signal: options.signal,
+    beforeRequest: options.beforeTranslate,
+  })
+  options.signal?.throwIfAborted()
+  return finalizePage(page, translated.translations, translated.model)
+}
+
+export function mangaOverlayPath(key: string): string | undefined {
+  if (!/^[a-f0-9]{64}$/.test(key)) return undefined
+  // 预热页与已翻译页共用同一份覆盖层；先查译文表，再回退到预热表。
+  const row = db.prepare(`
+    SELECT overlay_path AS file FROM manga_translations WHERE key = ?
+    UNION ALL SELECT overlay_path AS file FROM manga_prepared_pages WHERE key = ?
+  `).get(key, key) as { file: string | null } | undefined
+  return row?.file && existsSync(row.file) ? row.file : undefined
+}
+
+/** 译图底图：Pixiv 云页不在 assets 表里，只能沿这条路由按翻译时记录的原图路径提供。 */
+export function mangaSourcePath(key: string): string | undefined {
+  if (!/^[a-f0-9]{64}$/.test(key)) return undefined
+  const row = db.prepare(`
+    SELECT source_path AS file FROM manga_translations WHERE key = ?
+    UNION ALL SELECT source_path AS file FROM manga_prepared_pages WHERE key = ?
+  `).get(key, key) as { file: string | null } | undefined
+  return row?.file && existsSync(row.file) ? row.file : undefined
+}
+
+/**
+ * 底图 URL。
+ *
+ * 本地资产直接指向原图接口（与原图共用同一份 HTTP 缓存与解码结果）；
+ * Pixiv 云页的 id 不在 assets 表里，用记录下来的原图路径兜底。
+ */
+function sourceUrlFor(asset: StoredAsset, key: string): string {
+  return getAsset(asset.id) ? `/api/assets/${asset.id}/file` : `/api/ai/manga/cache/${key}/source`
+}
+
+/** 旧版整页擦字底图；只为兼容升级前写入的缓存行保留。 */
 export function mangaBaseImagePath(key: string): string | undefined {
   if (!/^[a-f0-9]{64}$/.test(key)) return undefined
   const row = db.prepare('SELECT image_path FROM manga_translations WHERE key = ?').get(key) as { image_path: string | null } | undefined
@@ -197,30 +292,36 @@ function placeholderPage(): EnginePage {
  * 只有「任务还没被接收」的连接失败才允许回退到本地主机；鉴权、协议、资源超限、
  * 模型错误都直接抛给调用方，避免同一页悄悄算两遍。
  */
-async function computePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void): Promise<EnginePage> {
-  const compute = getLocalComputeConfig()
-  if (compute.mode === 'remote') {
-    try {
-      return await runRemoteMangaJob(compute, { imagePath: asset.path, onStage: setStage })
-    } catch (error) {
-      const remote = error instanceof RemoteComputeError ? error : null
-      if (compute.fallback === 'local' && remote?.phase === 'connect') {
-        logWarn('计算', `远程计算端不可用，回退本地主机：${remote.message}`)
-        setStage('远程计算端不可用，改用本地主机')
-        return runInference(() => localEngine.process(asset.path, setStage))
+async function computePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void, priority: 'manual' | 'background' = 'manual', signal?: AbortSignal): Promise<EnginePage> {
+  // 远程与本地共用同一个优先级队列，后台任务才不会抢在手动任务前面占用计算端。
+  // 队列不可重入，因此本地回退必须直接调用引擎，不能再排一次队。
+  return runInference(async () => {
+    signal?.throwIfAborted()
+    const compute = getLocalComputeConfig()
+    if (compute.mode === 'remote') {
+      try {
+        return await runRemoteMangaJob(compute, { imagePath: asset.path, onStage: setStage, signal })
+      } catch (error) {
+        const remote = error instanceof RemoteComputeError ? error : null
+        if (compute.fallback === 'local' && remote?.phase === 'connect') {
+          logWarn('计算', `远程计算端不可用，回退本地主机：${remote.message}`)
+          setStage('远程计算端不可用，改用本地主机')
+          return currentLocalEngine().process(asset.path, setStage)
+        }
+        throw error
       }
-      throw error
     }
-  }
-  return runInference(() => localEngine.process(asset.path, setStage))
+    return currentLocalEngine().process(asset.path, setStage)
+  }, priority, signal)
 }
 
 /**
- * 各流水线共用「本地识别」这一段：检测 + OCR + 擦字 + 底图编码。
+ * 各流水线共用「本地识别」这一段：检测 + OCR + 擦字 + 底图编码.
  * 不涉及大模型调用，也不写任何缓存结果。
  */
-async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void): Promise<PreparedPage> {
-  const page = await computePage(asset, info, setStage)
+async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void, priority: 'manual' | 'background' = 'manual', signal?: AbortSignal): Promise<PreparedPage> {
+  signal?.throwIfAborted()
+  const page = await computePage(asset, info, setStage, priority, signal)
   const prepared: PreparedPage = { asset, key: info.key, targetLanguage: info.targetLanguage, page }
   if (!page.regions.length) prepared.empty = emptyResult(asset, info.key, info.targetLanguage)
   return prepared
@@ -231,19 +332,7 @@ async function finalizePage(
   page: PreparedPage, translations: string[], model: string, setStage?: (stage: string) => void,
 ): Promise<MangaPageResult> {
   if (page.empty) return page.empty
-  const base = page.page.base
-  if (!base) throw new Error('这一页缺少译图底图，请重试')
-  await mkdir(mangaCacheDir, { recursive: true })
-  const imagePath = path.join(mangaCacheDir, `${page.key}.png`)
-  const temp = `${imagePath}.tmp.png`
-  setStage?.('写入译图文件')
-  try {
-    await writeFile(temp, base)
-    await rename(temp, imagePath)
-  } finally {
-    await unlink(temp).catch(() => {})
-  }
-
+  const imagePath = await writeOverlayArtifact(page, setStage)
   const regions: MangaRegion[] = page.page.regions.map((region, index) => ({
     id: region.id,
     x: region.x, y: region.y, width: region.width, height: region.height,
@@ -258,16 +347,96 @@ async function finalizePage(
     key: page.key,
     width: page.page.width,
     height: page.page.height,
-    baseUrl: `/api/ai/manga/cache/${page.key}/base.png`,
+    // 底图就是原图本身：擦除只发生在独立的透明覆盖层里，原文件永远不改写。
+    baseUrl: sourceUrlFor(page.asset, page.key),
+    overlayUrl: `/api/ai/manga/cache/${page.key}/overlay.png`,
     regions,
     cached: false,
     model,
     targetLanguage: page.targetLanguage,
     createdAt: Date.now(),
   }
-  db.prepare('INSERT OR REPLACE INTO manga_translations (key, data, image_path, created) VALUES (?, ?, ?, ?)')
-    .run(page.key, JSON.stringify(result), imagePath, result.createdAt)
+  db.prepare('INSERT OR REPLACE INTO manga_translations (key, data, image_path, overlay_path, source_path, created) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(page.key, JSON.stringify(result), null, imagePath, page.asset.path, result.createdAt)
+  // 译文已覆盖同一份覆盖层，预热行不再需要。
+  db.prepare('DELETE FROM manga_prepared_pages WHERE key = ?').run(page.key)
   setStage?.('完成')
+  return result
+}
+
+/** 把透明覆盖层原子写进缓存目录，返回最终路径。原图永远只读，不会被改写。 */
+async function writeOverlayArtifact(page: PreparedPage, setStage?: (stage: string) => void): Promise<string> {
+  const imagePath = path.join(mangaCacheDir, `${page.key}.png`)
+  const overlay = page.page.overlay
+  // 复用预热阶段已经落盘的覆盖层：翻译阶段不需要再传一遍像素。
+  if (!overlay) {
+    if (!existsSync(imagePath)) throw new Error('这一页缺少擦字覆盖层，请重试')
+    return imagePath
+  }
+  await mkdir(mangaCacheDir, { recursive: true })
+  const temp = `${imagePath}.tmp.png`
+  setStage?.('写入擦字覆盖层')
+  try {
+    await writeFile(temp, overlay)
+    await rename(temp, imagePath)
+  } finally {
+    await unlink(temp).catch(() => {})
+  }
+  return imagePath
+}
+
+/**
+ * 预热：只落「识别 + 擦字覆盖层」，译文留空。
+ *
+ * 写进独立表而不是 manga_translations，这样自动显示译文时不会拿到一张
+ * translation 全是原文的假结果，再次翻译时又能直接跳过 OCR。
+ */
+async function persistPrepared(page: PreparedPage, setStage?: (stage: string) => void): Promise<MangaPageResult> {
+  if (page.empty) return page.empty
+  const imagePath = await writeOverlayArtifact(page, setStage)
+  const result: MangaPageResult = {
+    key: page.key,
+    width: page.page.width,
+    height: page.page.height,
+    baseUrl: sourceUrlFor(page.asset, page.key),
+    overlayUrl: `/api/ai/manga/cache/${page.key}/overlay.png`,
+    regions: page.page.regions.map(region => ({ ...region, translation: '' })),
+    cached: false,
+    model: OCR_ONLY_MODEL,
+    targetLanguage: page.targetLanguage,
+    createdAt: Date.now(),
+  }
+  db.prepare('INSERT OR REPLACE INTO manga_prepared_pages (key, data, image_path, overlay_path, source_path, created) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(page.key, JSON.stringify(result), null, imagePath, page.asset.path, result.createdAt)
+  // 预热与手动翻译可能同时跑到这里；译文已经落盘时不要再补一条预热行。
+  if (db.prepare('SELECT 1 FROM manga_translations WHERE key = ?').get(page.key)) {
+    db.prepare('DELETE FROM manga_prepared_pages WHERE key = ?').run(page.key)
+  }
+  setStage?.('完成')
+  return result
+}
+
+/** 用预热结果还原一页：只还原文本与坐标，覆盖层已经在磁盘上，无需再读像素。 */
+async function hydratePrepared(asset: StoredAsset, info: PreparedAsset): Promise<PreparedPage> {
+  const prepared = info.prepared
+  if (!prepared) throw new Error('缺少预热结果')
+  const page: EnginePage = {
+    width: prepared.width,
+    height: prepared.height,
+    regions: prepared.regions.map(region => ({
+      id: region.id,
+      x: region.x, y: region.y, width: region.width, height: region.height,
+      source: region.source,
+      detection: region.detection,
+      confidence: region.confidence,
+      background: region.background,
+      textColor: region.textColor,
+    })),
+    engine: prepared.model,
+    timings: { detectionMs: 0, ocrMs: 0, eraseMs: 0, encodeMs: 0 },
+  }
+  const result: PreparedPage = { asset, key: info.key, targetLanguage: info.targetLanguage, page }
+  if (!page.regions.length) result.empty = emptyResult(asset, info.key, info.targetLanguage)
   return result
 }
 
@@ -602,7 +771,8 @@ async function processAsset(
 
   setStage('等待本地识别资源')
   // 计算本身（本地或远程）由 computePage 串行化；这里只负责翻译与落盘。
-  const page = await recognizePage(asset, info, setStage)
+  // 已有 OCR 预热时直接复用底图与文本，只补翻译这一次网络调用。
+  const page = info.prepared ? await hydratePrepared(asset, info) : await recognizePage(asset, info, setStage)
   if (page.empty) return page.empty
   setStage(`AI 翻译 ${page.page.regions.length} 处文字`)
   const translated = await translateMangaTexts({
@@ -622,18 +792,22 @@ async function prepareAsset(asset: StoredAsset, force: boolean): Promise<Prepare
   const targetLanguage = getAiSettings().targetLanguage
   if (!force) {
     const known = await readAssetFingerprint(asset, targetLanguage)
-    if (known) {
-      const cached = readCachedResult(known.key)
-      return { key: known.key, targetLanguage, hash: known.hash, ...(cached ? { cached } : {}) }
-    }
+    if (known) return { key: known.key, targetLanguage, hash: known.hash, ...readCacheSlots(known.key) }
   }
   const info = await stat(asset.path)
   const hash = await hashFile(asset.path)
   const key = createHash('sha256').update(JSON.stringify({ version: PIPELINE_VERSION, hash, targetLanguage })).digest('hex')
   writeAssetFingerprint(asset, targetLanguage, key, hash, info.size, Math.trunc(info.mtimeMs))
   if (force) return { key, targetLanguage, hash }
+  return { key, targetLanguage, hash, ...readCacheSlots(key) }
+}
+
+/** 已完成的译文优先；没有译文才退回 OCR 预热结果。 */
+function readCacheSlots(key: string): Pick<PreparedAsset, 'cached' | 'prepared'> {
   const cached = readCachedResult(key)
-  return { key, targetLanguage, hash, ...(cached ? { cached } : {}) }
+  if (cached) return { cached }
+  const prepared = readPreparedResult(key)
+  return prepared ? { prepared } : {}
 }
 
 /** 原图指纹：大小与修改时间足够便宜，用来判断是否还需要重新哈希。 */
@@ -673,10 +847,8 @@ function hashFile(file: string): Promise<string> {
 }
 
 /** 只把真正需要模型/翻译/擦字的页面串行化；缓存查询可以在队列外立即完成。 */
-function runInference<T>(task: () => Promise<T>): Promise<T> {
-  const result = inferenceQueue.then(task, task)
-  inferenceQueue = result.then(() => undefined, () => undefined)
-  return result
+function runInference<T>(task: () => Promise<T>, priority: 'manual' | 'background' = 'manual', signal?: AbortSignal): Promise<T> {
+  return inferenceQueue(task, priority, signal)
 }
 
 function emptyResult(asset: StoredAsset, key: string, targetLanguage: string): MangaPageResult {
@@ -694,16 +866,37 @@ function emptyResult(asset: StoredAsset, key: string, targetLanguage: string): M
 }
 
 function readCachedResult(key: string): MangaPageResult | undefined {
-  const row = db.prepare('SELECT data, image_path FROM manga_translations WHERE key = ?').get(key) as { data: string; image_path: string | null } | undefined
+  const row = db.prepare('SELECT data, image_path, overlay_path FROM manga_translations WHERE key = ?').get(key) as { data: string; image_path: string | null; overlay_path: string | null } | undefined
   if (!row) return undefined
-  if (row.image_path && !existsSync(row.image_path)) {
+  const artifact = row.overlay_path || row.image_path
+  if (artifact && !existsSync(artifact)) {
     db.prepare('DELETE FROM manga_translations WHERE key = ?').run(key)
     return undefined
   }
   try {
-    return { ...(JSON.parse(row.data) as MangaPageResult), cached: true }
+    const result = JSON.parse(row.data) as MangaPageResult
+    // 旧版本把 OCR 预热写进这张表；它不含译文，绝不能当成已翻译结果返回。
+    if (result.model === OCR_ONLY_MODEL) return undefined
+    return { ...result, cached: true }
   } catch {
     db.prepare('DELETE FROM manga_translations WHERE key = ?').run(key)
+    return undefined
+  }
+}
+
+/** 只读取 OCR 预热结果；覆盖层丢失时丢弃该行，让调用方重新计算。 */
+function readPreparedResult(key: string): MangaPageResult | undefined {
+  const row = db.prepare('SELECT data, image_path, overlay_path FROM manga_prepared_pages WHERE key = ?').get(key) as { data: string; image_path: string | null; overlay_path: string | null } | undefined
+  if (!row) return undefined
+  const artifact = row.overlay_path || row.image_path
+  if (!artifact || !existsSync(artifact)) {
+    db.prepare('DELETE FROM manga_prepared_pages WHERE key = ?').run(key)
+    return undefined
+  }
+  try {
+    return JSON.parse(row.data) as MangaPageResult
+  } catch {
+    db.prepare('DELETE FROM manga_prepared_pages WHERE key = ?').run(key)
     return undefined
   }
 }

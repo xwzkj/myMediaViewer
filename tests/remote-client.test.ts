@@ -6,6 +6,7 @@ import { createServer } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { COMPUTE_PROTOCOL_VERSION } from '../shared/compute.js'
 
 /**
  * 主服务 → 计算端的真实 HTTP 往返。
@@ -18,7 +19,7 @@ const { createComputeApp } = await import('../server/compute/app.js')
 const { checkRemoteCompute, runRemoteMangaJob, RemoteComputeError } = await import('../server/ai/manga/remote.js')
 
 const KEY = 'roundtrip-key'
-const BASE_PNG = Buffer.from('roundtrip-png-bytes')
+const OVERLAY_PNG = Buffer.from('roundtrip-png-bytes')
 const root = await mkdtemp(path.join(os.tmpdir(), 'remote-client-'))
 
 const engine = {
@@ -37,7 +38,7 @@ const engine = {
         source: `原文:${image.toString('utf8')}`,
         detection: 0.88, confidence: 0.77, background: '#fafafa', textColor: '#111111',
       }],
-      base: BASE_PNG,
+      overlay: OVERLAY_PNG,
       engine: 'fake-engine',
       timings: { detectionMs: 1, ocrMs: 2, eraseMs: 3, encodeMs: 4 },
     }
@@ -70,7 +71,7 @@ async function closedPort(): Promise<number> {
 test('远程计算端的协议往返与错误阶段', async t => {
   await t.test('状态检查返回协议版本与设备', async () => {
     const status = await checkRemoteCompute(config)
-    assert.equal(status.protocol, 1)
+    assert.equal(status.protocol, COMPUTE_PROTOCOL_VERSION)
     assert.equal(status.ready, true)
     assert.equal(status.device, '测试设备')
   })
@@ -98,8 +99,8 @@ test('远程计算端的协议往返与错误阶段', async t => {
     assert.equal(page.height, 96)
     assert.equal(page.regions[0]?.source, '原文:page-image-bytes')
     assert.equal(page.engine, 'fake-engine')
-    assert.deepEqual(page.base, BASE_PNG)
-    assert.equal(createHash('sha256').update(page.base!).digest('hex').length, 64)
+    assert.deepEqual(page.overlay, OVERLAY_PNG)
+    assert.equal(createHash('sha256').update(page.overlay!).digest('hex').length, 64)
   })
 
   await t.test('同一张图再次请求复用计算端缓存，结果一致', async () => {
@@ -108,6 +109,6 @@ test('远程计算端的协议往返与错误阶段', async t => {
     const first = await runRemoteMangaJob(config, { imagePath })
     const second = await runRemoteMangaJob(config, { imagePath })
     assert.deepEqual(second.regions, first.regions)
-    assert.deepEqual(second.base, first.base)
+    assert.deepEqual(second.overlay, first.overlay)
   })
 })

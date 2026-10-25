@@ -1,4 +1,5 @@
 import Fastify from 'fastify'
+import { registerBackgroundRoutes } from './background/routes.js'
 import fastifyStatic from '@fastify/static'
 import { existsSync } from 'node:fs'
 import { stat, realpath } from 'node:fs/promises'
@@ -9,6 +10,9 @@ import { sources, saveSources, port, allowPublicAccess } from './config.js'
 import { isLocalAddress } from './access.js'
 import { allWorks, getAsset, getWork, workAssets, favoriteIds, setFavorite, toWork, db, type StoredAsset } from './database.js'
 import { refreshSearch, searchWorks, suggestTags } from './search.js'
+import { searchSemanticWorks } from './semantic/service.js'
+import { registerSemanticRoutes } from './semantic/routes.js'
+import type { SemanticProvider } from './semantic/provider.js'
 import { scanLibrary, scanStatus, onScan, sourceOnline } from './scanner.js'
 import { accessibleAsset, sendMedia, thumbnail, detectFFmpeg, ffmpegAvailable, convert, conversionStatus, conversionPath } from './media.js'
 import type { Source, LibraryStatus, AiTranslateFields } from '../shared/types.js'
@@ -22,7 +26,7 @@ import { sourceAiTurn, forgetSourceAiConversation, answerSourceAiQuestion, type 
 import { previewSource, calculatePreviewGroup } from './source-engine.js'
 import { listDirectories } from './directories.js'
 import { getAiSettings, saveAiSettings, testAiConnection, listAiModels, translateFields, clearTranslationCache, mergeLocalComputeSettings } from './ai.js'
-import { getAutoMangaTranslation, getMangaJob, getMangaModelStatus, mangaBaseImagePath, startMangaTranslation, clearMangaStatusCache } from './ai/manga/service.js'
+import { getAutoMangaTranslation, getMangaJob, getMangaModelStatus, mangaBaseImagePath, mangaOverlayPath, mangaSourcePath, startMangaTranslation, clearMangaStatusCache } from './ai/manga/service.js'
 import { checkRemoteCompute } from './ai/manga/remote.js'
 import { libraryRevision, markLibraryChanged } from './library-revision.js'
 import { debugLogging, logApi, logError, logInfo, setLoggingEnabled } from './log.js'
@@ -33,7 +37,7 @@ import { compareWorksByCollected, compareWorksByDate } from './work-order.js'
 import { getPixivBookmarkRestrict, getPixivWorkRecord } from './pixiv/store.js'
 import { getOrCachePixivResource, pixivCacheKey } from './pixiv/cache.js'
 
-export async function createApp(logging = true) {
+export async function createApp(logging = true, semanticProvider?: SemanticProvider) {
   setLoggingEnabled(logging)
   // 默认关掉 Fastify 的逐请求日志：常规运行使用下方的精简日志。
   // 常驻输出改由下面的 onResponse 钩子整理成「方法 + 路径 + 状态码 + 耗时」；
@@ -46,6 +50,8 @@ export async function createApp(logging = true) {
   onScan(refreshSearch)
   await detectFFmpeg()
   await registerPixivRoutes(app)
+  registerSemanticRoutes(app, semanticProvider)
+  registerBackgroundRoutes(app)
   app.addHook('onRequest', async (request, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff').header('Referrer-Policy', 'same-origin')
     // 默认只服务局域网：公网地址、以及任何经过代理转发的请求（本机反向代理/隧道同样会看起来像 127.0.0.1）都拒绝，
@@ -81,7 +87,7 @@ export async function createApp(logging = true) {
 
   // 接口调用日志：只保留人工触发的 API，前端轮询和媒体二进制请求交给各自的进度日志汇报。
   const isQuietRoute = (method: string, url: string) => {
-    if (url === '/api/status') return true
+    if (url === '/api/status' || url === '/api/background/status') return true
     if (method !== 'GET' && method !== 'HEAD') return false
     return /^\/api\/ai\/manga\/jobs\/[^/]+$/.test(url)
       || /^\/api\/assets\/[^/]+\/(file|thumbnail|convert|compatible)$/.test(url)
@@ -96,16 +102,25 @@ export async function createApp(logging = true) {
     logApi(request.method, url, reply.statusCode, reply.elapsedTime)
   })
 
+  // Polling status must not repeatedly deserialize/merge the whole library or synchronously probe network shares.
+  let statusCounts: { signature:string; totals:Pick<LibraryStatus,'works'|'files'|'favorites'|'images'|'videos'|'animations'>; bySource:Map<string,number> } | undefined
   app.get('/api/status', async (): Promise<LibraryStatus> => {
-    const works = allWorks()
-    const favorites = favoriteIds()
     const pixiv = getPixivRuntime()
-    const catalog = buildUnifiedCatalog(!pixiv.localMode && pixiv.configured ? pixiv.account?.id || null : null, works.map(work => toWork(work, favorites)))
+    const account = !pixiv.localMode && pixiv.configured ? pixiv.account?.id || null : null
+    const signature = `${libraryRevision()}:${account || ''}`
+    if (statusCounts?.signature !== signature) {
+      const works = allWorks(), favorites = favoriteIds()
+      const catalog = buildUnifiedCatalog(account, works.map(work => toWork(work, favorites)))
+      const totals = { works:catalog.length, files:0, favorites:0, images:0, videos:0, animations:0 }
+      const bySource = new Map<string,number>()
+      for (const work of works) { totals.files+=work.count; if (favorites.has(work.id)) totals.favorites++; bySource.set(work.sourceId,(bySource.get(work.sourceId)||0)+1) }
+      for (const work of catalog) { if (work.kind === 'image') totals.images++; else if (work.kind === 'video') totals.videos++; else if (work.kind === 'animation') totals.animations++ }
+      statusCounts = {signature,totals,bySource}
+    }
+    const counts = statusCounts
     return {
-      works: catalog.length, files: works.reduce((total, w) => total + w.count, 0), favorites: works.filter(w => favorites.has(w.id)).length,
-      images: catalog.filter(w => w.kind === 'image').length, videos: catalog.filter(w => w.kind === 'video').length,
-      animations: catalog.filter(w => w.kind === 'animation').length,
-      sources: sources.map(s => ({ ...s, works: works.filter(w => w.sourceId === s.id).length, online: sourceOnline.get(s.id) ?? existsSync(s.path) })),
+      ...counts.totals,
+      sources: await Promise.all(sources.map(async source => ({ ...source, works:counts.bySource.get(source.id)||0, online:sourceOnline.get(source.id) ?? await stat(source.path).then(value=>value.isDirectory(),()=>false) }))),
       scan: scanStatus, ffmpeg: ffmpegAvailable,
       addresses: Object.values(networkInterfaces()).flat().filter(i => i && i.family === 'IPv4' && !i.internal).map(i => `http://${i!.address}:${port}`),
       publicAccess: allowPublicAccess,
@@ -145,7 +160,7 @@ export async function createApp(logging = true) {
     try { await validateRules(rules, preview) } catch (error) { throw Object.assign(new Error((error as Error).message), { statusCode: 400 }) }
     const existing = except ? sources.find(source => source.id === except) : undefined
     const pixivWorks = body.pixivWorks ?? existing?.pixivWorks ?? sourceContainsPixivWorks({ kind: body.kind || 'custom', rules })
-    return { name: body.name.trim(), path: resolved, kind: body.rules ? 'custom' as const : body.kind, rules, pixivWorks }
+    return { name: body.name.trim(), path: resolved, kind: body.rules ? 'custom' as const : body.kind, rules, pixivWorks, ...(existing?.background ? { background: existing.background } : {}) }
 
   }
   app.post<{Body:{path:string}}>('/api/sources/ai/sample', {
@@ -257,7 +272,7 @@ export async function createApp(logging = true) {
     return suggestTags(request.query.q || '')
   })
 
-  app.get<{ Querystring: { q?: string; source?: string; kind?: string; favorites?: string; page?: string; sort?: string; fuzzy?: string; by?: string; seed?: string; localOnly?: string } }>('/api/works', async request => {
+  app.get<{ Querystring: { q?: string; source?: string; kind?: string; favorites?: string; page?: string; sort?: string; fuzzy?: string; by?: string; seed?: string; localOnly?: string; semantic?: string } }>('/api/works', async request => {
     const started = performance.now()
     const query = request.query
     const revision = libraryRevision()
@@ -274,10 +289,13 @@ export async function createApp(logging = true) {
         : buildUnifiedCatalog(accountId, localWorks)
     // kind 支持逗号分隔的多个值，例如 kind=video,animation：界面把视频和动图合并成了一个筛选。
     const kinds = (query.kind || '').split(',').map(value => value.trim()).filter(Boolean)
-    let results = searchWorks((query.q || '').slice(0, 500), query.fuzzy === 'true', catalog, `${revision}:${query.source || 'all'}:${query.localOnly === 'true' ? 'local' : 'all'}:${catalog.length}`).filter(({ work }) =>
-      workMatchesSource(work, query.source || '') && (!kinds.length || kinds.includes(work.kind))
-      && (query.favorites !== 'true' || favorites.has(work.id)))
-    if (!query.q?.trim() || query.sort !== 'relevance') {
+    const matchesFilters = (work: typeof catalog[number]) => workMatchesSource(work, query.source || '') && (!kinds.length || kinds.includes(work.kind))
+      && (query.favorites !== 'true' || favorites.has(work.id))
+    const semantic = query.semantic === 'true'
+    let results = semantic
+      ? await searchSemanticWorks(query.q || '', catalog.filter(matchesFilters), semanticProvider)
+      : searchWorks((query.q || '').slice(0, 500), query.fuzzy === 'true', catalog, `${revision}:${query.source || 'all'}:${query.localOnly === 'true' ? 'local' : 'all'}:${catalog.length}`).filter(({ work }) => matchesFilters(work))
+    if (!query.q?.trim() || (query.sort ? query.sort !== 'relevance' : !semantic)) {
       // by=collected 时「最新 / 最早」指收藏顺序（文件名开头的收藏编号），否则仍按发布日期。
       // 收藏编号只在同一个媒体目录内部可比：Pixiv 的 bmk_id 和 Telegram 的消息号含义与量级都不同，
       // 所以结果里涉及多个来源（混合显示）时忽略 by=collected，退回发布日期排序。
@@ -439,6 +457,17 @@ export async function createApp(logging = true) {
     const image = mangaBaseImagePath(request.params.key)
     if (!image) return reply.code(404).send({ message: '漫画翻译缓存不存在' })
     return sendMedia(request, reply, image, 'png')
+  })
+  app.get<{ Params: { key: string } }>('/api/ai/manga/cache/:key/overlay.png', async (request, reply) => {
+    const image = mangaOverlayPath(request.params.key)
+    if (!image) return reply.code(404).send({ message: '漫画擦字覆盖层不存在' })
+    return sendMedia(request, reply, image, 'png')
+  })
+  // Pixiv 云页的 id 不在 assets 表里，底图只能按翻译时记录的原图路径返回。
+  app.get<{ Params: { key: string } }>('/api/ai/manga/cache/:key/source', async (request, reply) => {
+    const image = mangaSourcePath(request.params.key)
+    if (!image) return reply.code(404).send({ message: '漫画原图不可用，请重新打开作品' })
+    return sendMedia(request, reply, image, path.extname(image).slice(1).toLowerCase() || 'png')
   })
 
   const webRoot = path.resolve('dist')

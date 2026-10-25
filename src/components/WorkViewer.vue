@@ -336,7 +336,13 @@ watch(() => {
   const nearby = nearbyImages(detail.value?.assets || [], index.value)
   return nearby.flatMap(item => {
     const translated = mangaResults.value[item.id]
-    return [{key: item.url, url: item.url}, ...(translated?.regions.length ? [{key: translated.key + ':' + translated.baseUrl, url: translated.baseUrl}] : [])]
+    if (!translated?.regions.length) return [{key: item.url, url: item.url}]
+    // 新缓存的底图就是原图本身：用 URL 当缓存键，和原图共用同一份解码结果。
+    return [
+      {key: item.url, url: item.url},
+      {key: translated.baseUrl, url: translated.baseUrl},
+      ...(translated.overlayUrl ? [{key: translated.overlayUrl, url: translated.overlayUrl}] : []),
+    ]
   })
 }, urls => { for (const item of urls) void images.load(item.key,item.url).catch(()=>{}) }, {immediate:true})
 watch([() => asset.value?.id, filmstrip], async () => {
@@ -988,7 +994,9 @@ async function drawMangaResult() {
   const assetId = asset.value?.id
   let image: HTMLImageElement
   try {
-    image = await images.load(result.key + ':' + result.baseUrl, result.baseUrl)
+    image = await images.load(result.baseUrl, result.baseUrl)
+    // 新缓存把擦字结果存成透明覆盖层，叠加在原图之上；旧缓存没有这一层。
+    if (result.overlayUrl) await images.load(result.overlayUrl, result.overlayUrl)
   } catch (e) {
     if (!disposed && version === drawVersion && asset.value?.id === assetId) mangaError.value = (e as Error).message
     return
@@ -1000,6 +1008,15 @@ async function drawMangaResult() {
   if (!ctx) return
   ctx.clearRect(0, 0, canvas.width, canvas.height)
   ctx.drawImage(image, 0, 0, result.width, result.height)
+  if (result.overlayUrl) {
+    try {
+      const overlay = await images.load(result.overlayUrl, result.overlayUrl)
+      if (version !== drawVersion || mangaCanvas.value !== canvas || mangaResult.value?.key !== result.key) return
+      ctx.drawImage(overlay, 0, 0, result.width, result.height)
+    } catch {
+      // 覆盖层失败不影响文字层：气泡底色仍由每处文本的 background 兜底。
+    }
+  }
   for (const region of result.regions) drawMangaRegion(ctx, region)
   mangaReadyKey.value = result.key
 }
@@ -1014,7 +1031,8 @@ async function showMangaTranslated(assetId: string) {
   const result = mangaResults.value[assetId]
   if (!result?.regions.length) return
   try {
-    await images.load(result.key + ':' + result.baseUrl, result.baseUrl)
+    await images.load(result.baseUrl, result.baseUrl)
+    if (result.overlayUrl) await images.load(result.overlayUrl, result.overlayUrl)
   } catch {
     return
   }

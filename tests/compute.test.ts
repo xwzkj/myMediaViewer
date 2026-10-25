@@ -20,7 +20,7 @@ const {
 const KEY = 'test-compute-key'
 const root = await mkdtemp(path.join(os.tmpdir(), 'compute-app-'))
 const workDir = path.join(root, 'work')
-const BASE_PNG = Buffer.from('fake-png-payload')
+const OVERLAY_PNG = Buffer.from('fake-png-payload')
 
 function fakeEngine() {
   return {
@@ -41,7 +41,7 @@ function fakeEngine() {
           source: `识别:${image.toString('utf8')}`,
           detection: 0.9, confidence: 0.8, background: '#ffffff', textColor: '#111111',
         }],
-        base: BASE_PNG,
+        overlay: OVERLAY_PNG,
         engine: 'fake-engine',
         timings: { detectionMs: 1, ocrMs: 2, eraseMs: 3, encodeMs: 4 },
       }
@@ -99,7 +99,7 @@ test('远程计算端要求鉴权，并完成一次完整的上传/结果/底图
     assert.equal(status.ready, true)
   })
 
-  await t.test('上传→轮询→结果→底图，内容与校验一致', async () => {
+  await t.test('上传→轮询→结果→覆盖层，内容与校验一致', async () => {
     const created = await app.inject({ method: 'POST', url: '/v1/jobs', payload: image, headers: uploadHeaders(image) })
     assert.equal(created.statusCode, 202)
     const id = (created.json() as { id: string }).id
@@ -107,21 +107,21 @@ test('远程计算端要求鉴权，并完成一次完整的上传/结果/底图
 
     const status = await waitForJob(id) as unknown as {
       state: string
-      result: { width: number; height: number; regions: Array<{ source: string }>; baseBytes: number; baseSha256: string }
+      result: { width: number; height: number; regions: Array<{ source: string }>; overlayBytes: number; overlaySha256: string }
     }
     assert.equal(status.state, 'ready')
     assert.equal(status.result.width, 120)
     assert.equal(status.result.regions[0]!.source, '识别:sample-image')
-    assert.equal(status.result.baseBytes, BASE_PNG.length)
+    assert.equal(status.result.overlayBytes, OVERLAY_PNG.length)
 
     const result = await app.inject({ url: `/v1/jobs/${id}/result`, headers: auth })
     assert.equal(result.statusCode, 200)
 
-    const base = await app.inject({ url: `/v1/jobs/${id}/base`, headers: auth })
+    const base = await app.inject({ url: `/v1/jobs/${id}/overlay`, headers: auth })
     assert.equal(base.statusCode, 200)
     assert.equal(base.headers['content-type'], 'image/png')
-    assert.deepEqual(base.rawPayload, BASE_PNG)
-    assert.equal(createHash('sha256').update(base.rawPayload).digest('hex'), status.result.baseSha256)
+    assert.deepEqual(base.rawPayload, OVERLAY_PNG)
+    assert.equal(createHash('sha256').update(base.rawPayload).digest('hex'), status.result.overlaySha256)
   })
 
   await t.test('同一请求 ID 重传复用已有任务，不重复计算', async () => {
@@ -158,4 +158,36 @@ test('远程计算端要求鉴权，并完成一次完整的上传/结果/底图
     assert.equal(badChecksum.statusCode, 400)
     assert.equal((badChecksum.json() as { code: string }).code, 'checksum_mismatch')
   })
+})
+
+test('语义模型未就绪时返回 503 与可重试错误码，而不是笼统的 500', async () => {
+  const pending = await createComputeApp({
+    apiKey: KEY,
+    workDir: path.join(root, 'semantic-work'),
+    engine: fakeEngine(),
+    quiet: true,
+    // 首次使用会先自动下载模型；这段时间的语义请求必须可重试，而不是被判为内部错误。
+    semanticProvider: {
+      status: async () => ({ ready: false, provider: 'local', model: '', dimensions: 512, downloading: true, message: '正在下载 CLIP 模型 12%' }),
+      embedText: async () => { throw new Error('不应被调用') },
+      embedImage: async () => { throw new Error('不应被调用') },
+    },
+  })
+  try {
+    const response = await pending.inject({
+      method: 'POST', url: '/v1/semantic/text',
+      headers: { ...auth, 'content-type': 'application/json', 'x-semantic-model': 'chinese-clip-vit-b16:abc' },
+      payload: { query: 'a cat' },
+    })
+    assert.equal(response.statusCode, 503)
+    const body = response.json() as { code: string; retryable: boolean }
+    assert.equal(body.code, 'semantic_downloading')
+    assert.equal(body.retryable, true)
+
+    const status = await pending.inject({ url: '/v1/semantic/status', headers: auth })
+    assert.equal(status.statusCode, 200)
+    assert.equal((status.json() as { downloading: boolean }).downloading, true)
+  } finally {
+    await pending.close()
+  }
 })

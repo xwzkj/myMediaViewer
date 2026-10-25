@@ -23,6 +23,19 @@ test('input 自动补全：顶层、媒体、元文件、捕获字段、可选�
   assert.deepEqual(captureNames([{mode:'template',pattern:'{id}_{author}',caseSensitive:false},{mode:'regex',pattern:'(?<id>\\d+)(?<title>.*)',caseSensitive:false}]),['id','author','title'])
 })
 
+test('设置页失活后带着旧请求恢复，丢弃旧响应但继续轮询', async () => {
+  const waits:Array<(value:number)=>void> = [], received:number[]=[]
+  const poll=createStatusPoller(()=>new Promise<number>(resolve=>waits.push(resolve)),value=>received.push(value),()=>{},10000)
+  try {
+    poll.start();assert.equal(waits.length,1)
+    poll.stop();poll.start();assert.equal(waits.length,1)
+    waits.shift()!(1);await new Promise(resolve=>setTimeout(resolve,20))
+    assert.deepEqual(received,[]);assert.equal(waits.length,1)
+    waits.shift()!(2);await new Promise(resolve=>setTimeout(resolve,0))
+    assert.deepEqual(received,[2])
+  } finally {poll.stop()}
+})
+
 test('设置页轮询：持续更新、请求不重叠、出错重试、卸载忽略迟到结果', async () => {
   const waits: Array<{resolve(value:number):void;reject(error:Error):void}> = []
   const received:number[]=[],errors:unknown[]=[]

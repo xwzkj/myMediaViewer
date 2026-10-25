@@ -4,6 +4,7 @@ import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import type { LibraryStatus, PixivSearchResponse, PixivSearchSuggestionsResponse, PixivStatus, PixivUserSearchResponse, PixivUserSummary, TagSuggestionsResponse, Work, WorksResponse } from '../../shared/types'
 import { activeSearchToken, replaceWithTag, replaceTrailingSearchToken, tagQuery, trailingSearchToken } from '../../shared/search-query'
 import { isPixivSearchTarget, pixivSearchTargets } from '../../shared/pixiv-search'
+import type { SemanticSearchStatus } from '../../shared/semantic'
 import { api, formatNumber } from '../api'
 import { appEvents, type PixivAuthChangedPayload, type PixivBookmarkSyncedPayload, type WorkReturnPayload } from '../events'
 import { createSearchSessionId } from '../route-cache-key'
@@ -59,6 +60,9 @@ const seed = ref(initialWorks.seed || String(Date.now()))
 // 排序依据：收藏时间（文件名开头的 bmk_id）或发布时间，默认按收藏顺序。
 const order = ref(initialWorks.order)
 const fuzzy = ref(initialWorks.fuzzy)
+// Semantic mode belongs to the search URL, never to the cloud/settings preferences.
+const semantic = ref(false)
+const semanticStatus = ref<SemanticSearchStatus | null>(null)
 const searchSource = ref<SearchSource>('local')
 const cloudSort = ref(readLibraryState('cloudSearch').sort)
 const cloudTarget = ref(readLibraryState('cloudSearch').target)
@@ -167,7 +171,7 @@ function trackScroll() { scrolled.value = window.scrollY > 4 }
 const menuOpen = ref(false)
 const menu = ref<HTMLElement>()
 const menuButton = ref<HTMLElement>()
-const filtersActive = computed(() => cloudSearchMode.value ? cloudTarget.value !== 'partial_match_for_tags' : Boolean(kind.value || source.value || fuzzy.value))
+const filtersActive = computed(() => cloudSearchMode.value ? cloudTarget.value !== 'partial_match_for_tags' : Boolean(kind.value || source.value || fuzzy.value || semantic.value))
 function closeMenu(event: PointerEvent | KeyboardEvent) {
   if (event instanceof KeyboardEvent) { if (event.key === 'Escape') menuOpen.value = false; return }
   if (!menuOpen.value) return
@@ -179,7 +183,7 @@ const mixedSources = computed(() => !source.value && (status.value?.sources.leng
 const effectiveOrder = computed(() => mixedSources.value ? 'published' : order.value)
 const timeSortDisabled = computed(() => mixedSources.value || sort.value === 'title' || sort.value === 'relevance' || sort.value === 'random')
 const title = computed(() => submittedQuery.value ? '发现你心中的那一张' : view.value === 'favorites' ? '把喜欢，留在身边。' : currentSource.value ? currentSource.value.name : '每一份喜欢，都值得珍藏。')
-const caption = computed(() => submittedQuery.value ? cloudSearchMode.value ? (isUserEntity.value ? `正在 Pixiv 作者中寻找「${submittedQuery.value}」` : `按${cloudTargetLabel.value}寻找「${submittedQuery.value}」`) : `正在整个描述、标题、作者与标签中寻找「${submittedQuery.value}」` : view.value === 'favorites' ? '那些让你停下来的瞬间，都在这里。' : '让散落在文件夹里的灵感，在这里重新相遇。')
+const caption = computed(() => submittedQuery.value ? cloudSearchMode.value ? (isUserEntity.value ? `正在 Pixiv 作者中寻找「${submittedQuery.value}」` : `按${cloudTargetLabel.value}寻找「${submittedQuery.value}」`) : semantic.value ? `按画面语义寻找「${submittedQuery.value}」（仅已索引的本地图片）` : `正在整个描述、标题、作者与标签中寻找「${submittedQuery.value}」` : view.value === 'favorites' ? '那些让你停下来的瞬间，都在这里。' : '让散落在文件夹里的灵感，在这里重新相遇。')
 const hasLibrary = computed(() => Boolean(cloudSearchMode.value || cloudFavoritesMode.value || status.value?.sources.length || (cloudEnabled.value && ((pixivStatus.value?.mirrors.public.items || 0) > 0 || (pixivStatus.value?.mirrors.private.items || 0) > 0))))
 // 视频与动图合并成一个筛选，动图在后端按 animation 归类，这里用逗号列表一起取。
 const filters = computed<Array<{ id: '' | 'image' | 'video'; label: string; icon: string; count: number }>>(() => [{ id: '', label: '全部', icon: 'gallery', count: status.value?.works || 0 }, { id: 'image', label: '图片', icon: 'image', count: status.value?.images || 0 }, { id: 'video', label: '视频', icon: 'video', count: (status.value?.videos || 0) + (status.value?.animations || 0) }])
@@ -200,6 +204,7 @@ async function loadPage(target: number, silent = false) {
   moreFailed.value = false
   if (target <= 1) { if (!silent) loading.value = true; error.value = '' } else loadingMore.value = true
   const params = new URLSearchParams({ q: submittedQuery.value, source: source.value, kind: kind.value === 'video' ? 'video,animation' : kind.value, favorites: String(view.value === 'favorites'), page: String(target), sort: sort.value, fuzzy: String(fuzzy.value), by: effectiveOrder.value, seed: seed.value })
+  if (localSearchMode.value && semantic.value) { params.set('semantic', 'true'); params.set('localOnly', 'true') }
   if (route.value.name === 'library' || route.value.name === 'source') params.set('localOnly', 'true')
   const cacheKey = params.toString()
   if (target === 1 && !silent) {
@@ -500,7 +505,7 @@ function queueSuggestions() {
   const target = searchSource.value
   const term = activeSearchToken(query.value, caret).value.trim().slice(0, 100)
   // 建议始终基于光标所在的关键词；本地搜索空关键词时不触发请求。
-  if (isUserEntity.value || !term || (target === 'cloud' && !cloudEnabled.value)) {
+  if ((target === 'local' && semantic.value) || isUserEntity.value || !term || (target === 'cloud' && !cloudEnabled.value)) {
     suggestionOpen.value = false
     suggestionLoading.value = false
     suggestionTerm.value = ''
@@ -512,7 +517,7 @@ function queueSuggestions() {
   suggestionTimer = setTimeout(loadSuggestions, 140)
 }
 async function loadSuggestions() {
-  if (isUserEntity.value) return
+  if (isUserEntity.value || (searchSource.value === 'local' && semantic.value)) return
   suggestionController?.abort()
   const active = new AbortController()
   suggestionController = active
@@ -588,7 +593,8 @@ function routeFilters(extra: Record<string, string> = {}) {
   const next: Record<string, string> = { ...extra }
   if (source.value && !source.value.startsWith('pixiv:')) next.source = source.value
   if (kind.value) next.kind = kind.value
-  if (fuzzy.value) next.fuzzy = 'true'
+  if (semantic.value) next.semantic = 'true'
+  else if (fuzzy.value) next.fuzzy = 'true'
   if (sort.value && sort.value !== 'newest') next.sort = sort.value
   if (order.value === 'published') next.by = 'published'
   if (seed.value) next.seed = seed.value
@@ -605,7 +611,8 @@ function searchTarget(value: string, target: SearchSource = 'local') {
     return { name: 'cloudSearch' as const, query: { q: value, sort: cloudSort.value, target: cloudTarget.value, entity, sid } }
   }
   const next = routeFilters({ q: value })
-  if (route.value.name !== 'search') next.sort = readLibraryState('localSearch').sort
+  if (semantic.value) next.sort = 'relevance'
+  else if (route.value.name !== 'search') next.sort = readLibraryState('localSearch').sort
   next.sid = sid
   if (view.value === 'favorites') next.favorites = 'true'
   return { name: 'search' as const, query: next }
@@ -626,6 +633,12 @@ function submitSearch(event?: KeyboardEvent) {
   const target = searchTarget(value, searchSource.value)
   if (router.resolve(target).fullPath === route.value.fullPath) queueLoadWorks()
   else void pushPage(router, target)
+}
+function toggleSemantic() {
+  semantic.value = !semantic.value
+  closeSuggestions()
+  if (semantic.value) { fuzzy.value = false; sort.value = 'relevance' }
+  if (query.value.trim()) submitSearch()
 }
 function switchSearchMode() {
   const next: SearchSource = searchSource.value === 'local' ? 'cloud' : 'local'
@@ -666,6 +679,7 @@ function applyRouteDraft() {
 }
 function applyRoute() {
   const name = String(route.value.name || '')
+  semantic.value = name === 'search' && route.value.query.semantic === 'true'
   pagePath.value = route.value.fullPath
   if (name === 'cloudSearch') {
     const memory = readLibraryState('cloudSearch')
@@ -697,9 +711,9 @@ function applyRoute() {
     view.value = route.value.query.favorites === 'true' ? 'favorites' : 'library'
     source.value = typeof route.value.query.source === 'string' ? route.value.query.source : memory.source
     kind.value = route.value.query.kind === 'image' || route.value.query.kind === 'video' ? route.value.query.kind : memory.kind
-    fuzzy.value = route.value.query.fuzzy === 'true' || (route.value.query.fuzzy !== 'false' && memory.fuzzy)
+    fuzzy.value = !semantic.value && (route.value.query.fuzzy === 'true' || (route.value.query.fuzzy !== 'false' && memory.fuzzy))
     sort.value = route.value.query.sort === 'newest' || route.value.query.sort === 'oldest' || route.value.query.sort === 'title' || route.value.query.sort === 'random' || route.value.query.sort === 'relevance'
-      ? route.value.query.sort : memory.sort
+      ? route.value.query.sort : semantic.value ? 'relevance' : memory.sort
     order.value = route.value.query.by === 'collected' || route.value.query.by === 'published' ? route.value.query.by : memory.order
     seed.value = typeof route.value.query.seed === 'string' ? route.value.query.seed : (memory.seed || String(Date.now()))
     applySubmittedQuery(typeof route.value.query.q === 'string' ? route.value.query.q : '')
@@ -743,6 +757,7 @@ function navigate(next: 'library' | 'favorites', sourceId?: string) {
 // 换一批：换一个随机种子，重新打乱这一批作品的顺序。
 function reshuffle() { seed.value = String(Date.now()) }
 function resetFilters() {
+  semantic.value = false
   query.value = ''
   source.value = ''
   kind.value = ''
@@ -755,7 +770,11 @@ watch(() => route.value.fullPath, () => {
   if (!routeInitialized || route.value.fullPath !== pagePath.value) queueLoadWorks()
   routeInitialized = true
 }, { immediate: true })
-watch([view, source, kind, sort, fuzzy, order, seed, cloudSort], () => {
+watch(semantic, async enabled => {
+  if (!enabled) return
+  try { semanticStatus.value = await api<SemanticSearchStatus>('/semantic/status') } catch { semanticStatus.value = null }
+}, { immediate: true })
+watch([view, source, kind, sort, fuzzy, semantic, order, seed, cloudSort], () => {
   if (!pageActive.value || route.value.name === 'cloudSearch') return
   // 筛选/排序由菜单直接修改时也立即刷新，不要求用户再次提交搜索。
   queueLoadWorks()
@@ -1047,7 +1066,7 @@ onUnmounted(() => {
         <div class="search-row">
           <div class="search-field">
             <button class="search-mode-toggle" :class="{ cloud: searchSource === 'cloud' }" type="button" :aria-label="searchSource === 'cloud' ? '切换到本地搜索' : '切换到云搜索'" :title="searchSource === 'cloud' ? '切换到本地搜索' : '切换到云搜索'" @click="switchSearchMode"><Icon :name="searchSource === 'cloud' ? 'cloud' : 'folder'" :size="19" /><span>{{ searchSource === 'cloud' ? '云端' : '本地' }}</span><Icon name="swap" :size="16" /></button>
-            <input ref="searchInput" v-model="query" type="text" :aria-label="searchSource === 'cloud' ? (isUserEntity ? '云搜索作者' : '云搜索作品') : '搜索作品'" :placeholder="searchSource === 'cloud' ? (isUserEntity ? '输入作者名，按 Enter 搜索…' : '输入关键词，按 Enter 搜索…') : '搜索标题、描述、作者或标签…'" maxlength="500" role="combobox" aria-autocomplete="list" aria-controls="tag-suggestions" :aria-expanded="suggestionsVisible" :aria-activedescendant="suggestionsVisible && suggestionIndex >= 0 ? 'tag-suggestion-' + suggestionIndex : undefined" @focus="focusSearch" @input="updateCaret" @click="updateCaret" @keyup="searchKeyup" @keydown.down.prevent="moveSuggestion(1)" @keydown.up.prevent="moveSuggestion(-1)" @keydown.enter="submitSearch" @keydown.esc="closeSuggestions" @blur="blurSuggestions" />
+            <input ref="searchInput" v-model="query" type="text" :aria-label="searchSource === 'cloud' ? (isUserEntity ? '云搜索作者' : '云搜索作品') : '搜索作品'" :placeholder="searchSource === 'cloud' ? (isUserEntity ? '输入作者名，按 Enter 搜索…' : '输入关键词，按 Enter 搜索…') : semantic ? '画面描述，例如：夕阳下的猫 / a cat at sunset…' : '搜索标题、描述、作者或标签…'" maxlength="500" role="combobox" aria-autocomplete="list" aria-controls="tag-suggestions" :aria-expanded="suggestionsVisible" :aria-activedescendant="suggestionsVisible && suggestionIndex >= 0 ? 'tag-suggestion-' + suggestionIndex : undefined" @focus="focusSearch" @input="updateCaret" @click="updateCaret" @keyup="searchKeyup" @keydown.down.prevent="moveSuggestion(1)" @keydown.up.prevent="moveSuggestion(-1)" @keydown.enter="submitSearch" @keydown.esc="closeSuggestions" @blur="blurSuggestions" />
             <button v-if="query" class="icon-button small-icon" type="button" aria-label="清空搜索" @click="clearSearch"><Icon name="close" :size="19" /></button>
             <button class="search-submit" type="button" aria-label="执行搜索" title="搜索（Enter）" @click="submitSearch()"><Icon name="search" :size="22" /></button>
             <div v-if="suggestionsVisible" id="tag-suggestions" class="tag-suggestions" role="listbox" aria-label="标签搜索建议"><div class="suggestion-heading"><Icon name="tag" :size="15" /><span>{{ searchSource === 'cloud' ? '云搜索建议' : '按标签搜索' }}</span><b v-if="suggestionLoading">正在加载…</b><b v-else-if="!suggestions.length">暂无匹配建议</b><b v-else-if="suggestionTotal > suggestions.length">还有 {{ formatNumber(suggestionTotal - suggestions.length) }} 个匹配标签</b></div><button v-for="(item, i) in suggestions" :id="'tag-suggestion-' + i" :key="item.name" type="button" class="tag-suggestion" :class="{ active: i === suggestionIndex }" role="option" :aria-selected="i === suggestionIndex" @mousedown.prevent @click="commitSuggestion(i)" @mouseenter="suggestionIndex = i"><span>{{ searchSource === 'cloud' ? item.name : '#' + item.name }}</span><small v-if="searchSource === 'local'">{{ formatNumber(item.count || 0) }} 组</small><small v-else-if="item.translatedName && item.translatedName !== item.name">{{ item.translatedName }}</small></button></div>
@@ -1058,7 +1077,8 @@ onUnmounted(() => {
         <Transition v-if="!isUserEntity" name="menu-pop"><div v-if="menuOpen" ref="menu" class="filter-menu" role="dialog" aria-label="筛选与排序">
           <div v-if="!cloudSearchMode && !cloudFavoritesMode && sourceOptions.length > 0" class="menu-row"><span>来源</span><AppSelect v-model="source" compact label="筛选媒体来源" :options="[{ value: '', label: '全部来源' }, ...sourceOptions.map(item => ({ value: item.id, label: item.name }))]" /></div>
           <div v-if="!isUserEntity" class="menu-row"><span>媒体类型</span><div class="menu-chips"><button v-for="filter in filters" :key="filter.id" class="filter-chip" :class="{ active: kind === filter.id }" :aria-pressed="kind === filter.id" @click="kind = filter.id"><Icon :name="kind === filter.id ? 'check' : filter.icon" :size="18" />{{ filter.label }}</button></div></div>
-          <label v-if="!cloudSearchMode" class="menu-row"><span>模糊匹配</span><span class="fuzzy-toggle"><input v-model="fuzzy" type="checkbox" /><span class="mini-switch" /><span>{{ fuzzy ? '已开启' : '已关闭' }}</span></span></label>
+          <label v-if="searchSource === 'local'" class="menu-row"><span title="中文与英文画面描述都可用；索引由后台按来源建立">画面语义（中文/英文）</span><span class="fuzzy-toggle"><input type="checkbox" :checked="semantic" @change="toggleSemantic" /><span class="mini-switch" /><span>{{ semantic ? '已开启' : '已关闭' }}</span></span></label>
+          <label v-if="!cloudSearchMode && !semantic" class="menu-row"><span>模糊匹配</span><span class="fuzzy-toggle"><input v-model="fuzzy" type="checkbox" /><span class="mini-switch" /><span>{{ fuzzy ? '已开启' : '已关闭' }}</span></span></label>
           <div v-if="cloudSearchMode && !isUserEntity" class="menu-row"><span>匹配规则</span><AppSelect v-model="cloudTarget" compact label="云搜索匹配规则" :options="pixivSearchTargets" /></div>
           <div class="menu-row"><span>排序方式</span><AppSelect v-if="cloudSearchMode && !isUserEntity" v-model="cloudSort" compact label="云搜索排序" :options="[{ value: 'popular_preview', label: '热度预览' }, { value: 'date_desc', label: '最新优先' }, { value: 'date_asc', label: '最早优先' }]" /><AppSelect v-else-if="!isUserEntity" v-model="sort" compact label="排序方式" :options="localSortOptions" /></div>
           <label v-if="sort === 'random' && !cloudSearchMode" class="menu-row"><span>换一批</span><button class="button tonal small" type="button" @click="reshuffle"><Icon name="refresh" :size="17" />重新打乱</button></label>
@@ -1069,12 +1089,13 @@ onUnmounted(() => {
       <!-- hero-meta 是本地库统计（组作品/目录数）：users 下隐藏，避免假关联 -->
       <section class="hero"><div class="hero-copy"><span class="eyebrow"><span class="short-line" />{{ view === 'favorites' ? 'YOUR FAVORITE MOMENTS' : 'A HOME FOR YOUR INSPIRATION' }}</span><h1>{{ title }}</h1><p>{{ caption }}</p><div v-if="!isUserEntity" class="hero-meta"><span><strong>{{ formatNumber(view === 'favorites' ? status?.favorites || 0 : currentSource?.works || status?.works || 0) }}</strong> 组作品</span><span class="dot-separator">·</span><span>{{ status?.sources.length || 0 }} 个媒体目录</span><span v-if="hasLibrary" class="hero-status"><Icon :name="status?.scan.running ? 'refresh' : 'check'" :class="{ spinning: status?.scan.running }" :size="15" />{{ status?.scan.running ? '正在整理' : '收藏随时可见' }}</span></div></div><div class="hero-illustration" aria-hidden="true"><div class="orbit orbit-one" /><div class="orbit orbit-two" /><div class="illustration-card back"><Icon name="video" :size="30" /></div><div class="illustration-card middle"><Icon name="leaf" :size="40" /></div><div class="illustration-card front"><div class="little-sun" /><div class="little-hill hill-one" /><div class="little-hill hill-two" /></div><span class="illustration-sparkle">✦</span><span class="illustration-dot" /></div></section>
       <section class="library-content" :aria-label="isUserEntity ? '作者列表' : '作品列表'">
+        <div v-if="semantic && semanticStatus && !cloudSearchMode" class="warning-banner" role="status"><Icon :name="semanticStatus.ready ? 'image' : 'warning'" :size="20" /><span>{{ semanticStatus.ready ? '已索引 ' + formatNumber(semanticStatus.indexedAssets) + ' 张图片 · ' + formatNumber(semanticStatus.indexedWorks) + ' 组作品' : semanticStatus.message }}{{ semanticStatus.ready && semanticStatus.message ? ' · ' + semanticStatus.message : '' }}</span></div>
         <div v-if="status?.scan.running" class="scan-progress" role="status"><div class="indeterminate-bar" /><span>{{ status.scan.phase }}<b>{{ formatNumber(status.scan.files) }} 个文件</b></span></div>
         <div v-if="status?.scan.errors.length && !status.scan.running" class="warning-banner"><Icon name="warning" :size="20" /><span>部分目录或描述未能读取，已有索引已保留。</span><button class="button text small" @click="openSettings">查看详情</button></div>
         <div v-if="cloudFavoritesMode" class="cloud-favorite-tabs" role="tablist" aria-label="Pixiv 收藏可见性"><button type="button" role="tab" :aria-selected="cloudFavoritesRestrict === 'public'" :class="{ active: cloudFavoritesRestrict === 'public' }" @click="switchCloudFavorites('public')">公开收藏</button><button type="button" role="tab" :aria-selected="cloudFavoritesRestrict === 'private'" :class="{ active: cloudFavoritesRestrict === 'private' }" @click="switchCloudFavorites('private')">私密收藏</button><span class="cloud-mirror-actions"><button type="button" class="cloud-mirror-refresh" :disabled="!cloudEnabled || mirrorRefreshing || mirrorBusy" @click="refreshCloudMirror('incremental')"><Icon name="refresh" :class="{ spinning: incrementalUpdating }" :size="16" />{{ incrementalUpdating ? '正在增量' : '增量更新' }}</button><button type="button" class="cloud-mirror-refresh" :disabled="!cloudEnabled || mirrorRefreshing || mirrorBusy" @click="refreshCloudMirror('full')"><Icon name="cloud" :size="16" />{{ fullUpdating ? '正在全量' : '全量刷新' }}</button></span></div>
         <div v-if="cloudDataDirty && (cloudSearchMode || cloudFavoritesMode)" class="dirty-banner" role="status"><Icon name="warning" :size="18" /><span>{{ cloudDirtyMessage }}</span><button class="button tonal small" type="button" @click="reloadCloudResults">重新加载</button></div>
         <div v-if="cloudSearchMode" class="cloud-entity-tabs" role="tablist" aria-label="云搜索维度"><button type="button" role="tab" :aria-selected="cloudEntity === 'works'" :class="{ active: cloudEntity === 'works' }" @click="openCloudEntity('works')">作品</button><button type="button" role="tab" :aria-selected="cloudEntity === 'users'" :class="{ active: cloudEntity === 'users' }" @click="openCloudEntity('users')">作者</button></div>
-        <div class="results-heading"><h2>{{ cloudSearchMode ? (isUserEntity ? 'Pixiv 作者搜索' : 'Pixiv 云搜索') : cloudFavoritesMode ? (cloudFavoritesRestrict === 'private' ? 'Pixiv 私密收藏' : 'Pixiv 公开收藏') : submittedQuery ? '搜索结果' : view === 'favorites' ? '我的收藏' : currentSource?.name || '全部作品' }}<span>{{ formatNumber(isUserEntity ? cloudUsers.length : result.total) }}</span></h2><span v-if="cloudSearchMode && isUserEntity && !cloudUserLoading" class="results-note">已加载 {{ formatNumber(cloudUsers.length) }} 位作者 · {{ cloudUserElapsed }} ms</span><span v-else-if="cloudSearchMode && isUserEntity" class="results-note">正在搜索作者…</span><span v-else-if="cloudSearchMode && !isUserEntity && !loading" class="results-note">{{ cloudTargetLabel }} · {{ cloudSort === 'date_desc' ? '最新优先' : cloudSort === 'date_asc' ? '最早优先' : '热度预览' }} · {{ result.elapsed }} ms</span><span v-else-if="cloudSearchMode" class="results-note">正在搜索作品…</span><span v-else-if="cloudFavoritesMode" class="results-note" :title="currentMirror?.error || mirrorStatusText">{{ mirrorStatusText }} · {{ formatNumber(currentMirror?.items || result.total) }} 组</span><span v-else-if="submittedQuery && !loading" class="results-note">{{ result.elapsed }} ms · 支持简繁体与拼音</span><span v-else-if="submittedQuery" class="results-note">正在搜索…</span><span v-else class="results-note">{{ kind ? ({ image: '静止的画面，无限的想象', video: '按下播放，让故事继续', animation: '让灵感动起来' }[kind]) : '灵感，在这里慢慢生长' }}</span></div>
+        <div class="results-heading"><h2>{{ cloudSearchMode ? (isUserEntity ? 'Pixiv 作者搜索' : 'Pixiv 云搜索') : cloudFavoritesMode ? (cloudFavoritesRestrict === 'private' ? 'Pixiv 私密收藏' : 'Pixiv 公开收藏') : submittedQuery ? '搜索结果' : view === 'favorites' ? '我的收藏' : currentSource?.name || '全部作品' }}<span>{{ formatNumber(isUserEntity ? cloudUsers.length : result.total) }}</span></h2><span v-if="cloudSearchMode && isUserEntity && !cloudUserLoading" class="results-note">已加载 {{ formatNumber(cloudUsers.length) }} 位作者 · {{ cloudUserElapsed }} ms</span><span v-else-if="cloudSearchMode && isUserEntity" class="results-note">正在搜索作者…</span><span v-else-if="cloudSearchMode && !isUserEntity && !loading" class="results-note">{{ cloudTargetLabel }} · {{ cloudSort === 'date_desc' ? '最新优先' : cloudSort === 'date_asc' ? '最早优先' : '热度预览' }} · {{ result.elapsed }} ms</span><span v-else-if="cloudSearchMode" class="results-note">正在搜索作品…</span><span v-else-if="cloudFavoritesMode" class="results-note" :title="currentMirror?.error || mirrorStatusText">{{ mirrorStatusText }} · {{ formatNumber(currentMirror?.items || result.total) }} 组</span><span v-else-if="submittedQuery && !loading" class="results-note">{{ result.elapsed }} ms · {{ semantic ? '画面语义 · 按作品最佳图片匹配' : '支持简繁体与拼音' }}</span><span v-else-if="submittedQuery" class="results-note">正在搜索…</span><span v-else class="results-note">{{ kind ? ({ image: '静止的画面，无限的想象', video: '按下播放，让故事继续', animation: '让灵感动起来' }[kind]) : '灵感，在这里慢慢生长' }}</span></div>
         <div v-if="cloudSearchMode && isUserEntity" class="user-results" aria-label="作者搜索结果">
           <div v-if="cloudUserError" class="empty-state error-state"><span class="empty-symbol"><Icon name="warning" :size="38" /></span><h3>暂时无法搜索作者</h3><p>{{ cloudUserError }}</p><button class="button filled" @click="loadCloudUsers(true)">重新搜索</button></div>
           <div v-else-if="cloudUserLoading && !cloudUsers.length" class="work-grid" aria-label="正在加载"><div v-for="n in 8" :key="n" class="skeleton-card"><div /><span /><small /></div></div>
@@ -1087,10 +1108,10 @@ onUnmounted(() => {
           </div>
         </div>
         <template v-else>
-        <div v-if="error" class="empty-state error-state"><span class="empty-symbol"><Icon name="warning" :size="38" /></span><h3>暂时无法连接媒体库</h3><p>{{ error }}</p><button class="button filled" @click="refreshStatus(); loadWorks()">重新连接</button></div>
+        <div v-if="error" class="empty-state error-state"><span class="empty-symbol"><Icon name="warning" :size="38" /></span><h3>{{ semantic ? '语义搜索暂不可用' : '暂时无法连接媒体库' }}</h3><p>{{ error }}</p><button class="button filled" @click="refreshStatus(); loadWorks()">重试</button><button v-if="semantic" class="button tonal" @click="toggleSemantic">切换关键词搜索</button></div>
         <div v-else-if="loading && !result.items.length" class="work-grid" aria-label="正在加载"><div v-for="n in 8" :key="n" class="skeleton-card"><div /><span /><small /></div></div>
         <div v-else-if="!hasLibrary" class="empty-state welcome-state"><div class="empty-art"><Icon name="folder-plus" :size="54" /><span>✦</span></div><span class="eyebrow">YOUR COLLECTION STARTS HERE</span><h3>给你的喜欢，一个家。</h3><p>添加存放图片和视频的文件夹，<br />拾光会自动将同组作品整理在一起。</p><button class="button filled" @click="openSettings"><Icon name="plus" :size="20" />添加第一个媒体目录</button><div class="welcome-features"><span><Icon name="images" :size="17" />自动分组</span><span><Icon name="search" :size="17" />描述搜索</span><span><Icon name="heart" :size="17" />跨设备收藏</span></div></div>
-        <div v-else-if="!result.items.length" class="empty-state"><span class="empty-symbol"><Icon :name="submittedQuery ? 'search' : view === 'favorites' ? 'heart' : 'images'" :size="40" /></span><h3>{{ status?.scan.running ? '正在整理你的第一批作品' : submittedQuery ? '还没有找到相关作品' : view === 'favorites' ? '留一点位置，给心动的作品' : '这里还没有作品' }}</h3><p>{{ status?.scan.running ? '扫描完成后，作品会自动出现在这里。' : submittedQuery ? '试试更短的关键词，或开启模糊匹配。' : view === 'favorites' ? '点击作品卡片上的爱心，就能在这里找到它。' : '检查分组规则，或调整筛选条件再看看。' }}</p><button v-if="submittedQuery || kind || source" class="button tonal" @click="resetFilters">清除筛选</button><button v-else-if="!status?.scan.running && view !== 'favorites'" class="button tonal" @click="openSettings">检查媒体目录</button></div>
+        <div v-else-if="!result.items.length" class="empty-state"><span class="empty-symbol"><Icon :name="submittedQuery ? 'search' : view === 'favorites' ? 'heart' : 'images'" :size="40" /></span><h3>{{ status?.scan.running ? '正在整理你的第一批作品' : submittedQuery ? '还没有找到相关作品' : view === 'favorites' ? '留一点位置，给心动的作品' : '这里还没有作品' }}</h3><p>{{ status?.scan.running ? '扫描完成后，作品会自动出现在这里。' : submittedQuery ? (semantic ? '仅搜索已建立索引的本地静态图片；试试其他画面描述或切换关键词搜索。' : '试试更短的关键词，或开启模糊匹配。') : view === 'favorites' ? '点击作品卡片上的爱心，就能在这里找到它。' : '检查分组规则，或调整筛选条件再看看。' }}</p><button v-if="submittedQuery || kind || source" class="button tonal" @click="resetFilters">清除筛选</button><button v-else-if="!status?.scan.running && view !== 'favorites'" class="button tonal" @click="openSettings">检查媒体目录</button></div>
         <div v-else class="work-grid" :class="{ refreshing: loading }"><WorkCard v-for="work in result.items" :key="work.id" :work="work" :cloud-enabled="cloudEnabled" @open="openWork" @open-author="openAuthor" @favorite="toggleFavorite" @cloud-favorite="toggleCloudFavorite" /></div>
         <div v-if="result.items.length" class="load-more">
           <button v-if="result.page < result.pages" class="button text small" :disabled="loadingMore" @click="retryLoadMore"><Icon name="refresh" :class="{ spinning: loadingMore }" :size="18" />{{ loadingMore ? '正在加载更多…' : moreFailed ? '加载失败，点击重试' : '继续向下滚动，自动加载更多' }}</button>

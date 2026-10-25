@@ -1,2 +1,2 @@
-call pnpm start
+call pnpm start:compute
 pause

@@ -13,11 +13,16 @@ export const scanStatus: ScanStatus = { running: false, phase: '尚未扫描', f
 export const sourceOnline = new Map<string, boolean>()
 let afterScan: () => void = () => {}
 export function onScan(callback: () => void) { afterScan = callback }
+const scanListeners = new Set<() => void>()
+export function onScanComplete(callback: () => void): () => void {
+  scanListeners.add(callback)
+  return () => { scanListeners.delete(callback) }
+}
 
 export interface ScanOptions {
   /** Omit to scan the entire library. Configuration changes pass only the changed source. */
   sourceIds?: string[]
-  reason?: 'manual' | 'startup' | 'source-change'
+  reason?: 'manual' | 'startup' | 'source-change' | 'watch'
 }
 
 export async function scanLibrary(options: ScanOptions = {}): Promise<void> {
@@ -128,6 +133,7 @@ export async function scanLibrary(options: ScanOptions = {}): Promise<void> {
   } finally {
     scanStatus.running = false
     scanStatus.finishedAt = Date.now()
+    for (const callback of scanListeners) { try { callback() } catch (error) { logError('后台', '扫描后任务同步失败', error) } }
     const summary = `完成 · ${scanStatus.works} 组作品 / ${scanStatus.files} 个文件 · 用时 ${formatDuration(Date.now() - started)}`
     if (scanStatus.errors.length) logWarn('扫描', `${summary} · ${scanStatus.errors.length} 处需要检查`)
     else logInfo('扫描', summary)

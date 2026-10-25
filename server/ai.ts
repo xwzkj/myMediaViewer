@@ -41,6 +41,7 @@ const defaults: AiSettings = {
     apiKeyConfigured: false,
     connectTimeoutMs: 3000,
     timeoutMs: 15 * 60_000,
+    localThreads: 1,
   },
 }
 
@@ -112,6 +113,7 @@ function parseLocalCompute(raw: unknown): { settings: LocalComputeSettings; apiK
   const apiKey = typeof value.apiKey === 'string' ? value.apiKey.trim() : ''
   return {
     settings: {
+      localThreads: clampRange(value.localThreads, defaultsHere.localThreads ?? 1, 1, 16),
       mode: asMode(value.mode, defaultsHere.mode),
       baseUrl: asText(value.baseUrl, defaultsHere.baseUrl) || defaultsHere.baseUrl,
       fallback: asFallback(value.fallback, defaultsHere.fallback),
@@ -221,11 +223,13 @@ export interface LocalComputeConfig {
   connectTimeoutMs: number
   timeoutMs: number
   apiKey: string
+  localThreads: number
 }
 
 export function getLocalComputeConfig(): LocalComputeConfig {
   const lc = current.settings.localCompute
   return {
+    localThreads: lc.localThreads ?? 1,
     mode: lc.mode,
     baseUrl: lc.baseUrl,
     fallback: lc.fallback,
@@ -244,6 +248,7 @@ export function mergeLocalComputeSettings(input: unknown): LocalComputeConfig {
   const base = current.settings.localCompute
   const key = resolveLocalKey(input, effectiveComputeKey())
   return {
+    localThreads: clampRange(lc.localThreads, base.localThreads ?? 1, 1, 16),
     mode: asMode(lc.mode, base.mode),
     baseUrl: typeof lc.baseUrl === 'string' && lc.baseUrl.trim() ? lc.baseUrl.trim() : base.baseUrl,
     fallback: asFallback(lc.fallback, base.fallback),
@@ -279,6 +284,7 @@ export function mergeAiSettings(input: unknown): AiSettings {
   // 设置页可能带着尚未保存的计算配置来测试连接，这里一并合并，但只保留公开字段。
   const compute = mergeLocalComputeSettings(input)
   merged.localCompute = {
+    localThreads: compute.localThreads,
     mode: compute.mode,
     baseUrl: compute.baseUrl,
     fallback: compute.fallback,
@@ -324,14 +330,24 @@ function describeHttp(status: number, text: string): string {
 }
 
 /** 所有对外 AI 请求都从这里走，顺带记一条「用途 + 地址 + 状态 + 耗时」的调用日志。 */
-async function requestJson(url: string, init: RequestInit, timeoutMs: number, label: string): Promise<Record<string, unknown>> {
+async function requestJson(
+  url: string, init: RequestInit, timeoutMs: number, label: string,
+  options: { signal?: AbortSignal; beforeRequest?: () => void } = {},
+): Promise<Record<string, unknown>> {
   const method = (init.method || 'GET').toUpperCase()
   const started = Date.now()
   let response: Response
+  options.signal?.throwIfAborted()
+  // Paid-work gates reserve budget exactly at the point where the HTTP request is launched.
+  options.beforeRequest?.()
   try {
-    response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) })
+    const timeout = AbortSignal.timeout(timeoutMs)
+    const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
+    response = await fetch(url, { ...init, signal })
   } catch (error) {
     logUpstream(label, method, url, null, Date.now() - started)
+    // 暂停/停止导致的取消不是超时，不能显示成「请求超时」。
+    if (options.signal?.aborted) throw new AiError('请求已取消', 499)
     const name = (error as Error).name
     if (name === 'TimeoutError' || name === 'AbortError') throw new AiError(`请求超时（${Math.round(timeoutMs / 1000)} 秒），可在设置里调大超时时间`, 504)
     // fetch 只给一句「fetch failed」，真正的原因（拒绝连接、DNS 失败等）在 cause 里。
@@ -522,7 +538,12 @@ export interface MangaTextTranslateResult { translations: string[]; model: strin
  * 一页漫画里的文本按阅读顺序一次批量翻译。输入输出等长、顺序一致；
  * 模型少返或漏返的项回退到原文，避免某个气泡被擦掉后却没有新文字。
  */
-export async function translateMangaTexts(input: { texts: string[]; targetLanguage?: string }): Promise<MangaTextTranslateResult> {
+export async function translateMangaTexts(input: {
+  texts: string[]
+  targetLanguage?: string
+  signal?: AbortSignal
+  beforeRequest?: () => void
+}): Promise<MangaTextTranslateResult> {
   const texts = Array.isArray(input?.texts) ? input.texts.map(text => asText(text)).filter(Boolean) : []
   if (!texts.length) throw new AiError('这一页没有识别到可翻译的文字')
   const settings = configured()
@@ -543,7 +564,10 @@ export async function translateMangaTexts(input: { texts: string[]; targetLangua
     stream: false,
   }, ['model', 'messages', 'response_format', 'stream'])
   const label = `翻译漫画文本（${texts.length} 段${settings.model ? ` · ${settings.model}` : ''}）`
-  const data = await requestJson(chat, { method: 'POST', headers: headers(settings), body: payload }, settings.timeoutMs, label)
+  const data = await requestJson(chat, { method: 'POST', headers: headers(settings), body: payload }, settings.timeoutMs, label, {
+    signal: input.signal,
+    beforeRequest: input.beforeRequest,
+  })
   const content = extractContent(data, label)
   const parsed = parseJsonValue(content, label)
   const values = Array.isArray(parsed)

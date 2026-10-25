@@ -12,17 +12,17 @@ import {
 import { logInfo } from '../../log.js'
 
 /**
- * 共享的漫画计算核心：检测 → OCR → 阅读顺序整理 → 擦字 → 底图编码。
+ * 共享的漫画计算核心：检测 → OCR → 阅读顺序整理 → 擦字 → 覆盖层编码。
  *
  * 主服务的本地模式和远程计算端都调用这一份实现，保证两边对同一张图给出相同的
- * 文字、坐标和底图。这里刻意不引用数据库、配置或在线 AI：计算端只做纯计算。
+ * 文字、坐标和覆盖层。这里刻意不引用数据库、配置或在线 AI：计算端只做纯计算。
  *
- * 擦字不依赖译文，所以底图可以在这里一次生成；在线翻译随后只在主服务进行，不需要
- * 把整页 mask 传回主服务，也不需要第二次远程调用。
+ * 擦字不依赖译文，所以透明的擦字覆盖层可以在这里一次生成；原文保留，在线翻译
+ * 随后只在主服务进行，不需要把整页 mask 传回主服务，也不需要第二次远程调用。
  */
 
 /** 结果缓存版本。改动识别、擦字或输出语义时递增，让旧缓存自然失效。 */
-export const PIPELINE_VERSION = 1
+export const PIPELINE_VERSION = 2
 /** 单页像素上限。超出时返回可解释的错误，避免异常扫描件耗尽内存。 */
 export const MAX_PAGE_PIXELS = 40_000_000
 /** 单页最多识别的文本区域。超出时明确报错，不静默丢掉文字。 */
@@ -55,8 +55,8 @@ export interface EnginePage {
   width: number
   height: number
   regions: EngineRegion[]
-  /** 擦除后编码的无损 PNG；本页没有可翻译文本时为 undefined。 */
-  base?: Buffer
+  /** 擦字覆盖层（透明 PNG，只有被擦除像素不透明）；本页没有可翻译文本时为 undefined。 */
+  overlay?: Buffer
   /** 实际使用的模型描述，写进任务日志与结果。 */
   engine: string
   timings: { detectionMs: number; ocrMs: number; eraseMs: number; encodeMs: number }
@@ -233,7 +233,7 @@ export class MangaEngine {
     if (!kept.length) setStage('没有可翻译的气泡文本')
 
     const eraseRegions = kept.map(region => boxToRect({ ...region, classId: 0 }, detection.pageWidth, detection.pageHeight))
-    let base: Buffer | undefined
+    let overlay: Buffer | undefined
     let colors: Array<{ background: string; textColor: string }> = []
     let eraseMs = 0
     let encodeMs = 0
@@ -243,10 +243,11 @@ export class MangaEngine {
       const erased = await eraseTranslatedRegions(imagePath, detection.pageWidth, detection.pageHeight, detection.textMask, eraseRegions)
       eraseMs = Date.now() - eraseStarted
       colors = erased.colors
-      setStage('生成译图底图')
+      setStage('生成擦字覆盖层')
       const encodeStarted = Date.now()
-      base = await sharp(erased.data, { raw: { width: erased.width, height: erased.height, channels: 3 } })
-        .png({ compressionLevel: 7, adaptiveFiltering: true })
+      // 覆盖层绝大部分像素是透明的，最高压缩等级下通常只有几十 KB。
+      overlay = await sharp(erased.overlay, { raw: { width: erased.width, height: erased.height, channels: 4 } })
+        .png({ compressionLevel: 9, adaptiveFiltering: true })
         .toBuffer()
       encodeMs = Date.now() - encodeStarted
     }
@@ -268,7 +269,7 @@ export class MangaEngine {
       width: detection.pageWidth,
       height: detection.pageHeight,
       regions,
-      base,
+      overlay,
       engine: engineName,
       timings: { detectionMs, ocrMs, eraseMs, encodeMs },
     }

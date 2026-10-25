@@ -10,7 +10,7 @@ export interface SourceRules {
   preset?: 'pixiv' | 'telegram'
 }
 // kind is retained for API compatibility/display only, never for scanning.
-export interface Source { id: string; name: string; kind: SourceKind; path: string; rules?: SourceRules; pixivWorks?: boolean }
+export interface Source { id: string; name: string; kind: SourceKind; path: string; rules?: SourceRules; pixivWorks?: boolean; background?: import('./background.js').SourceBackgroundSettings }
 export interface MetadataFields { title: string; author: string; description: string; tags: string[]; date: string; originalUrl: string }
 export interface ScriptFile {
   filename: string; relativePath: string; directory?: string; directoryName?: string; extension: string; size: number; modified: number;
@@ -38,6 +38,9 @@ export interface Work {
   collected: number;
   updated: number; count: number; kind: MediaKind; favorite: boolean; cover: string;
   approximate?: boolean
+  /** Cosine similarity in [-1, 1], not a probability; semantic results only. */
+  semanticScore?: number
+  semanticAssetId?: string
   /** 缺省按 local 处理，兼容旧 API 数据。 */
   origin?: WorkOrigin
   /** 该条目是否拥有可直接播放的本地媒体。 */
@@ -157,6 +160,8 @@ export type LocalComputeMode = 'local' | 'remote'
 export type LocalComputeFallback = 'error' | 'local'
 
 export interface LocalComputeSettings {
+  /** 本地主机 ONNX 线程上限；旧配置默认为 1。 */
+  localThreads?: number
   mode: LocalComputeMode
   /** 远程计算端基础地址，例如 http://192.168.1.10:3211；本地模式下可为空。 */
   baseUrl: string
@@ -210,8 +215,10 @@ export interface MangaRegion {
 export interface MangaPageResult {
   key: string
   width: number; height: number
-  /** 已擦除有译文区域的底图；若本页没有可翻译文本则回退到原图 URL。 */
+  /** 底图：新结果指向原图（原图只读），旧缓存指向整页擦字图。 */
   baseUrl: string
+  /** 透明擦字覆盖层；旧缓存没有这一层。前端按需叠加在原图之上。 */
+  overlayUrl?: string
   regions: MangaRegion[]
   cached: boolean
   model: string

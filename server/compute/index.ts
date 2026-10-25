@@ -5,6 +5,7 @@ import { mkdirSync } from 'node:fs'
 import { createComputeApp } from './app.js'
 import { MangaEngine } from '../ai/manga/engine.js'
 import { modelRoot } from '../ai/manga/models.js'
+import { LocalClipProvider } from '../semantic/provider.js'
 import { COMPUTE_MAX_UPLOAD_BYTES, COMPUTE_PROTOCOL_VERSION } from '../../shared/compute.js'
 import { logError, logInfo, logWarn } from '../log.js'
 
@@ -35,7 +36,9 @@ const engine = new MangaEngine({
   ...(Number.isFinite(threads) && threads > 0 ? { intraOpNumThreads: Math.floor(threads) } : {}),
 })
 
-const app = await createComputeApp({ apiKey, workDir, engine })
+// 计算端自己的 CLIP provider：模型目录按本进程的数据目录解析，首次使用自动下载。
+const semanticProvider = new LocalClipProvider({ threads: Number(process.env.SEMANTIC_CLIP_THREADS) || 1 })
+const app = await createComputeApp({ apiKey, workDir, engine, semanticProvider })
 
 try {
   await app.listen({ port, host })
@@ -48,6 +51,12 @@ try {
   logInfo('计算端', `模型目录 ${modelRoot}`)
   logInfo('计算端', `临时目录 ${workDir} · 单图上限 ${Math.round(COMPUTE_MAX_UPLOAD_BYTES / 1048576)} MB · 任务保留 1 小时`)
   if (!status.ready) logWarn('计算端', '模型尚未就位，首次计算时会自动下载；下载进度会输出在下面')
+  // 提前把 CLIP 拉起来：首次语义请求不必等待模型下载/加载完成。
+  void semanticProvider.status().then(clip => {
+    if (clip.ready) logInfo('计算端', `CLIP 就绪 · ${clip.model.slice(0, 24)}…`)
+    else if (clip.downloading) logInfo('计算端', 'CLIP 模型正在下载，完成后自动就绪')
+    else logInfo('计算端', `CLIP 尚未就绪：${clip.message || '未知原因'}`)
+  }).catch(error => logWarn('计算端', `CLIP 初始化失败：${(error as Error).message}`))
 } catch (error) {
   logError('计算端', '启动失败', error)
   process.exit(1)

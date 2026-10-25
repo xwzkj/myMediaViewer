@@ -83,7 +83,9 @@
 | GET | `/api/ai/manga/status` | 本地漫画模型状态 |
 | POST | `/api/ai/manga/translate` | 创建漫画翻译任务 |
 | GET | `/api/ai/manga/jobs/:id` | 查询漫画任务 |
-| GET | `/api/ai/manga/cache/:key/base.png` | 漫画擦字底图 |
+| GET | `/api/ai/manga/cache/:key/overlay.png` | 漫画擦字覆盖层（透明） |
+| GET | `/api/ai/manga/cache/:key/source` | 译图底图原图（云端页兜底） |
+| GET | `/api/ai/manga/cache/:key/base.png` | 升级前的整页擦字底图（兼容旧缓存） |
 | GET/PUT | `/api/pixiv/settings` | 读取或保存 Pixiv 本地模式、账号与缓存设置 |
 | DELETE | `/api/pixiv/account` | 断开 Pixiv 账号，保留本地缓存与镜像 |
 | GET | `/api/pixiv/status` | Pixiv 账号、收藏镜像与缓存状态 |
@@ -421,7 +423,7 @@ interface SourcePreview {
 
 ### 6.3 通用 Range 与缓存行为
 
-原文件、成功生成的缩略图、兼容视频和漫画 PNG 底图使用相同的媒体输出逻辑：
+原文件、成功生成的缩略图、兼容视频和漫画覆盖层 PNG使用相同的媒体输出逻辑：
 
 | 请求头 / 响应头 | 行为 |
 | --- | --- |
@@ -705,16 +707,17 @@ results 和 failed 为空时省略，客户端可用空数组作为回退值。q
 - `width`、`height` 和 region 的 `x`、`y`、`width`、`height` 均按原图像素表示；x/y 是左上角坐标。
 - `source` 是 OCR 原文，`translation` 是译文，`detection` 是检测置信度，`confidence` 是 OCR 置信度。
 - `background`、`textColor` 为擦字底色和建议文字颜色。客户端负责依据气泡尺寸排版绘制译文，可参考 `src/manga-layout.ts`。
-- **baseUrl 返回的是擦字底图，不是已绘制译文的成品图。** 客户端需叠加 regions 中的文字。
+- **baseUrl 指向原图，overlayUrl 才是擦除结果。** 渲染顺序为：原图 → 透明覆盖层 → regions 中的译文文字。原图文件永远不被改写；旧缓存没有 `overlayUrl`，此时 `baseUrl` 直接指向升级前的整页擦字图。
+- 本地资产的 `baseUrl` 就是 `/api/assets/:id/file`；Pixiv 云页的 id 不在资产表里，此时 `baseUrl` 是 `/api/ai/manga/cache/:key/source`，按翻译时记录的原图路径返回。
 - 未识别到可翻译文本时，regions 为空，width/height 可能为 0，model 可能为空，baseUrl 回退为原媒体 URL；此时直接显示原图。
 - 缓存依据文件内容哈希、目标语言、流水线版本。更换模型、参数或流水线模式不自动使缓存失效；force 可强制重译。
 - 本地执行检测与 OCR，识别出的文本发送到 AI 上游，图片本身不发送到上游翻译接口。
 
-### 8.5 GET /api/ai/manga/cache/:key/base.png
+### 8.5 GET /api/ai/manga/cache/:key/overlay.png
 
-返回 `image/png`，支持第 6.3 节的 Range 与缓存协议。key 必须是 64 位小写十六进制，且数据库中有对应底图、文件实际存在；否则返回 404。
+返回 `image/png`，支持第 6.3 节的 Range 与缓存协议。图片与页面同尺寸，只有被擦除的像素不透明，其余 alpha 为 0；典型体积只有几十 KB。key 必须是 64 位小写十六进制，且数据库中有对应覆盖层、文件实际存在；否则返回 404。
 
-应优先使用 MangaPageResult.baseUrl，因为没有文本的结果可能指向原文件。
+升级前的整页擦字 PNG 仍可通过 `/api/ai/manga/cache/:key/base.png` 读取，供旧缓存行使用。
 
 ### 8.6 批量模式
 

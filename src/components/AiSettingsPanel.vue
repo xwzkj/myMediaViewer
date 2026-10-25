@@ -33,6 +33,7 @@ const pipelineMode = ref<AiSettings['mangaPipelineMode']>('streaming')
 const concurrency = ref(3)
 // 本地 AI 执行位置：本地主机或同一项目的远程计算端。Key 只在提交时上传，接口不回传明文。
 const computeMode = ref<LocalComputeMode>('local')
+const localThreads = ref(1)
 const computeBaseUrl = ref('')
 const computeFallback = ref<LocalComputeFallback>('error')
 const computeKeyDraft = ref('')
@@ -64,6 +65,7 @@ function apply(data: AiSettings) {
   pipelineMode.value = data.mangaPipelineMode || 'streaming'
   concurrency.value = Math.min(10, Math.max(1, data.mangaConcurrency || 3))
   computeMode.value = data.localCompute.mode === 'remote' ? 'remote' : 'local'
+  localThreads.value = data.localCompute.localThreads || 1
   computeBaseUrl.value = data.localCompute.baseUrl || ''
   computeFallback.value = data.localCompute.fallback === 'local' ? 'local' : 'error'
   computeKeyConfigured.value = Boolean(data.localCompute.apiKeyConfigured)
@@ -95,6 +97,7 @@ function buildPayload() {
   const local = current.localCompute
   const key = computeKeyDraft.value.trim()
   const localCompute: LocalComputeSettings = {
+    localThreads: Math.min(16, Math.max(1, Math.round(Number(localThreads.value) || 1))),
     mode: computeMode.value,
     baseUrl: computeBaseUrl.value.trim() || local.baseUrl,
     fallback: computeFallback.value,
@@ -282,6 +285,7 @@ function pickModel(model: string) {
             </span>
           </label>
         </div>
+        <label v-if="computeMode === 'local'" class="field">本地 ONNX 线程上限<input v-model.number="localThreads" type="number" min="1" max="16" required /><span>默认 1，给 API 和媒体读取预留算力。E3-1226 v3 等 CPU 主机建议 1–2；后台一次处理一项，并通过来源占空比休息。远程回退沿用已保存限制。</span></label>
         <template v-if="computeMode === 'remote'">
           <label class="field">远程 API 地址<input v-model="computeBaseUrl" placeholder="http://192.168.1.10:3211" spellcheck="false" autocomplete="off" /><span>填写计算端的基础地址，默认端口 3211。</span></label>
           <label class="field">API Key

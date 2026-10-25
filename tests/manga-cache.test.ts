@@ -23,7 +23,7 @@ const { saveAiSettings } = await import('../server/ai.js')
 const { db } = await import('../server/database.js')
 const { ComicTextDetector } = await import('../server/ai/manga/detector.js')
 const { MangaOcrRecognizer } = await import('../server/ai/manga/recognizer.js')
-const { startMangaTranslation, getMangaJob, getAutoMangaTranslation } = await import('../server/ai/manga/service.js')
+const { startMangaTranslation, getMangaJob, getAutoMangaTranslation, runBackgroundMangaAsset } = await import('../server/ai/manga/service.js')
 
 after(() => db.close())
 
@@ -110,8 +110,8 @@ test('译图自动查询只做 stat，不重复读取原图', async t => {
     const afterRow = db.prepare('SELECT content_hash FROM manga_asset_cache WHERE asset_id = ?').get(asset.id) as { content_hash: string }
     assert.match(afterRow.content_hash, /^[a-f0-9]{64}$/)
     assert.notEqual(afterRow.content_hash, before.content_hash)
-    const imagePath = db.prepare('SELECT image_path FROM manga_translations WHERE key = ?').get(forced.result!.key) as { image_path: string }
-    assert.ok(existsSync(imagePath.image_path))
+    const imagePath = db.prepare('SELECT overlay_path FROM manga_translations WHERE key = ?').get(forced.result!.key) as { overlay_path: string }
+    assert.ok(existsSync(imagePath.overlay_path))
   })
 
   await t.test('流式模式不会因为重复排队而卡住', async () => {
@@ -122,4 +122,78 @@ test('译图自动查询只做 stat，不重复读取原图', async t => {
     assert.equal(job.state, 'ready')
     assert.equal(job.result?.regions[0]?.translation, '你好')
   })
+})
+
+test('OCR 预热只缓存识别结果，后续翻译只补一次请求', async t => {
+  saveAiSettings({
+    baseUrl: 'https://example.com/v1', apiKey: 'test', model: 'test-model',
+    targetLanguage: '简体中文', mangaPipelineMode: 'sequential', mangaAutoShowTranslated: true,
+  })
+  t.mock.getter(ComicTextDetector.prototype, 'isLoaded', () => true)
+  t.mock.getter(MangaOcrRecognizer.prototype, 'isLoaded', () => true)
+  const detect = t.mock.method(ComicTextDetector.prototype, 'detect', async () => ({
+    pageWidth: 60, pageHeight: 80, textMask: null,
+    boxes: [{ cx: 30, cy: 40, width: 24, height: 30, confidence: 0.99, classId: 0 }],
+  }))
+  t.mock.method(MangaOcrRecognizer.prototype, 'recognizeBatch', async () => [{ text: 'こんにちは', confidence: 0.99 }])
+  const fetchMock = t.mock.method(globalThis, 'fetch', async () =>
+    Response.json({ choices: [{ message: { content: JSON.stringify({ translations: ['你好'] }) } }] }))
+
+  const asset = await makeAsset('prewarm')
+  // 换成唯一配色的同尺寸图片：缓存 key 只由内容决定，避免命中其它用例的白色底图。
+  await sharp({ create: { width: 60, height: 80, channels: 3, background: '#778899' } }).png().toFile(asset.path)
+  const warm = await runBackgroundMangaAsset(asset, { translate: false })
+  assert.equal(warm.model, 'OCR 预热')
+  assert.equal(warm.regions.length, 1)
+  assert.equal(warm.regions[0]?.translation, '', '预热结果不能填译文')
+  assert.equal(fetchMock.mock.callCount(), 0, '预热不应产生任何翻译费用')
+
+  await t.test('预热结果不会被自动显示当成已翻译缓存', () => {
+    const translations = db.prepare('SELECT COUNT(*) AS n FROM manga_translations WHERE key = ?').get(warm.key) as { n: number }
+    assert.equal(translations.n, 0, '预热结果不写译文表')
+    const prepared = db.prepare('SELECT overlay_path FROM manga_prepared_pages WHERE key = ?').get(warm.key) as { overlay_path: string } | undefined
+    assert.ok(prepared && existsSync(prepared.overlay_path))
+  })
+
+  await t.test('自动显示返回 null，随后翻译复用预热只补一次网络请求', async () => {
+    assert.equal(await getAutoMangaTranslation(asset), null)
+    const detectCalls = detect.mock.callCount()
+    let billed = 0
+    const translated = await runBackgroundMangaAsset(asset, { translate: true, beforeTranslate: () => { billed++ } })
+    assert.equal(billed, 1, '每次真实翻译请求只预留一次预算')
+    assert.equal(fetchMock.mock.callCount(), 1)
+    assert.equal(detect.mock.callCount(), detectCalls, '复用预热结果时不应重新检测')
+    assert.equal(translated.model, 'test-model')
+    assert.equal(translated.regions[0]?.translation, '你好')
+    const auto = await getAutoMangaTranslation(asset)
+    assert.equal(auto?.cached, true)
+    assert.equal(auto?.regions[0]?.translation, '你好')
+  })
+})
+
+test('不在资产表里的云端页用 source 路由兜底底图', async t => {
+  saveAiSettings({
+    baseUrl: 'https://example.com/v1', apiKey: 'test', model: 'test-model',
+    targetLanguage: '简体中文', mangaPipelineMode: 'sequential',
+  })
+  t.mock.getter(ComicTextDetector.prototype, 'isLoaded', () => true)
+  t.mock.getter(MangaOcrRecognizer.prototype, 'isLoaded', () => true)
+  t.mock.method(ComicTextDetector.prototype, 'detect', async () => ({
+    pageWidth: 60, pageHeight: 80, textMask: null,
+    boxes: [{ cx: 30, cy: 40, width: 24, height: 30, confidence: 0.99, classId: 0 }],
+  }))
+  t.mock.method(MangaOcrRecognizer.prototype, 'recognizeBatch', async () => [{ text: 'こんにちは', confidence: 0.99 }])
+  t.mock.method(globalThis, 'fetch', async () =>
+    Response.json({ choices: [{ message: { content: JSON.stringify({ translations: ['你好'] }) } }] }))
+
+  // Pixiv 云页的 id 形如 pixiv:<illust>:<page>，不在 assets 表里，
+  // 因此 /api/assets/:id/file 必然 404，底图必须走按 key 记录原图路径的路由。
+  const asset = await makeAsset('cloud-page')
+  await sharp({ create: { width: 60, height: 80, channels: 3, background: '#223344' } }).png().toFile(asset.path)
+  const cloud = { ...asset, id: 'pixiv:123456:0', workId: 'pixiv:123456', filename: '123456_p0.png' }
+  const job = await finished((await startMangaTranslation(cloud)).id)
+  assert.equal(job.state, 'ready')
+  const result = job.result!
+  assert.equal(result.baseUrl, `/api/ai/manga/cache/${result.key}/source`)
+  assert.equal(result.overlayUrl, `/api/ai/manga/cache/${result.key}/overlay.png`)
 })

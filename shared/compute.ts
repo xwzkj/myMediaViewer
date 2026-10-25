@@ -2,14 +2,14 @@
  * 远程计算端的稳定协议。
  *
  * 主服务（家庭服务器）把一张原图交给计算端，计算端只做本地 AI：检测 → OCR →
- * 阅读顺序整理 → 擦字 → 底图编码。在线翻译始终留在主服务，计算端不接触媒体库、
+ * 阅读顺序整理 → 擦字 → 覆盖层编码。在线翻译始终留在主服务，计算端不接触媒体库、
  * SQLite 或任何在线 AI 凭据。
  *
- * 所有接口都要求 `Authorization: Bearer <key>`，包括状态、结果与底图。
+ * 所有接口都要求 `Authorization: Bearer <key>`，包括状态、结果与覆盖层。
  */
 
 /** 协议版本。字段含义变化时必须递增，主服务只接受同版本的计算端。 */
-export const COMPUTE_PROTOCOL_VERSION = 1
+export const COMPUTE_PROTOCOL_VERSION = 2
 
 /** 计算端默认端口，避免和主服务的 3210 冲突。 */
 export const COMPUTE_DEFAULT_PORT = 3211
@@ -64,9 +64,9 @@ export interface ComputeJobResult {
   width: number
   height: number
   regions: ComputeRegion[]
-  /** 底图字节数与摘要；没有可翻译文本时都为 0 / 空串。 */
-  baseBytes: number
-  baseSha256: string
+  /** 透明擦字覆盖层的字节数与摘要；没有可翻译文本时都为 0 / 空串。 */
+  overlayBytes: number
+  overlaySha256: string
   /** 实际使用的模型/设备描述，便于任务日志排查。 */
   engine: string
   pipelineVersion: number
