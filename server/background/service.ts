@@ -217,6 +217,20 @@ function pickTask(kinds: BackgroundTaskKind[]): { source: (typeof sources)[numbe
 
 const taskLabel = (task: Task) => task.kind === 'semantic' ? 'CLIP 索引' : task.kind === 'translate' ? '自动翻译' : 'OCR 预热'
 
+/** 只影响当前这一页、重试也不会成功的错误：不要因此暂停整个来源。 */
+const ASSET_FAILURE_CODES = new Set([
+  'image_too_large', 'too_many_regions', 'invalid_image',
+  'semantic_image_too_large', 'semantic_invalid_image', 'semantic_asset_unavailable', 'semantic_asset_changed',
+  'unsupported',
+])
+function assetSpecificFailure(error: unknown): boolean {
+  const value = error as { code?: unknown; statusCode?: unknown; message?: unknown }
+  if (typeof value?.code === 'string' && ASSET_FAILURE_CODES.has(value.code)) return true
+  if (typeof value?.message === 'string' && value.message === 'unsupported') return true
+  // 413/422 通常由这一页的像素、格式或识别结果触发；换下一页即可继续。
+  return Number(value?.statusCode) === 413 || Number(value?.statusCode) === 422
+}
+
 /**
  * 启动一轮后台任务。
  *
@@ -315,7 +329,9 @@ async function runBackgroundTask(
     if (state === 'failed') logError('后台', `失败 ${taskLabel(task)} · ${(error as Error).message}`)
     else if (downloading) logInfo('后台', 'CLIP 模型正在下载/加载，任务稍后自动重试')
     else logWarn('后台', `暂缓任务 · ${(error as Error).message}`)
-    blockedUntil.set(task.source_id, Date.now() + 60000)
+    // 单页资源超限/格式损坏只标记这一页失败，立即补位；连接、鉴权、预算或
+    // 配置问题才让整个来源退避 60 秒，避免反复撞同一个错误。
+    if (!assetSpecificFailure(error)) blockedUntil.set(task.source_id, Date.now() + 60000)
   } finally {
     activeTasks.delete(task.id)
     if (usedLocal) duty = settings.localDutyPercent
