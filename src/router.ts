@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory, START_LOCATION } from 'vue-router'
 import { createSearchSessionId } from './route-cache-key'
+import { readLibraryState } from './library-state'
 
 const LibraryView = () => import('./views/LibraryView.vue')
 const SettingsPage = () => import('./views/SettingsPage.vue')
@@ -7,14 +8,10 @@ const WorkPage = () => import('./views/WorkPage.vue')
 const PixivUserPage = () => import('./views/PixivUserPage.vue')
 
 function restoreLastPage() {
-  try {
-    const saved: unknown = JSON.parse(localStorage.getItem('libraryState') || '{}')
-    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return { name: 'library' }
-    const state = saved as Record<string, unknown>
-    const source = typeof state.source === 'string' ? state.source : ''
-    if (state.view === 'favorites') return { name: 'favorites', query: source ? { source } : {} }
-    if (source) return { name: 'source', params: { sourceId: source } }
-  } catch { /* 状态损坏时回到全部作品 */ }
+  // 上次浏览的媒体库/收藏/来源由服务端记忆。
+  const state = readLibraryState('works')
+  if (state.view === 'favorites') return { name: 'favorites', query: state.source ? { source: state.source } : {} }
+  if (state.source) return { name: 'source', params: { sourceId: state.source } }
   return { name: 'library' }
 }
 

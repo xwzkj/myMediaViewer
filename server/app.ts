@@ -29,6 +29,8 @@ import { getAiSettings, saveAiSettings, testAiConnection, listAiModels, translat
 import { getAutoMangaTranslation, getMangaJob, getMangaModelStatus, mangaBaseImagePath, mangaOverlayPath, mangaSourcePath, startMangaTranslation, clearMangaStatusCache } from './ai/manga/service.js'
 import { checkRemoteCompute } from './ai/manga/remote.js'
 import { libraryRevision, markLibraryChanged } from './library-revision.js'
+import { readStoredLibraryState, saveStoredLibraryStateScope } from './library-state-store.js'
+import { isLibraryScope } from '../shared/library-state.js'
 import { debugLogging, logApi, logError, logInfo, setLoggingEnabled } from './log.js'
 import { registerPixivRoutes } from './pixiv/routes.js'
 import { getPixivRuntime } from './pixiv/auth.js'
@@ -125,6 +127,16 @@ export async function createApp(logging = true, semanticProvider?: SemanticProvi
       addresses: Object.values(networkInterfaces()).flat().filter(i => i && i.family === 'IPv4' && !i.internal).map(i => `http://${i!.address}:${port}`),
       publicAccess: allowPublicAccess,
     }
+  })
+  // 筛选/排序记忆：服务端持久化，浏览器清理站点数据或换设备后仍能恢复。
+  app.get('/api/library-state', async (_request, reply) => {
+    reply.header('Cache-Control', 'no-store')
+    return readStoredLibraryState()
+  })
+  app.put<{ Params: { scope: string }; Body: unknown }>('/api/library-state/:scope', async (request, reply) => {
+    const { scope } = request.params
+    if (!isLibraryScope(scope)) return reply.code(400).send({ message: '未知的筛选状态类型' })
+    return { scope, state: saveStoredLibraryStateScope(scope, request.body) }
   })
   app.post('/api/scan', async (_request, reply) => {
     if (scanStatus.running) return reply.code(409).send({ message: '正在扫描，请稍候' })

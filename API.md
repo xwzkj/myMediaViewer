@@ -58,6 +58,8 @@
 | 方法 | 路径 | 功能 |
 | --- | --- | --- |
 | GET | `/api/status` | 媒体库、扫描及网络状态 |
+| GET | `/api/library-state` | 读取服务端筛选/排序记忆 |
+| PUT | `/api/library-state/:scope` | 保存单个 scope 的筛选/排序记忆 |
 | POST | `/api/scan` | 触发扫描 |
 | GET | `/api/directories` | 浏览服务端目录 |
 | GET | `/api/source-presets` | 获取可编辑 Pixiv / Telegram 预设 |
@@ -337,6 +339,37 @@ interface SourcePreview {
 最多枚举 5000 个文件、返回 20 组。所有分组初始都无 `result/error`；预览只编译校验脚本，不执行模块顶层或 extract，不读取元文件内容。预览只读，不写配置/缓存/索引。无效配置返回 400；正在扫描或已有预览返回 409。仅为样本，不承诺未预览文件可以成功处理。
 
 全来源作品 ID 保持 `${sourceId}:${id}`；子目录隔离 ID 为 `v2:` 加 `[sourceId, directory, id]` 的 JSON 编码。客户端应将 ID 视为不透明字符串，并在 URL 路径中编码。改变分组 ID/范围可能改变作品身份，收藏不做猜测迁移。
+
+### 4.10 GET /api/library-state 与 PUT /api/library-state/:scope
+
+筛选、排序和推荐来源等浏览偏好保存在服务端 SQLite 的 `library_state` 表，浏览器清理站点数据、换浏览器或换设备后仍可恢复。前端启动时读取一次；修改后按 scope 去抖写回。
+
+`GET /api/library-state` 返回完整偏好对象，缺失的 scope 使用默认值：
+
+```ts
+interface LibraryStateResponse {
+  works: {
+    view: 'library' | 'favorites'; source: string; kind: '' | 'image' | 'video';
+    fuzzy: boolean; sort: 'newest' | 'oldest' | 'title' | 'random';
+    order: 'collected' | 'published'; seed: string;
+  };
+  localSearch: {
+    source: string; kind: '' | 'image' | 'video'; fuzzy: boolean;
+    semantic: boolean; // 画面语义开关；只在本地搜索结果页可见
+    sort: 'relevance' | 'newest' | 'oldest' | 'title' | 'random';
+    order: 'collected' | 'published'; seed: string;
+  };
+  cloudSearch: {
+    sort: 'popular_preview' | 'date_desc' | 'date_asc';
+    target: 'partial_match_for_tags' | 'exact_match_for_tags' | 'title_and_caption' | 'keyword';
+    entity: 'works' | 'users';
+  };
+  cloudFavorites: { restrict: 'public' | 'private' };
+  recommendation: { source: 'local' | 'cloud' };
+}
+```
+
+`PUT /api/library-state/:scope` 的 `:scope` 取上述五个键之一，请求体通常为该 scope 的完整对象；缺失字段按默认值归一化。字段会按上表归一化：非法枚举、错误类型和 `pixiv:` 云端收藏来源不会写入。200 返回 `{ scope, state }`，其中 `state` 是落库后的归一化值；未知 scope 返回 400。单个 scope 的损坏记录在读取时回退默认值，不影响其它 scope。
 
 ## 5. 作品与搜索
 

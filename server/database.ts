@@ -23,6 +23,8 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS group_metadata_cache (key TEXT PRIMARY KEY, stamp TEXT NOT NULL, data TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS metadata_cache (path TEXT PRIMARY KEY, stamp TEXT NOT NULL, data TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS translations (key TEXT PRIMARY KEY, data TEXT NOT NULL, created INTEGER NOT NULL);
+  -- UI filter/sort memory is server-side so it survives clearing site data and works across browsers.
+  CREATE TABLE IF NOT EXISTS library_state (scope TEXT PRIMARY KEY, data TEXT NOT NULL, updated INTEGER NOT NULL);
   -- CLIP vectors are model-specific, little-endian Float32 blobs (512 dimensions).
   -- Keep across unchanged rescans; stale/deleted assets are excluded by the semantic store.
   CREATE TABLE IF NOT EXISTS semantic_embeddings (

@@ -13,7 +13,7 @@ import { usePageRoute } from '../use-page-route'
 import { createMirrorUpdateTracker } from '../mirror-update-tracker'
 import { watchLibraryMemory } from '../library-memory'
 import { releaseLibrarySession, retainLibrarySession, setLibraryLoader, syncLibrarySession, getLibrarySession } from '../library-session'
-import { asCloudSearchEntity, migrateLegacyLibraryState, readLibraryState, writeLibraryState, type CloudSearchEntity, type LibraryWorksState, type LocalSearchState, type SearchSource } from '../library-state'
+import { asCloudSearchEntity, readLibraryState, writeLibraryState, type CloudSearchEntity, type LibraryWorksState, type LocalSearchState, type SearchSource } from '../library-state'
 import Icon from '../components/Icon.vue'
 import AppSelect from '../components/AppSelect.vue'
 import AppNotice from '../components/AppNotice.vue'
@@ -40,7 +40,6 @@ let pendingScrollToken = 0
 const savedScrollY = ref(readSavedScroll())
 const status = ref<LibraryStatus | null>(null)
 // 媒体库、本地搜索、云搜索分别记忆；搜索排序不得再覆盖媒体库排序。
-migrateLegacyLibraryState()
 const initialWorks = readLibraryState('works')
 const view = ref<'library' | 'favorites'>(initialWorks.view)
 const source = ref(initialWorks.source.startsWith('pixiv:') ? '' : initialWorks.source)
@@ -60,7 +59,7 @@ const seed = ref(initialWorks.seed || String(Date.now()))
 // 排序依据：收藏时间（文件名开头的 bmk_id）或发布时间，默认按收藏顺序。
 const order = ref(initialWorks.order)
 const fuzzy = ref(initialWorks.fuzzy)
-// Semantic mode belongs to the search URL, never to the cloud/settings preferences.
+// 语义开关属于本地搜索页的筛选条件：只由 /search 路由显式值或服务端记忆决定。
 const semantic = ref(false)
 const semanticStatus = ref<SemanticSearchStatus | null>(null)
 const searchSource = ref<SearchSource>('local')
@@ -589,12 +588,13 @@ function openAuthor(work: Work) {
   }
   void pushPage(router, { name: 'cloudUser', params: { userId }, query: { from: route.value.fullPath } })
 }
-function routeFilters(extra: Record<string, string> = {}) {
+function routeFilters(extra: Record<string, string>, semanticMode = semantic.value) {
   const next: Record<string, string> = { ...extra }
   if (source.value && !source.value.startsWith('pixiv:')) next.source = source.value
   if (kind.value) next.kind = kind.value
-  if (semantic.value) next.semantic = 'true'
-  else if (fuzzy.value) next.fuzzy = 'true'
+  // 本地搜索 URL 始终写明确的 true/false：缺省表示旧链接，由 applyRoute 回退到服务端记忆。
+  next.semantic = semanticMode ? 'true' : 'false'
+  if (!semanticMode && fuzzy.value) next.fuzzy = 'true'
   if (sort.value && sort.value !== 'newest') next.sort = sort.value
   if (order.value === 'published') next.by = 'published'
   if (seed.value) next.seed = seed.value
@@ -610,9 +610,12 @@ function searchTarget(value: string, target: SearchSource = 'local') {
     writeLibraryState('cloudSearch', { sort: cloudSort.value, target: cloudTarget.value, entity })
     return { name: 'cloudSearch' as const, query: { q: value, sort: cloudSort.value, target: cloudTarget.value, entity, sid } }
   }
-  const next = routeFilters({ q: value })
-  if (semantic.value) next.sort = 'relevance'
-  else if (route.value.name !== 'search') next.sort = readLibraryState('localSearch').sort
+  const memory = readLibraryState('localSearch')
+  // 在搜索页沿用当前开关；从媒体库/收藏发起搜索时沿用服务端记住的上一次选择。
+  const semanticMode = route.value.name === 'search' ? semantic.value : memory.semantic
+  const next = routeFilters({ q: value }, semanticMode)
+  if (semanticMode) next.sort = 'relevance'
+  else if (route.value.name !== 'search') next.sort = memory.sort
   next.sid = sid
   if (view.value === 'favorites') next.favorites = 'true'
   return { name: 'search' as const, query: next }
@@ -638,6 +641,8 @@ function toggleSemantic() {
   semantic.value = !semantic.value
   closeSuggestions()
   if (semantic.value) { fuzzy.value = false; sort.value = 'relevance' }
+  // 空关键词时不会提交新路由，这里显式落一次记忆；有路由变化时 watchLibraryMemory 会再归一化保存。
+  if (localSearchMode.value) writeLibraryState('localSearch', { ...readLibraryState('localSearch'), semantic: semantic.value })
   if (query.value.trim()) submitSearch()
 }
 function switchSearchMode() {
@@ -679,7 +684,7 @@ function applyRouteDraft() {
 }
 function applyRoute() {
   const name = String(route.value.name || '')
-  semantic.value = name === 'search' && route.value.query.semantic === 'true'
+  semantic.value = false
   pagePath.value = route.value.fullPath
   if (name === 'cloudSearch') {
     const memory = readLibraryState('cloudSearch')
@@ -707,6 +712,11 @@ function applyRoute() {
   }
   if (name === 'search') {
     const memory = readLibraryState('localSearch')
+    // 显式 true/false 优先；旧链接没有 semantic 时用服务端记住的开关。
+    const semanticParam = route.value.query.semantic
+    semantic.value = semanticParam === 'true' ? true : semanticParam === 'false' ? false : memory.semantic
+    // URL 显式指定时把这次选择记为最新偏好；旧链接缺参数则只读记忆。
+    if (semanticParam === 'true' || semanticParam === 'false') writeLibraryState('localSearch', { ...memory, semantic: semantic.value })
     searchSource.value = 'local'
     view.value = route.value.query.favorites === 'true' ? 'favorites' : 'library'
     source.value = typeof route.value.query.source === 'string' ? route.value.query.source : memory.source
@@ -762,6 +772,8 @@ function resetFilters() {
   source.value = ''
   kind.value = ''
   fuzzy.value = false
+  // 即将离开搜索页，先显式落库，避免保存回调按新路由把开关状态记到错误的 scope。
+  if (localSearchMode.value) writeLibraryState('localSearch', { ...readLibraryState('localSearch'), semantic: false })
   if (route.value.name === 'search' || route.value.name === 'cloudSearch' || route.value.name === 'source' || route.value.name === 'cloudFavorites') void replacePage(router, { name: view.value === 'favorites' ? 'favorites' : 'library' }, route.value)
 }
 function retryLoadMore() { loadMore(true) }
@@ -780,7 +792,7 @@ watch([view, source, kind, sort, fuzzy, semantic, order, seed, cloudSort], () =>
   queueLoadWorks()
 })
 watchLibraryMemory(
-  () => ({ view: view.value, source: source.value, kind: kind.value, fuzzy: fuzzy.value, order: order.value, seed: seed.value, sort: sort.value }),
+  () => ({ view: view.value, source: source.value, kind: kind.value, fuzzy: fuzzy.value, semantic: semantic.value, order: order.value, seed: seed.value, sort: sort.value }),
   () => route.value.fullPath,
   () => pageActive.value,
   state => {
@@ -1077,7 +1089,7 @@ onUnmounted(() => {
         <Transition v-if="!isUserEntity" name="menu-pop"><div v-if="menuOpen" ref="menu" class="filter-menu" role="dialog" aria-label="筛选与排序">
           <div v-if="!cloudSearchMode && !cloudFavoritesMode && sourceOptions.length > 0" class="menu-row"><span>来源</span><AppSelect v-model="source" compact label="筛选媒体来源" :options="[{ value: '', label: '全部来源' }, ...sourceOptions.map(item => ({ value: item.id, label: item.name }))]" /></div>
           <div v-if="!isUserEntity" class="menu-row"><span>媒体类型</span><div class="menu-chips"><button v-for="filter in filters" :key="filter.id" class="filter-chip" :class="{ active: kind === filter.id }" :aria-pressed="kind === filter.id" @click="kind = filter.id"><Icon :name="kind === filter.id ? 'check' : filter.icon" :size="18" />{{ filter.label }}</button></div></div>
-          <label v-if="searchSource === 'local'" class="menu-row"><span title="中文与英文画面描述都可用；索引由后台按来源建立">画面语义（中文/英文）</span><span class="fuzzy-toggle"><input type="checkbox" :checked="semantic" @change="toggleSemantic" /><span class="mini-switch" /><span>{{ semantic ? '已开启' : '已关闭' }}</span></span></label>
+          <label v-if="localSearchMode" class="menu-row"><span title="中文与英文画面描述都可用；索引由后台按来源建立">画面语义（中文/英文）</span><span class="fuzzy-toggle"><input type="checkbox" :checked="semantic" @change="toggleSemantic" /><span class="mini-switch" /><span>{{ semantic ? '已开启' : '已关闭' }}</span></span></label>
           <label v-if="!cloudSearchMode && !semantic" class="menu-row"><span>模糊匹配</span><span class="fuzzy-toggle"><input v-model="fuzzy" type="checkbox" /><span class="mini-switch" /><span>{{ fuzzy ? '已开启' : '已关闭' }}</span></span></label>
           <div v-if="cloudSearchMode && !isUserEntity" class="menu-row"><span>匹配规则</span><AppSelect v-model="cloudTarget" compact label="云搜索匹配规则" :options="pixivSearchTargets" /></div>
           <div class="menu-row"><span>排序方式</span><AppSelect v-if="cloudSearchMode && !isUserEntity" v-model="cloudSort" compact label="云搜索排序" :options="[{ value: 'popular_preview', label: '热度预览' }, { value: 'date_desc', label: '最新优先' }, { value: 'date_asc', label: '最早优先' }]" /><AppSelect v-else-if="!isUserEntity" v-model="sort" compact label="排序方式" :options="localSortOptions" /></div>
