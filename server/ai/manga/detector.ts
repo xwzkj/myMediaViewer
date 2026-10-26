@@ -1,6 +1,6 @@
 import * as ort from 'onnxruntime-node'
-import sharp from 'sharp'
 import type { DetectionBox, DetectionResult, TextMask } from './types.js'
+import { pageSharp, pageSize, type PageImage } from './page.js'
 
 /**
  * dmMaze/comic-text-detector，跑在 ONNX Runtime 上。
@@ -64,19 +64,17 @@ export class ComicTextDetector {
   }
 
   /**
-   * @param imagePath 任意尺寸的图片；内部 letterbox 到 1024²
-   * @returns boxes 已反变换回原图坐标；textMask 与原图等大
+   * @param image 任意尺寸的图片或已解码整页；内部 letterbox 到 1024²
+   * @returns boxes 已反变换回工作图坐标；textMask 与工作图等大
    */
-  async detect(imagePath: string): Promise<DetectionResult & { pageWidth: number; pageHeight: number }> {
+  async detect(image: PageImage): Promise<DetectionResult & { pageWidth: number; pageHeight: number }> {
     const session = this.session
     if (!session) throw new Error('CTD 模型未加载')
 
-    const meta = await sharp(imagePath, { limitInputPixels: 500_000_000 }).metadata()
-    const pageWidth = meta.width ?? 0
-    const pageHeight = meta.height ?? 0
-    if (!pageWidth || !pageHeight) throw new Error(`无法读取图片尺寸：${imagePath}`)
+    const { width: pageWidth, height: pageHeight } = await pageSize(image)
+    if (!pageWidth || !pageHeight) throw new Error('无法读取图片尺寸')
 
-    const input = await letterboxToTensor(imagePath, pageWidth, pageHeight)
+    const input = await letterboxToTensor(image, pageWidth, pageHeight)
     const outputs = await session.run({
       [this.inputName]: new ort.Tensor('float32', input, [BATCH, 3, INPUT_SIZE, INPUT_SIZE]),
     })
@@ -129,11 +127,11 @@ function isSegShape(meta: readonly ort.InferenceSession.ValueMetadata[], name: s
  * letterbox 到 1024² 并转 NCHW float32。
  * padding 靠 Float32Array 初始化为 0 天然实现黑色填充，只把缩放后的像素写进左上角。
  */
-async function letterboxToTensor(imagePath: string, pageWidth: number, pageHeight: number): Promise<Float32Array> {
+async function letterboxToTensor(image: PageImage, pageWidth: number, pageHeight: number): Promise<Float32Array> {
   const scale = Math.min(INPUT_SIZE / pageWidth, INPUT_SIZE / pageHeight)
   const newW = Math.max(1, Math.floor(pageWidth * scale))
   const newH = Math.max(1, Math.floor(pageHeight * scale))
-  const { data, info } = await sharp(imagePath, { limitInputPixels: 500_000_000 })
+  const { data, info } = await pageSharp(image)
     .resize(newW, newH, { fit: 'fill' })
     .removeAlpha()
     .toColourspace('srgb')

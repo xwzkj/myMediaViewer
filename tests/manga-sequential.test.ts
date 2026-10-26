@@ -1,7 +1,7 @@
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, existsSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { setImmediate as nextTurn } from 'node:timers/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -48,7 +48,11 @@ test('逐页模式复用识别和回填，保持串行、缓存、空页和失�
     beforeDetect?.()
     events.push(`detect:${path.basename(imagePath)}`)
     if (imagePath === failPath) throw new Error('模拟识别失败')
-    return { pageWidth: imagePath === changedSizePath ? 81 : 80, pageHeight: 100, textMask: null, boxes: empty ? [] : [
+    // 模拟检测后原图被替换：擦字重新解码时会发现尺寸和检测时不一致。
+    if (imagePath === changedSizePath) {
+      await sharp({ create: { width: 81, height: 100, channels: 3, background: '#ffffff' } }).png().toFile(imagePath)
+    }
+    return { pageWidth: 80, pageHeight: 100, textMask: null, boxes: empty ? [] : [
       { cx: 40, cy: 50, width: 30, height: 40, confidence: 0.99, classId: 0 },
     ] }
   })
@@ -181,5 +185,6 @@ test('逐页模式复用识别和回填，保持串行、缓存、空页和失�
       assert.deepEqual(job.results?.map(item => item.assetId), [second.id])
     }
     assert.match(finalizeFailed.failed![0]!.message, /图片尺寸在检测后发生变化/)
+    await writeFile(first.path, originals.get('first')!)
   })
 })

@@ -73,7 +73,7 @@ POST /v1/semantic/text   application/json {query:string}
 POST /v1/semantic/image  application/octet-stream <图片字节>
 ```
 
-所有接口都要求已有的 Bearer Key；编码请求还必须带上状态响应里的 `x-semantic-model`。响应为 `{model,dimensions:512,vector:number[512]}`。上传沿用 128 MB 上限与 4000 万像素解码上限；同一时刻只允许一个语义操作（繁忙时返回 429）。
+所有接口都要求已有的 Bearer Key；编码请求还必须带上状态响应里的 `x-semantic-model`。响应为 `{model,dimensions:512,vector:number[512]}`。上传沿用 128 MB 上限与 1 亿像素解码上限；同一时刻只允许一个语义操作（繁忙时返回 429）。
 
 每次远程操作都会先做鉴权的 `GET /v1/status` 健康检查。健康检查失败一律视为离线，不再发送任何语义请求；只有现有策略为 `local` 时才回退，否则返回不可用。基础健康检查通过后，语义路由缺失/状态异常或传输失败也允许按配置回退本地。进行中的失败只有在本地模型哈希完全一致时才允许回退；语义路由鉴权失败、模型不匹配、向量非法与输入被拒绝都不会静默回退。任何响应都不暴露远程凭据。没有语义路由的旧计算端会得到确定性的「不可用」结果。
 

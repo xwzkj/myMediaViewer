@@ -22,11 +22,19 @@ export class RemoteClipProvider implements SemanticProvider {
     try {
       const response = await fetch(url, { ...init, redirect: 'error', headers: { ...init?.headers, authorization: `Bearer ${this.config.apiKey}` }, signal: AbortSignal.timeout(init ? this.config.timeoutMs : this.config.connectTimeoutMs) })
       if (!response.ok) {
-        await response.body?.cancel()
+        const failure = await response.json().catch(() => null) as { code?: unknown; message?: unknown } | null
+        const code = typeof failure?.code === 'string' ? failure.code : ''
+        const message = typeof failure?.message === 'string' ? failure.message : ''
         if (response.status === 409) throw new SemanticError('semantic_model_mismatch', '本地与远程 CLIP 模型不匹配，请重新建立对应模型的索引', 409)
         if (response.status === 401 || response.status === 403) throw new SemanticError('semantic_remote_unauthorized', '远程语义计算端 API Key 无效或访问被拒绝', 503)
         if (response.status === 429) throw new SemanticError('semantic_busy', '远程语义计算端繁忙，请稍后重试', 429)
-        if (response.status < 500 && response.status !== 404) throw new SemanticError('semantic_remote_rejected', '远程语义计算端拒绝请求，请检查输入', 400)
+        // 图片本身超过上限是单页问题，保留具体原因，后台不会把它当成服务离线而整源退避。
+        if (response.status === 413 || code === 'semantic_image_too_large') {
+          throw new SemanticError('semantic_image_too_large', message || '图片超过语义索引像素上限', 413)
+        }
+        if (response.status < 500 && response.status !== 404) {
+          throw new SemanticError(code || 'semantic_remote_rejected', message || '远程语义计算端拒绝请求，请检查输入', response.status)
+        }
         throw new SemanticError('semantic_remote_unavailable', '远程计算端没有可用的 CLIP 语义编码服务', 503)
       }
       const reader = response.body?.getReader()

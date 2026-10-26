@@ -6,6 +6,9 @@ import { eraseTranslatedRegions } from './erase.js'
 import { judgeRegion, mangaReadingOrder, trimTrailingNoise } from './pipeline.js'
 import { boxToRect, paddedRect, type OcrRegion } from './types.js'
 import {
+  MAX_SOURCE_PIXELS, encodeOverlayPng, pageSharp, planPageScale, scaleRectToSource, type PageImage,
+} from './page.js'
+import {
   decoderModel, detectorModel, encoderFp16Model, ensureMangaModels, hasModel,
   missingModels, modelPath, vocabModel,
 } from './models.js'
@@ -23,8 +26,7 @@ import { logInfo } from '../../log.js'
 
 /** 结果缓存版本。改动识别、擦字或输出语义时递增，让旧缓存自然失效。 */
 export const PIPELINE_VERSION = 2
-/** 单页像素上限。超出时返回可解释的错误，避免异常扫描件耗尽内存。 */
-export const MAX_PAGE_PIXELS = 40_000_000
+export { MAX_PAGE_PIXELS, MAX_SOURCE_PIXELS } from './page.js'
 /** 单页最多识别的文本区域。超出时明确报错，不静默丢掉文字。 */
 export const MAX_REGIONS = 80
 
@@ -165,6 +167,9 @@ export class MangaEngine {
   /**
    * 处理一页：检测、OCR、整理阅读顺序、擦字、编码底图。
    *
+   * 超过工作分辨率上限的页面会先等比缩小，检测/OCR/擦字都在缩小后的页面完成；
+   * 返回前把区域坐标和擦字覆盖层缩放回原图尺寸，前端与缓存不需要特殊处理。
+   *
    * @param imagePath 原图路径；调用方负责确认它在允许的媒体目录内。
    */
   async process(imagePath: string, setStage: (stage: string) => void = () => {}): Promise<EnginePage> {
@@ -173,31 +178,51 @@ export class MangaEngine {
 
     let metadata: sharp.Metadata
     try {
-      metadata = await sharp(imagePath, { limitInputPixels: MAX_PAGE_PIXELS * 4 }).metadata()
+      // metadata 只读文件头；不能用像素上限拦截，否则超大图会先得到含糊的解码错误。
+      metadata = await sharp(imagePath, { limitInputPixels: false }).metadata()
     } catch {
       throw new MangaEngineError('无法读取这张图片，可能已损坏或不是支持的图片格式', 422, 'invalid_image')
     }
     const width = metadata.width ?? 0
     const height = metadata.height ?? 0
     if (!width || !height) throw new MangaEngineError(`无法读取图片尺寸：${path.basename(imagePath)}`, 422, 'invalid_image')
-    if (width * height > MAX_PAGE_PIXELS) {
+    const sourcePixels = width * height
+    if (sourcePixels > MAX_SOURCE_PIXELS) {
       throw new MangaEngineError(
-        `这张图有 ${((width * height) / 1_000_000).toFixed(1)} MP，超过单页 ${MAX_PAGE_PIXELS / 1_000_000} MP 上限`,
+        `这张图有 ${(sourcePixels / 1_000_000).toFixed(1)} MP，超过可缩放的 ${MAX_SOURCE_PIXELS / 1_000_000} MP 上限`,
         413, 'image_too_large',
       )
     }
 
+    const plan = planPageScale(width, height)
+    const scaled = plan.width !== width || plan.height !== height
+    let working: PageImage = imagePath
+    let pageRaw: Buffer | undefined
+    if (scaled) {
+      setStage('缩小超大页面')
+      const { data, info } = await pageSharp(imagePath)
+        .resize(plan.width, plan.height, { fit: 'fill', kernel: 'lanczos3' })
+        .removeAlpha()
+        .toColourspace('srgb')
+        .raw()
+        .toBuffer({ resolveWithObject: true })
+      if (info.channels !== 3) throw new MangaEngineError('图片色彩空间无法转换', 422, 'invalid_image')
+      working = { data, width: info.width, height: info.height, channels: 3 }
+      // 缩小后的 RGB 就是 OCR 要用的整页像素，避免再解码一次。
+      pageRaw = data
+    }
+
     setStage('识别气泡区域')
     const detectionStarted = Date.now()
-    const detection = await this.detector.detect(imagePath)
+    const detection = await this.detector.detect(working)
     const detectionMs = Date.now() - detectionStarted
     const engineName = `comic-text-detector + manga-ocr（${this.providers[0] === 'dml' ? 'DirectML/CPU' : 'CPU'}）`
 
     if (!detection.boxes.length) {
       setStage('没有检测到气泡文字')
       return {
-        width: detection.pageWidth,
-        height: detection.pageHeight,
+        width,
+        height,
         regions: [],
         engine: engineName,
         timings: { detectionMs, ocrMs: 0, eraseMs: 0, encodeMs: 0 },
@@ -205,13 +230,24 @@ export class MangaEngine {
     }
 
     setStage(`准备提取 ${detection.boxes.length} 处气泡文本`)
-    const pageRaw = await sharp(imagePath, { limitInputPixels: MAX_PAGE_PIXELS * 4 })
-      .removeAlpha().toColourspace('srgb').raw().toBuffer()
-    const crops = detection.boxes.map(box => paddedRect(boxToRect(box, detection.pageWidth, detection.pageHeight), detection.pageWidth, detection.pageHeight))
+    let raw: Buffer
+    if (pageRaw) {
+      raw = pageRaw
+    } else {
+      const decoded = await pageSharp(working).removeAlpha().toColourspace('srgb').raw().toBuffer({ resolveWithObject: true })
+      if (decoded.info.width !== plan.width || decoded.info.height !== plan.height) {
+        throw new MangaEngineError(
+          `图片尺寸在检测后发生变化：${plan.width}x${plan.height} -> ${decoded.info.width}x${decoded.info.height}`,
+          422, 'image_changed',
+        )
+      }
+      raw = decoded.data
+    }
+    const crops = detection.boxes.map(box => paddedRect(boxToRect(box, plan.width, plan.height), plan.width, plan.height))
     setStage(`提取气泡文本 0/${crops.length}`)
     const ocrStarted = Date.now()
     const ocrResults = await this.recognizer.recognizeBatch(
-      pageRaw, detection.pageWidth, detection.pageHeight, crops,
+      raw, plan.width, plan.height, crops,
       (completed, total) => setStage(`提取气泡文本 ${completed}/${total}`),
     )
     const ocrMs = Date.now() - ocrStarted
@@ -223,7 +259,7 @@ export class MangaEngine {
       prob: box.confidence,
       confidence: ocrResults[index]?.confidence || 0,
     }))
-    const shortEdge = Math.min(detection.pageWidth, detection.pageHeight)
+    const shortEdge = Math.min(plan.width, plan.height)
     const kept = mangaReadingOrder(candidates.filter(region => judgeRegion(region, shortEdge).keep))
     if (kept.length > MAX_REGIONS) {
       throw new MangaEngineError(
@@ -232,7 +268,7 @@ export class MangaEngine {
     }
     if (!kept.length) setStage('没有可翻译的气泡文本')
 
-    const eraseRegions = kept.map(region => boxToRect({ ...region, classId: 0 }, detection.pageWidth, detection.pageHeight))
+    const eraseRegions = kept.map(region => boxToRect({ ...region, classId: 0 }, plan.width, plan.height))
     let overlay: Buffer | undefined
     let colors: Array<{ background: string; textColor: string }> = []
     let eraseMs = 0
@@ -240,20 +276,18 @@ export class MangaEngine {
     if (kept.length) {
       setStage('擦除原文')
       const eraseStarted = Date.now()
-      const erased = await eraseTranslatedRegions(imagePath, detection.pageWidth, detection.pageHeight, detection.textMask, eraseRegions)
+      const erased = await eraseTranslatedRegions(working, plan.width, plan.height, detection.textMask, eraseRegions)
       eraseMs = Date.now() - eraseStarted
       colors = erased.colors
       setStage('生成擦字覆盖层')
       const encodeStarted = Date.now()
       // 覆盖层绝大部分像素是透明的，最高压缩等级下通常只有几十 KB。
-      overlay = await sharp(erased.overlay, { raw: { width: erased.width, height: erased.height, channels: 4 } })
-        .png({ compressionLevel: 9, adaptiveFiltering: true })
-        .toBuffer()
+      overlay = await encodeOverlayPng(erased.overlay, erased.width, erased.height, width, height)
       encodeMs = Date.now() - encodeStarted
     }
 
     const regions: EngineRegion[] = kept.map((region, index) => {
-      const rect = eraseRegions[index]!
+      const rect = scaleRectToSource(eraseRegions[index]!, plan, width, height)
       return {
         id: index + 1,
         x: rect.left, y: rect.top, width: rect.width, height: rect.height,
@@ -266,8 +300,8 @@ export class MangaEngine {
     })
 
     return {
-      width: detection.pageWidth,
-      height: detection.pageHeight,
+      width,
+      height,
       regions,
       overlay,
       engine: engineName,

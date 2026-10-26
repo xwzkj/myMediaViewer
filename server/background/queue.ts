@@ -25,6 +25,16 @@ export class BackgroundQueue {
     // A paid call interrupted by a restart may already have been billed. Never retry it automatically.
     db.exec(`UPDATE background_tasks SET state='failed',message='服务重启时翻译未确认完成；可能已计费，请人工检查后重试' WHERE state='running' AND kind='translate';
       UPDATE background_tasks SET state='queued' WHERE state='running';`)
+    // 旧版本把超过 40 MP 的页面永久标失败；现在会先缩小再识别，重新排队一次。
+    // 语义索引还曾把 CLIP 的 40 MP 解码上限误报成“服务不可用”，同批恢复。
+    // 只处理不收费的任务，并尊重来源当前的停止状态。
+    db.prepare(`UPDATE background_tasks SET
+      state = CASE WHEN (SELECT state FROM background_sources WHERE source_id=background_tasks.source_id)='stopped' THEN 'stopped' ELSE 'queued' END,
+      message = '', updated = ?
+      WHERE state='failed' AND (
+        (kind IN ('ocr','semantic') AND message LIKE ?)
+        OR (kind='semantic' AND message=?)
+      )`).run(Date.now(), '%超过单页 40 MP 上限%', '远程计算端没有可用的 CLIP 语义编码服务')
   }
   ensure(sourceId: string) { this.db.prepare('INSERT OR IGNORE INTO background_sources(source_id) VALUES (?)').run(sourceId) }
   control(sourceId: string): { state: SourceRunState; consent: string; file_count: number | null; checked: number | null; message: string } {

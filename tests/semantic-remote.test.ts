@@ -100,3 +100,25 @@ test('base compute health failure never sends a semantic job, even if semantic e
     assert.equal(semanticCalls, 0)
   } finally { await app.close() }
 })
+
+test('远程 CLIP 图片超限保留 413 与具体原因，不被当成服务离线', async () => {
+  const app = Fastify()
+  app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_request, body, done) => done(null, body))
+  app.get('/v1/status', async () => ({ protocol: COMPUTE_PROTOCOL_VERSION }))
+  app.get('/v1/semantic/status', async () => ({ ready: true, provider: 'local', dimensions: 512, model }))
+  app.post('/v1/semantic/image', async (_request, reply) => reply.code(413).send({
+    code: 'semantic_image_too_large',
+    message: '图片有 120.0 MP，超过语义索引 100 MP 上限',
+  }))
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  try {
+    const base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`
+    const remote = new RemoteClipProvider(config(base), provider())
+    await remote.status()
+    await assert.rejects(remote.embedImage(Buffer.from('too-large')), {
+      code: 'semantic_image_too_large',
+      statusCode: 413,
+      message: /120\.0 MP/,
+    })
+  } finally { await app.close() }
+})

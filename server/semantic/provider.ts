@@ -31,6 +31,8 @@ const FAILURE_COOLDOWN = 30_000
 
 /** Chinese-CLIP 预处理：直接缩放到 224×224（不做中心裁剪），CLIP 逐通道均值方差。 */
 const IMAGE_SIZE = 224
+/** CLIP 只取 224² 输入，但源图仍要完整解码一次；100 MP 是内存与解压炸弹的折中。 */
+const MAX_IMAGE_PIXELS = 100_000_000
 const MEANS = [0.48145466, 0.4578275, 0.40821073]
 const STDS = [0.26862954, 0.26130258, 0.27577711]
 
@@ -201,8 +203,24 @@ export class LocalClipProvider implements SemanticProvider {
     return this.serial(async () => {
       const loaded = await this.load()
       try {
+        let metadata: sharp.Metadata
+        try {
+          metadata = await sharp(image, { limitInputPixels: false }).metadata()
+        } catch {
+          throw new SemanticError('semantic_invalid_image', '图片无法解码，可能已损坏或格式不受支持', 422)
+        }
+        const width = metadata.width ?? 0, height = metadata.height ?? 0
+        if (!width || !height) throw new SemanticError('semantic_invalid_image', '图片尺寸无效', 422)
+        const pixels = width * height
+        if (pixels > MAX_IMAGE_PIXELS) {
+          throw new SemanticError(
+            'semantic_image_too_large',
+            `图片有 ${(pixels / 1_000_000).toFixed(1)} MP，超过语义索引 ${MAX_IMAGE_PIXELS / 1_000_000} MP 上限`,
+            413,
+          )
+        }
         // Chinese-CLIP 直接缩放到 224×224（不做中心裁剪），其余与 CLIP 一致。
-        const oriented = sharp(image, { limitInputPixels: 40_000_000 }).rotate().flatten({ background: '#ffffff' }).toColourspace('srgb').removeAlpha()
+        const oriented = sharp(image, { limitInputPixels: MAX_IMAGE_PIXELS }).rotate().flatten({ background: '#ffffff' }).toColourspace('srgb').removeAlpha()
         const { data, info } = await oriented.resize(IMAGE_SIZE, IMAGE_SIZE, { fit: 'fill', kernel: 'cubic' }).raw().toBuffer({ resolveWithObject: true })
         if (info.channels !== 3) throw invalid()
         const values = new Float32Array(3 * IMAGE_SIZE * IMAGE_SIZE)

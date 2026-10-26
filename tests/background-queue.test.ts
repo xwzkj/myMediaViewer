@@ -28,6 +28,13 @@ test('persistent queue deduplicates, keeps pause/stop and recovers interrupted w
     q.retry('s'); assert.equal(q.counts('s').queued,3)
     q.enqueue('s','a','v2','ocr'); assert.equal(q.counts('s').queued,3,'changed fingerprint replaces stale pending version')
     q.removeDisabled('s',['semantic']); assert.equal(q.counts('s').queued,1)
+    // 旧版本因 40 MP 上限失败的非收费任务，重开队列时自动重试；付费任务不动。
+    const oversize=q.enqueue('s','big','v1','ocr'); q.mark(oversize,'failed','这张图有 47.5 MP，超过单页 40 MP 上限')
+    const paid=q.enqueue('s','paid','v1','translate'); q.mark(paid,'failed','这张图有 47.5 MP，超过单页 40 MP 上限')
+    const semantic=q.enqueue('s','clip','v1','semantic'); q.mark(semantic,'failed','远程计算端没有可用的 CLIP 语义编码服务')
+    const recovered=new BackgroundQueue(db)
+    assert.equal(recovered.counts('s').queued,3,'OCR 超限与误报的语义任务回到队列')
+    assert.equal(recovered.counts('s').failed,1,'付费失败任务不能被自动重试')
   } finally { db.close() }
 })
 test('daily budgets are reserved atomically, persist, and reset on UTC day boundary',()=>{

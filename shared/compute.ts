@@ -23,7 +23,7 @@ export const COMPUTE_HEADER_PRIORITY = 'x-compute-priority'
 
 /** 单张原图上传上限（字节）。属于输入校验，不是任务调度。 */
 export const COMPUTE_MAX_UPLOAD_BYTES = 128 * 1024 * 1024
-/** 单页像素上限，防止异常扫描件把内存打满。 */
+/** 单页工作分辨率上限；超过会等比缩小后再识别，覆盖层与坐标再缩放回原图。 */
 export const COMPUTE_MAX_PAGE_PIXELS = 40_000_000
 /** 单页最多识别的文本区域；超过时返回明确错误，不静默截断。 */
 export const COMPUTE_MAX_REGIONS = 80

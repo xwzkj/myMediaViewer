@@ -1,5 +1,5 @@
-import sharp from 'sharp'
 import type { TextMask } from './types.js'
+import { pageSharp, type PageImage } from './page.js'
 
 export interface EraseRegion {
   left: number
@@ -28,13 +28,13 @@ export interface ErasedPage {
  * 估一个主色回填。框内没有 mask 输出时退化为填满该框，保证不会把日文留在译文下面。
  */
 export async function eraseTranslatedRegions(
-  imagePath: string,
+  image: PageImage,
   pageWidth: number,
   pageHeight: number,
   textMask: TextMask | null,
   regions: EraseRegion[],
 ): Promise<ErasedPage> {
-  const { data, info } = await sharp(imagePath, { limitInputPixels: 500_000_000 })
+  const { data, info } = await pageSharp(image)
     .removeAlpha()
     .toColourspace('srgb')
     .raw()

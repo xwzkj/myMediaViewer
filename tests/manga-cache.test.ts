@@ -74,7 +74,8 @@ test('译图自动查询只做 stat，不重复读取原图', async t => {
     // 同样长度、完全不是图片的字节：只要真的读了内容，就绝不可能命中同一个缓存。
     const decoy = Buffer.alloc(original.length, 7)
     await writeFile(asset.path, decoy)
-    await utimes(asset.path, info.atime, info.mtime)
+    // utimes 用 Date 只有毫秒精度，指纹用 Math.trunc(mtimeMs)；先截断再还原，避免舍入后差 1ms。
+    await utimes(asset.path, info.atime, new Date(Math.trunc(info.mtimeMs)))
     const detectCalls = detect.mock.callCount()
     const requests = fetchMock.mock.callCount()
 
@@ -84,7 +85,7 @@ test('译图自动查询只做 stat，不重复读取原图', async t => {
     assert.equal(detect.mock.callCount(), detectCalls, '自动查询不应触发识别')
     assert.equal(fetchMock.mock.callCount(), requests, '自动查询不应调用翻译接口')
     await writeFile(asset.path, original)
-    await utimes(asset.path, info.atime, info.mtime)
+    await utimes(asset.path, info.atime, new Date(Math.trunc(info.mtimeMs)))
   })
 
   await t.test('内容与修改时间都变化后指纹失效，重新哈希并返回没有缓存', async () => {
