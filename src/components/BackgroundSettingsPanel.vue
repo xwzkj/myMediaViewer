@@ -30,6 +30,12 @@ onActivated(startPolling)
 onDeactivated(() => { activeEntry=false; poller.stop(); confirmation.value=null })
 onBeforeUnmount(poller.stop)
 function sourceStatus(id:string) { return status.value?.sources.find(item => item.sourceId === id) }
+function activeLabel(id:string) {
+  const items = (status.value?.active || []).filter(item => item.sourceId === id)
+  if (!items.length) return ''
+  const names = [...new Set(items.map(item => item.kind === 'semantic' ? 'CLIP 索引' : item.kind === 'translate' ? '自动翻译' : 'OCR 预热'))]
+  return `正在处理${items.length > 1 ? ` ${items.length} 项` : ''}：${names.join('、')}`
+}
 async function persist(id:string, settings:SourceBackgroundSettings, token?:string) {
   await api(`/sources/${encodeURIComponent(id)}/background`, { method:'PUT', body:JSON.stringify({settings,confirmationToken:token}) })
   drafts.value[id] = {...settings}
@@ -84,7 +90,7 @@ async function control(id:string, action:'pause'|'stop'|'resume'|'retry') {
           <label v-if="drafts[source.id]!.autoTranslate" class="field">每日翻译请求上限<input v-model.number="drafts[source.id]!.maxTranslationRequestsPerDay" type="number" min="1" max="10000" required /></label>
           <label v-if="localMode" class="field">本地后台占空比（%）<input v-model.number="drafts[source.id]!.localDutyPercent" type="number" min="5" max="100" required /><span>通过任务间休息降低平均负载，并非 CPU 使用率硬上限。E3 等低配主机建议 25%。</span></label>
         </div>
-        <p v-if="status?.active?.sourceId === source.id" class="helper" role="status">正在处理：{{ status.active.kind === 'semantic' ? 'CLIP 索引' : status.active.kind === 'translate' ? '自动翻译' : 'OCR 预热' }}</p>
+        <p v-if="activeLabel(source.id)" class="helper" role="status">{{ activeLabel(source.id) }}</p>
         <p class="helper">今日已尝试 {{ sourceStatus(source.id)?.pagesToday || 0 }} 项计算 / {{ sourceStatus(source.id)?.translationRequestsToday || 0 }} 次翻译请求。按 UTC 日期重置；请求上限不等于金额上限，失败调用也可能计费。</p>
         <p v-if="sourceStatus(source.id)?.settings.autoTranslate && !sourceStatus(source.id)?.translationConsentValid" class="warning">AI 配置已变更，自动翻译暂停；请重新保存并确认费用。</p>
         <p v-if="sourceStatus(source.id)?.message" class="warning" role="status">{{ sourceStatus(source.id)?.message }}</p>

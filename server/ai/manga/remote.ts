@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import {
-  COMPUTE_HEADER_PROTOCOL, COMPUTE_HEADER_REQUEST_ID, COMPUTE_HEADER_SHA256, COMPUTE_MAX_UPLOAD_BYTES,
+  COMPUTE_HEADER_PRIORITY, COMPUTE_HEADER_PROTOCOL, COMPUTE_HEADER_REQUEST_ID, COMPUTE_HEADER_SHA256, COMPUTE_MAX_UPLOAD_BYTES,
   COMPUTE_PROTOCOL_VERSION, type ComputeJobStatus, type ComputeStatus,
 } from '../../../shared/compute.js'
 import { MangaEngineError, type EnginePage } from './engine.js'
@@ -144,6 +144,8 @@ export interface RemoteJobInput {
   onStage?: (stage: string) => void
   /** 暂停/停止信号：会中止上传、轮询与下载。 */
   signal?: AbortSignal
+  /** 计算端按此决定排队顺序；后台预热让手动翻译先跑。 */
+  priority?: 'manual' | 'background'
 }
 
 /**
@@ -186,6 +188,7 @@ export async function runRemoteMangaJob(config: RemoteComputeConfig, input: Remo
         [COMPUTE_HEADER_REQUEST_ID]: digest,
         [COMPUTE_HEADER_SHA256]: digest,
         [COMPUTE_HEADER_PROTOCOL]: String(COMPUTE_PROTOCOL_VERSION),
+        [COMPUTE_HEADER_PRIORITY]: input.priority || 'manual',
       }),
       body: new Uint8Array(image),
       // 上传本身可能比建连久，这里给一个足够宽的独立时限。
@@ -209,7 +212,8 @@ export async function runRemoteMangaJob(config: RemoteComputeConfig, input: Remo
   // 一旦任务被接收，后面任何失败都不再回退本地：否则同一页会被计算两次。
   const deadline = Date.now() + config.timeoutMs
   let status: ComputeJobStatus | null = null
-  let interval = 250
+  // 单页通常几百毫秒；轮询上限过高会把“算完”到“取回结果”拖出几百毫秒空档。
+  let interval = 120
   while (Date.now() < deadline) {
     let poll: Response
     try {
@@ -239,7 +243,7 @@ export async function runRemoteMangaJob(config: RemoteComputeConfig, input: Remo
     if (status.state === 'ready') break
     if (status.stage) setStage(`远程：${status.stage}`)
     await sleep(interval, signal)
-    interval = Math.min(interval * 1.5, 2000)
+    interval = Math.min(interval * 1.5, 500)
   }
   if (!status || status.state !== 'ready') {
     throw new RemoteComputeError(

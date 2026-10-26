@@ -14,10 +14,12 @@ export const COMPUTE_PROTOCOL_VERSION = 2
 /** 计算端默认端口，避免和主服务的 3210 冲突。 */
 export const COMPUTE_DEFAULT_PORT = 3211
 
-/** 请求头：幂等请求 ID、原图内容摘要、协议版本。 */
+/** 请求头：幂等请求 ID、原图内容摘要、协议版本、调度优先级。 */
 export const COMPUTE_HEADER_REQUEST_ID = 'x-compute-request-id'
 export const COMPUTE_HEADER_SHA256 = 'x-compute-sha256'
 export const COMPUTE_HEADER_PROTOCOL = 'x-compute-protocol'
+/** manual 任务排在所有后台任务之前；旧计算端忽略该头并按到达顺序执行。 */
+export const COMPUTE_HEADER_PRIORITY = 'x-compute-priority'
 
 /** 单张原图上传上限（字节）。属于输入校验，不是任务调度。 */
 export const COMPUTE_MAX_UPLOAD_BYTES = 128 * 1024 * 1024
@@ -99,6 +101,9 @@ export interface ComputeStatus {
   device: string
   models: ComputeModelEntry[]
   busy: boolean
+  /** 等待执行的任务数（不含正在运行的）。 */
   queued: number
+  /** 正在执行的任务数；旧计算端可能不返回。 */
+  running?: number
   message?: string
 }

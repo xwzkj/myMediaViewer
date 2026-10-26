@@ -39,4 +39,9 @@ export interface BackgroundSourceStatus {
   lastCheckedAt: number | null
   message: string
 }
-export interface BackgroundStatus { localComputeMode: 'local' | 'remote'; sources: BackgroundSourceStatus[]; active: { sourceId: string; assetId: string; kind: BackgroundTaskKind } | null }
+export interface BackgroundStatus {
+  localComputeMode: 'local' | 'remote'
+  sources: BackgroundSourceStatus[]
+  /** 远程模式可能同时有多项；本地模式最多一项。 */
+  active: Array<{ sourceId: string; assetId: string; kind: BackgroundTaskKind }>
+}

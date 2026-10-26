@@ -1,6 +1,7 @@
 // 必须最先导入：下面的端口、Key、模型目录都在模块加载时读取 process.env。
 import '../env.js'
 import path from 'node:path'
+import { availableParallelism } from 'node:os'
 import { mkdirSync } from 'node:fs'
 import { createComputeApp } from './app.js'
 import { MangaEngine } from '../ai/manga/engine.js'
@@ -23,6 +24,8 @@ const host = process.env.COMPUTE_HOST || '0.0.0.0'
 const apiKey = (process.env.COMPUTE_API_KEY || '').trim()
 const workDir = path.resolve(process.env.COMPUTE_WORK_DIR || path.join('data-compute', 'work'))
 const threads = Number(process.env.COMPUTE_INTRA_OP_THREADS)
+const requestedConcurrency = Number(process.env.COMPUTE_CONCURRENCY)
+const concurrency = Number.isFinite(requestedConcurrency) && requestedConcurrency > 0 ? Math.min(4, Math.floor(requestedConcurrency)) : 1
 
 if (!apiKey) {
   console.error('远程计算端缺少 COMPUTE_API_KEY，拒绝启动。请写进仓库根目录的 .env，或在启动前设置同名环境变量；主服务的设置页要填同一个 Key。')
@@ -37,8 +40,15 @@ const engine = new MangaEngine({
 })
 
 // 计算端自己的 CLIP provider：模型目录按本进程的数据目录解析，首次使用自动下载。
-const semanticProvider = new LocalClipProvider({ threads: Number(process.env.SEMANTIC_CLIP_THREADS) || 1 })
-const app = await createComputeApp({ apiKey, workDir, engine, semanticProvider })
+// 单图编码默认给 4 线程：远程预热时 CLIP 通常和 OCR 交替执行，单线程会白白多花一倍时间。
+const clipThreads = Number(process.env.SEMANTIC_CLIP_THREADS)
+const semanticProvider = new LocalClipProvider({
+  threads: Number.isFinite(clipThreads) && clipThreads > 0 ? Math.floor(clipThreads) : Math.min(4, availableParallelism()),
+})
+const app = await createComputeApp({
+  apiKey, workDir, engine, semanticProvider,
+  concurrency,
+})
 
 try {
   await app.listen({ port, host })
@@ -46,7 +56,7 @@ try {
   const readyModels = status.models.filter(model => model.ready).length
   const missing = status.models.flatMap(model => model.missing)
   logInfo('计算端', `已监听 http://${host}:${port} · 协议 v${COMPUTE_PROTOCOL_VERSION}`)
-  logInfo('计算端', `设备 ${status.device} · 线程 ${Number.isFinite(threads) && threads > 0 ? Math.floor(threads) : '由 ONNX Runtime 决定'}`)
+  logInfo('计算端', `设备 ${status.device} · 线程 ${Number.isFinite(threads) && threads > 0 ? Math.floor(threads) : '由 ONNX Runtime 决定'} · 并发 ${concurrency}`)
   logInfo('计算端', `模型 ${readyModels}/${status.models.length} 就绪${missing.length ? ` · 缺少 ${missing.join('、')}` : ''}`)
   logInfo('计算端', `模型目录 ${modelRoot}`)
   logInfo('计算端', `临时目录 ${workDir} · 单图上限 ${Math.round(COMPUTE_MAX_UPLOAD_BYTES / 1048576)} MB · 任务保留 1 小时`)

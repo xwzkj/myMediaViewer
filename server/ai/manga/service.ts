@@ -12,6 +12,7 @@ import { formatDuration, logError, logInfo, logWarn } from '../../log.js'
 import { modelRoot } from './models.js'
 import { createTranslationLimiter } from './concurrency.js'
 import { createPriorityQueue } from './priority.js'
+import { remoteBackgroundConcurrency } from '../../background/limits.js'
 
 const mangaCacheDir = path.join(cacheDir, 'manga')
 
@@ -52,7 +53,12 @@ const jobs = new Map<string, InternalJob>()
 /** 日志里用短编号指代任务，长 UUID 只会占地方。 */
 const jobLabel = (job: InternalJob) => `漫画翻译 #${job.id.slice(0, 6)}`
 // 只有真正需要模型的页面才占用这个队列。缓存查询不排队，也不会被 GPU 任务挡住。
-const inferenceQueue = createPriorityQueue()
+// 本地 ONNX 会话必须逐页推理；远程模式允许后台流水线，手动任务仍然优先。
+const localInferenceQueue = createPriorityQueue({ manualBypass: false })
+const remoteInferenceQueue = createPriorityQueue({
+  backgroundConcurrency: () => remoteBackgroundConcurrency(),
+  manualBypass: true,
+})
 const manualJobs = new Set<string>()
 
 /** 远程状态检查带 10 秒缓存，设置页轮询时不会每次都打计算端。 */
@@ -203,7 +209,7 @@ export function hasManualMangaWork(): boolean {
  * the HTTP call via beforeTranslate.
  */
 export async function runBackgroundMangaAsset(
-  asset: StoredAsset, options: { translate: boolean; signal?: AbortSignal; beforeTranslate?: () => void },
+  asset: StoredAsset, options: { translate: boolean; signal?: AbortSignal; beforeTranslate?: () => void; onLocalFallback?: () => void },
 ): Promise<MangaPageResult> {
   options.signal?.throwIfAborted()
   const info = await prepareAsset(asset, false)
@@ -212,7 +218,7 @@ export async function runBackgroundMangaAsset(
   if (!options.translate && info.prepared) return info.prepared
   const page = info.prepared
     ? await hydratePrepared(asset, info)
-    : await recognizePage(asset, info, () => {}, 'background', options.signal)
+    : await recognizePage(asset, info, () => {}, 'background', options.signal, options.onLocalFallback)
   options.signal?.throwIfAborted()
   if (page.empty) return page.empty
   // 预热只缓存「识别 + 底图」，不写 manga_translations，避免被当成已翻译结果。
@@ -292,36 +298,38 @@ function placeholderPage(): EnginePage {
  * 只有「任务还没被接收」的连接失败才允许回退到本地主机；鉴权、协议、资源超限、
  * 模型错误都直接抛给调用方，避免同一页悄悄算两遍。
  */
-async function computePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void, priority: 'manual' | 'background' = 'manual', signal?: AbortSignal): Promise<EnginePage> {
-  // 远程与本地共用同一个优先级队列，后台任务才不会抢在手动任务前面占用计算端。
-  // 队列不可重入，因此本地回退必须直接调用引擎，不能再排一次队。
-  return runInference(async () => {
-    signal?.throwIfAborted()
-    const compute = getLocalComputeConfig()
-    if (compute.mode === 'remote') {
+async function computePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void, priority: 'manual' | 'background' = 'manual', signal?: AbortSignal, onLocalFallback?: () => void): Promise<EnginePage> {
+  const compute = getLocalComputeConfig()
+  if (compute.mode === 'remote') {
+    // 远程模式：后台任务按流水线深度并发，手动任务可以越过已满的后台名额。
+    // 计算端会按请求头优先执行手动任务，所以再排队也只是上传先后不同。
+    return remoteInferenceQueue(async () => {
+      signal?.throwIfAborted()
       try {
-        return await runRemoteMangaJob(compute, { imagePath: asset.path, onStage: setStage, signal })
+        return await runRemoteMangaJob(compute, { imagePath: asset.path, onStage: setStage, signal, priority })
       } catch (error) {
         const remote = error instanceof RemoteComputeError ? error : null
         if (compute.fallback === 'local' && remote?.phase === 'connect') {
           logWarn('计算', `远程计算端不可用，回退本地主机：${remote.message}`)
           setStage('远程计算端不可用，改用本地主机')
-          return currentLocalEngine().process(asset.path, setStage)
+          onLocalFallback?.()
+          // 本地回退走独立队列：远程任务可以并发，但本机 ONNX 仍然只能逐页跑。
+          return localInferenceQueue(() => currentLocalEngine().process(asset.path, setStage), priority, signal)
         }
         throw error
       }
-    }
-    return currentLocalEngine().process(asset.path, setStage)
-  }, priority, signal)
+    }, priority, signal)
+  }
+  return localInferenceQueue(() => currentLocalEngine().process(asset.path, setStage), priority, signal)
 }
 
 /**
  * 各流水线共用「本地识别」这一段：检测 + OCR + 擦字 + 底图编码.
  * 不涉及大模型调用，也不写任何缓存结果。
  */
-async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void, priority: 'manual' | 'background' = 'manual', signal?: AbortSignal): Promise<PreparedPage> {
+async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void, priority: 'manual' | 'background' = 'manual', signal?: AbortSignal, onLocalFallback?: () => void): Promise<PreparedPage> {
   signal?.throwIfAborted()
-  const page = await computePage(asset, info, setStage, priority, signal)
+  const page = await computePage(asset, info, setStage, priority, signal, onLocalFallback)
   const prepared: PreparedPage = { asset, key: info.key, targetLanguage: info.targetLanguage, page }
   if (!page.regions.length) prepared.empty = emptyResult(asset, info.key, info.targetLanguage)
   return prepared
@@ -844,11 +852,6 @@ function hashFile(file: string): Promise<string> {
     stream.on('error', reject)
     stream.on('end', () => resolve(hash.digest('hex')))
   })
-}
-
-/** 只把真正需要模型/翻译/擦字的页面串行化；缓存查询可以在队列外立即完成。 */
-function runInference<T>(task: () => Promise<T>, priority: 'manual' | 'background' = 'manual', signal?: AbortSignal): Promise<T> {
-  return inferenceQueue(task, priority, signal)
 }
 
 function emptyResult(asset: StoredAsset, key: string, targetLanguage: string): MangaPageResult {

@@ -4,7 +4,7 @@ import { createReadStream } from 'node:fs'
 import { mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import {
-  COMPUTE_HEADER_PROTOCOL, COMPUTE_HEADER_REQUEST_ID, COMPUTE_HEADER_SHA256, COMPUTE_MAX_UPLOAD_BYTES,
+  COMPUTE_HEADER_PRIORITY, COMPUTE_HEADER_PROTOCOL, COMPUTE_HEADER_REQUEST_ID, COMPUTE_HEADER_SHA256, COMPUTE_MAX_UPLOAD_BYTES,
   COMPUTE_PROTOCOL_VERSION, type ComputeError, type ComputeJobResult, type ComputeJobStatus, type ComputeStatus,
 } from '../../shared/compute.js'
 import { PIPELINE_VERSION, type EnginePage } from '../ai/manga/engine.js'
@@ -47,6 +47,8 @@ export interface ComputeAppOptions {
   quiet?: boolean
   /** 语义编码 provider；不传时按默认模型目录懒加载，首次使用自动下载。 */
   semanticProvider?: SemanticProvider
+  /** 同时执行的计算任务数；默认 1，直接照搬现有串行行为。 */
+  concurrency?: number
 }
 
 interface JobRecord {
@@ -57,6 +59,8 @@ interface JobRecord {
   progress: number
   createdAt: number
   updatedAt: number
+  /** 手动翻页/翻译优先于后台预热；旧主服务不发送时按 background 处理。 */
+  priority: 'manual' | 'background'
   inputPath: string
   overlayPath: string
   overlayBytes: number
@@ -109,9 +113,10 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
   const jobs = new Map<string, JobRecord>()
   /** 内容哈希 → 任务 ID，用于重传幂等。 */
   const byRequest = new Map<string, string>()
-  let queue: Promise<void> = Promise.resolve()
-  let queued = 0
-  let processing = false
+  const concurrency = Math.max(1, Math.min(4, Math.floor(options.concurrency ?? 1)))
+  /** 等待执行的任务；pump 会先取手动任务。 */
+  const pending: JobRecord[] = []
+  let running = 0
 
   await mkdir(options.workDir, { recursive: true })
 
@@ -232,7 +237,7 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
     job.stage = '开始计算'
     job.progress = 5
     job.updatedAt = startedAt
-    info(`开始计算 ${shortId(job.id)} · 排队 ${formatDuration(queueWait)}${queued > 0 ? ` · 后面还有 ${queued} 个` : ''}`)
+    info(`开始计算 ${shortId(job.id)} · 排队 ${formatDuration(queueWait)}${pending.length > 0 ? ` · 后面还有 ${pending.length} 个` : ''}${job.priority === 'manual' ? ' · 手动优先' : ''}`)
     // 阶段日志按"去掉数字后的阶段名"去重：每种阶段只记一次，逐框进度不会刷屏。
     let lastFamily = ''
     const publishStage = (stage: string) => {
@@ -296,15 +301,28 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
     }
   }
 
+  /** 取下一个任务：手动任务插到所有后台任务前面，同类按到达顺序。 */
+  function takeNext(): JobRecord | undefined {
+    const index = pending.findIndex(job => job.priority === 'manual')
+    return pending.splice(index >= 0 ? index : 0, 1)[0]
+  }
+
   function enqueue(job: JobRecord): void {
-    queued++
-    // 计算端一次只跑一个任务：本机推理本来就会占满模型会话，并行只会互相拖慢。
-    const task = queue.then(() => {
-      queued--
-      processing = true
-      return runJob(job).finally(() => { processing = false })
-    }, () => undefined)
-    queue = task.then(() => undefined, () => undefined)
+    pending.push(job)
+    pump()
+  }
+
+  /**
+   * 补位执行。默认并发 1；调高 `COMPUTE_CONCURRENCY` 可以让检测/OCR 的
+   * CPU 空闲段互相重叠，但单任务延迟会变长，内存占用也会随并发数增长。
+   */
+  function pump(): void {
+    while (running < concurrency) {
+      const job = takeNext()
+      if (!job) return
+      running++
+      void runJob(job).finally(() => { running--; pump() })
+    }
   }
 
   app.get('/v1/status', async (): Promise<ComputeStatus> => {
@@ -314,8 +332,9 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
       ready: models.ready,
       device: models.device,
       models: models.models,
-      busy: processing || queued > 0,
-      queued,
+      busy: running > 0 || pending.length > 0,
+      queued: pending.length,
+      running,
       ...(models.message ? { message: models.message } : {}),
     }
   })
@@ -364,6 +383,7 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
       progress: 0,
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      priority: request.headers[COMPUTE_HEADER_PRIORITY] === 'manual' ? 'manual' : 'background',
       inputPath: path.join(options.workDir, `${id}.input`),
       overlayPath: path.join(options.workDir, `${id}.png`),
       overlayBytes: 0,
@@ -373,7 +393,7 @@ export async function createComputeApp(options: ComputeAppOptions): Promise<Fast
     jobs.set(id, job)
     byRequest.set(requestId, id)
     enqueue(job)
-    info(`收到任务 ${shortId(id)} · ${megabytes(body.length)} · 哈希 ${requestId.slice(0, 12)}… · 队列 ${queued + (processing ? 1 : 0)}`)
+    info(`收到任务 ${shortId(id)} · ${megabytes(body.length)} · 哈希 ${requestId.slice(0, 12)}… · 队列 ${pending.length + running}${job.priority === 'manual' ? ' · 手动优先' : ''}`)
     return reply.code(202).send({ id, state: job.state })
   })
 

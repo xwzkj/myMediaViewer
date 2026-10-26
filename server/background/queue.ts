@@ -57,9 +57,13 @@ export class BackgroundQueue {
     this.db.prepare('INSERT OR IGNORE INTO background_tasks(id,source_id,asset_id,stamp,kind,state,updated) VALUES (?,?,?,?,?,?,?)').run(id,sourceId,assetId,stamp,kind,state,now)
     return id
   }
-  next(sourceId: string): Task | undefined {
+  next(sourceId: string, kinds?: BackgroundTaskKind[]): Task | undefined {
     if (this.control(sourceId).state !== 'running') return undefined
-    return this.db.prepare("SELECT * FROM background_tasks WHERE source_id=? AND state='queued' ORDER BY updated,id LIMIT 1").get(sourceId) as Task | undefined
+    if (!kinds?.length) {
+      return this.db.prepare("SELECT * FROM background_tasks WHERE source_id=? AND state='queued' ORDER BY updated,id LIMIT 1").get(sourceId) as Task | undefined
+    }
+    const placeholders = kinds.map(() => '?').join(',')
+    return this.db.prepare(`SELECT * FROM background_tasks WHERE source_id=? AND state='queued' AND kind IN (${placeholders}) ORDER BY updated,id LIMIT 1`).get(sourceId, ...kinds) as Task | undefined
   }
   mark(id: string, state: BackgroundTaskState, message = '') {
     this.db.prepare('UPDATE background_tasks SET state=?,message=?,updated=? WHERE id=?').run(state,message.slice(0,1000),Date.now(),id)

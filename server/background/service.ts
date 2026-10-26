@@ -9,10 +9,13 @@ import { getAiSettings, getLocalComputeConfig } from '../ai.js'
 import { onScanComplete, scanLibrary, scanStatus, sourceOnline } from '../scanner.js'
 import { formatDuration, logError, logInfo, logWarn } from '../log.js'
 import { BackgroundQueue, type Task, type SourceRunState } from './queue.js'
+import { remoteBackgroundConcurrency } from './limits.js'
 
 export const backgroundQueue = new BackgroundQueue(db)
 const challenges = new Map<string, { sourceId: string; signature: string; settings: string; expires: number }>()
-let active: { task: Task; controller: AbortController } | null = null
+interface ActiveTask { task: Task; controller: AbortController }
+/** 正在执行的后台任务；远程模式可同时有多个，本地模式最多一个。 */
+const activeTasks = new Map<string, ActiveTask>()
 let timer: ReturnType<typeof setInterval> | undefined
 let checking = false, ticking = false, synchronizing: Promise<void> | null = null, syncAgain = false
 let stopped = false, cooldownUntil = 0, roundRobin = 0
@@ -39,6 +42,26 @@ function taskStamp(asset: StoredAsset, kind: BackgroundTaskKind) {
 function enabledKinds(settings: SourceBackgroundSettings): BackgroundTaskKind[] {
   return [...(settings.semantic ? ['semantic' as const] : []), ...(settings.autoTranslate ? ['translate' as const] : settings.ocr ? ['ocr' as const] : [])]
 }
+/** 当前允许的后台并发数：远程流水线可调，本机 ONNX 会话始终逐页。 */
+function backgroundWorkerLimit(): number {
+  return getLocalComputeConfig().mode === 'remote' ? remoteBackgroundConcurrency() : 1
+}
+function abortSource(sourceId: string) {
+  for (const entry of activeTasks.values()) if (entry.task.source_id === sourceId) entry.controller.abort()
+}
+/** 同一种任务同时只跑一个：CLIP 会话与付费翻译都不适合并发堆积。 */
+function allowedKinds(): BackgroundTaskKind[] {
+  const kinds: BackgroundTaskKind[] = ['semantic', 'ocr', 'translate']
+  if ([...activeTasks.values()].some(entry => entry.task.kind === 'semantic')) kinds.splice(kinds.indexOf('semantic'), 1)
+  if ([...activeTasks.values()].some(entry => entry.task.kind === 'translate')) kinds.splice(kinds.indexOf('translate'), 1)
+  return kinds
+}
+function deferTask(sourceId: string, task: Task, message: string) {
+  backgroundQueue.mark(task.id, 'queued', message)
+  backgroundQueue.message(sourceId, message)
+  blockedUntil.set(sourceId, Date.now() + 60000)
+}
+
 export function createTranslationConfirmation(sourceId: string, raw: unknown) {
   sourceById(sourceId)
   const settings = normalizeSourceBackground(raw)
@@ -64,7 +87,7 @@ export function saveBackgroundSettings(sourceId: string, raw: unknown, token?: s
   saveSources(sources.map(item => item.id === sourceId ? { ...item, background: settings } : item))
   if (needsConsent) backgroundQueue.consent(sourceId,signature)
   if (!settings.autoTranslate) backgroundQueue.consent(sourceId,'')
-  active?.task.source_id === sourceId && active.controller.abort()
+  abortSource(sourceId)
   directoryChecks.get(sourceId)?.abort()
   blockedUntil.delete(sourceId); nextChecks.delete(sourceId)
   void synchronizeBackground().catch(error => backgroundQueue.message(sourceId, String(error)))
@@ -75,13 +98,13 @@ export function controlBackground(sourceId: string, action: 'pause' | 'stop' | '
   const state: SourceRunState = action === 'pause' ? 'paused' : action === 'stop' ? 'stopped' : 'running'
   backgroundQueue.setState(sourceId,state)
   if (action === 'retry') backgroundQueue.retry(sourceId)
-  if (action === 'pause' || action === 'stop') { directoryChecks.get(sourceId)?.abort(); if (active?.task.source_id === sourceId) active.controller.abort() }
+  if (action === 'pause' || action === 'stop') { directoryChecks.get(sourceId)?.abort(); abortSource(sourceId) }
   blockedUntil.delete(sourceId)
   if (state === 'running') void synchronizeBackground().catch(error => backgroundQueue.message(sourceId,String(error)))
 }
 export function getBackgroundStatus(): BackgroundStatus {
   const signature = translationSignature()
-  return { localComputeMode: getLocalComputeConfig().mode, active: active ? { sourceId:active.task.source_id, assetId:active.task.asset_id, kind:active.task.kind } : null, sources: sources.map(source => {
+  return { localComputeMode: getLocalComputeConfig().mode, active: [...activeTasks.values()].map(({ task }) => ({ sourceId: task.source_id, assetId: task.asset_id, kind: task.kind })), sources: sources.map(source => {
     const control = backgroundQueue.control(source.id), usage = backgroundQueue.usage(source.id)
     return { sourceId:source.id, settings:normalizeSourceBackground(source.background), state:control.state, counts:backgroundQueue.counts(source.id), pagesToday:usage.pages, translationRequestsToday:usage.requests, translationConsentValid:control.consent === signature, lastFileCount:control.file_count, lastCheckedAt:control.checked, message:control.message }
   }) }
@@ -180,73 +203,128 @@ export interface BackgroundRuntimeServices {
   manga: Pick<typeof import('../ai/manga/service.js'), 'hasManualMangaWork' | 'runBackgroundMangaAsset'>
   semantic?: Pick<typeof import('../semantic/service.js'), 'indexSemanticAsset'>
 }
+function pickTask(kinds: BackgroundTaskKind[]): { source: (typeof sources)[number]; task: Task } | undefined {
+  for (let i = 0; i < sources.length; i++) {
+    const source = sources[(roundRobin + i) % sources.length]!
+    if (sourceOnline.get(source.id) === false || Date.now() < (blockedUntil.get(source.id) || 0)) continue
+    const task = backgroundQueue.next(source.id, kinds)
+    if (!task) continue
+    roundRobin = (roundRobin + i + 1) % sources.length
+    return { source, task }
+  }
+  return undefined
+}
+
+const taskLabel = (task: Task) => task.kind === 'semantic' ? 'CLIP 索引' : task.kind === 'translate' ? '自动翻译' : 'OCR 预热'
+
+/**
+ * 启动一轮后台任务。
+ *
+ * 远程模式会一次补满流水线（默认 3 个），而不是算完一张再等下一次 1 秒定时器：
+ * 上传、排队、推理和下载覆盖层互相重叠，计算端才不会在任务之间空转。
+ * 本地模式仍只有一个名额，并由占空比在任务之间休息。
+ */
 export async function runBackgroundTick(services?: BackgroundRuntimeServices) {
   if (ticking || stopped || scanStatus.running || Date.now() < cooldownUntil) return
+  if (activeTasks.size >= backgroundWorkerLimit()) return
   ticking = true
-  const started = Date.now()
-  let duty = 100, billed = false
   try {
     if (!sources.some(source => enabledKinds(normalizeSourceBackground(source.background)).length)) return
     const manga = services?.manga || await import('../ai/manga/service.js')
     if (manga.hasManualMangaWork()) return
-    for (let i=0; i<sources.length; i++) {
-      const source = sources[(roundRobin+i)%sources.length]!
-      if (sourceOnline.get(source.id) === false || Date.now() < (blockedUntil.get(source.id)||0)) continue
-      const task = backgroundQueue.next(source.id)
-      if (!task) continue
-      roundRobin = (roundRobin+i+1)%sources.length
+    const limit = backgroundWorkerLimit()
+    let guard = 0
+    while (activeTasks.size < limit && guard++ < sources.length * 8) {
+      const picked = pickTask(allowedKinds())
+      if (!picked) break
+      const { source, task } = picked
       const settings = normalizeSourceBackground(source.background)
       const asset = getAsset(task.asset_id)
-      if (!asset || task.stamp !== taskStamp(asset,task.kind) || !enabledKinds(settings).includes(task.kind)) { backgroundQueue.mark(task.id,'stopped'); continue }
+      if (!asset || task.stamp !== taskStamp(asset, task.kind) || !enabledKinds(settings).includes(task.kind)) {
+        backgroundQueue.mark(task.id, 'stopped')
+        continue
+      }
+      if (task.kind === 'translate' && backgroundQueue.control(source.id).consent !== translationSignature()) {
+        deferTask(source.id, task, 'AI 配置已变更，请重新确认自动翻译费用')
+        continue
+      }
+      if (task.kind === 'translate' && backgroundQueue.usage(source.id).requests >= settings.maxTranslationRequestsPerDay) {
+        deferTask(source.id, task, '今日自动翻译请求预算已用完；UTC 次日恢复')
+        continue
+      }
+      if (!backgroundQueue.reserve(source.id, 'pages', settings.maxPagesPerDay)) {
+        deferTask(source.id, task, '今日后台计算预算已用完；UTC 次日恢复')
+        continue
+      }
       const controller = new AbortController()
-      active = {task,controller}
-      assertAllowed(task,controller.signal)
-      if (task.kind === 'translate' && backgroundQueue.usage(source.id).requests >= settings.maxTranslationRequestsPerDay) throw new DeferredTask('今日自动翻译请求预算已用完；UTC 次日恢复')
-      if (!backgroundQueue.reserve(source.id,'pages',settings.maxPagesPerDay)) throw new DeferredTask('今日后台计算预算已用完；UTC 次日恢复')
-      backgroundQueue.mark(task.id,'running')
-      duty = getLocalComputeConfig().mode === 'local' || getLocalComputeConfig().fallback === 'local' ? settings.localDutyPercent : 100
-      const taskStarted = Date.now()
-      const label = task.kind === 'semantic' ? 'CLIP 索引' : task.kind === 'translate' ? '自动翻译' : 'OCR 预热'
-      logInfo('后台', `开始 ${label} · ${source.name} · ${asset.filename}`)
-      if (task.kind === 'semantic') {
-        const semantic = services?.semantic || await import('../semantic/service.js')
-        const result = await semantic.indexSemanticAsset(asset)
-        if (!result.indexed && result.reason !== 'cached') throw new Error(result.reason || 'CLIP 模型尚未就绪')
-        logInfo('后台', `${result.indexed ? '完成' : '跳过（已索引）'} ${label} · ${asset.filename} · ${formatDuration(Date.now() - taskStarted)}`)
-      } else {
-        await manga.runBackgroundMangaAsset(asset, { translate:task.kind === 'translate', signal:controller.signal, beforeTranslate: () => {
-          assertAllowed(task,controller.signal)
+      backgroundQueue.mark(task.id, 'running')
+      activeTasks.set(task.id, { task, controller })
+      logInfo('后台', `开始 ${taskLabel(task)} · ${source.name} · ${asset.filename}`)
+      void runBackgroundTask(source, task, asset, settings, controller, manga, services)
+    }
+  } finally { ticking = false }
+}
+
+async function runBackgroundTask(
+  source: (typeof sources)[number],
+  task: Task,
+  asset: StoredAsset,
+  settings: SourceBackgroundSettings,
+  controller: AbortController,
+  manga: BackgroundRuntimeServices['manga'],
+  services?: BackgroundRuntimeServices,
+) {
+  const started = Date.now()
+  let duty = 100, billed = false
+  // 只有真正在本机执行（本地模式或实际回退）才按占空比休息；远程任务被 1 秒
+  // 定时器拖慢已经是过去式，不能因为配置里保留了本地回退就人为降速。
+  let usedLocal = getLocalComputeConfig().mode === 'local'
+  try {
+    assertAllowed(task, controller.signal)
+    duty = usedLocal ? settings.localDutyPercent : 100
+    if (task.kind === 'semantic') {
+      const semantic = services?.semantic || await import('../semantic/service.js')
+      const result = await semantic.indexSemanticAsset(asset)
+      if (!result.indexed && result.reason !== 'cached') throw new Error(result.reason || 'CLIP 模型尚未就绪')
+      logInfo('后台', `${result.indexed ? '完成' : '跳过（已索引）'} ${taskLabel(task)} · ${asset.filename} · ${formatDuration(Date.now() - started)}`)
+    } else {
+      await manga.runBackgroundMangaAsset(asset, {
+        translate: task.kind === 'translate',
+        signal: controller.signal,
+        onLocalFallback: () => { usedLocal = true },
+        beforeTranslate: () => {
+          assertAllowed(task, controller.signal)
           if (manga.hasManualMangaWork()) throw new DeferredTask('让位给手动翻译')
           const current = normalizeSourceBackground(sourceById(source.id).background)
-          if (!backgroundQueue.reserve(source.id,'requests',current.maxTranslationRequestsPerDay)) throw new DeferredTask('今日自动翻译请求预算已用完；UTC 次日恢复')
+          if (!backgroundQueue.reserve(source.id, 'requests', current.maxTranslationRequestsPerDay)) throw new DeferredTask('今日自动翻译请求预算已用完；UTC 次日恢复')
           billed = true
-        } })
-        logInfo('后台', `完成 ${label} · ${asset.filename} · ${formatDuration(Date.now() - taskStarted)}`)
-      }
-      backgroundQueue.mark(task.id,'done')
-      backgroundQueue.message(source.id,'')
-      break
+        },
+      })
+      logInfo('后台', `完成 ${taskLabel(task)} · ${asset.filename} · ${formatDuration(Date.now() - started)}`)
     }
+    backgroundQueue.mark(task.id, 'done')
+    backgroundQueue.message(source.id, '')
   } catch (error) {
-    if (active) {
-      const {task,controller} = active
-      // 首次启用语义索引会先自动下载 CLIP 模型：这不是失败，等下载完成后重试。
-      const downloading = (error as { code?: string }).code === 'semantic_downloading'
-      const deferred = error instanceof DeferredTask || controller.signal.aborted || downloading
-      // After a request was reserved, interruption is ambiguous: require an explicit retry to avoid surprise billing.
-      const state = deferred && !billed ? (backgroundQueue.control(task.source_id).state === 'stopped' ? 'stopped' : 'queued') : 'failed'
-      backgroundQueue.mark(task.id,state,(error as Error).message)
-      backgroundQueue.message(task.source_id,(error as Error).message)
-      if (state === 'failed') logError('后台', `失败 ${task.kind === 'semantic' ? 'CLIP 索引' : task.kind === 'translate' ? '自动翻译' : 'OCR 预热'} · ${(error as Error).message}`)
-      else if (downloading) logInfo('后台', 'CLIP 模型正在下载/加载，任务稍后自动重试')
-      else logWarn('后台', `暂缓任务 · ${(error as Error).message}`)
-      blockedUntil.set(task.source_id,Date.now()+60000)
-    }
+    // 首次启用语义索引会先自动下载 CLIP 模型：这不是失败，等下载完成后重试。
+    const downloading = (error as { code?: string }).code === 'semantic_downloading'
+    const deferred = error instanceof DeferredTask || controller.signal.aborted || downloading
+    // After a request was reserved, interruption is ambiguous: require an explicit retry to avoid surprise billing.
+    const state = deferred && !billed ? (backgroundQueue.control(task.source_id).state === 'stopped' ? 'stopped' : 'queued') : 'failed'
+    backgroundQueue.mark(task.id, state, (error as Error).message)
+    backgroundQueue.message(task.source_id, (error as Error).message)
+    if (state === 'failed') logError('后台', `失败 ${taskLabel(task)} · ${(error as Error).message}`)
+    else if (downloading) logInfo('后台', 'CLIP 模型正在下载/加载，任务稍后自动重试')
+    else logWarn('后台', `暂缓任务 · ${(error as Error).message}`)
+    blockedUntil.set(task.source_id, Date.now() + 60000)
   } finally {
-    if (active) cooldownUntil = Date.now() + (Date.now()-started)*(100/duty-1)
-    active = null; ticking = false
+    activeTasks.delete(task.id)
+    if (usedLocal) duty = settings.localDutyPercent
+    if (usedLocal && duty < 100 && !stopped) cooldownUntil = Math.max(cooldownUntil, Date.now() + (Date.now() - started) * (100 / duty - 1))
+    // 有空位就立刻补，不必等下一次 1 秒定时器。
+    if (!stopped) void runBackgroundTick(services).catch(() => {})
   }
 }
+
 export function startBackgroundRuntime() {
   if (timer) return
   stopped = false; stopWatcher = new AbortController()
@@ -258,5 +336,5 @@ export function startBackgroundRuntime() {
 export function stopBackgroundRuntime() {
   stopped = true
   if (timer) clearInterval(timer)
-  timer = undefined; for (const check of directoryChecks.values()) check.abort(); stopWatcher?.abort(); active?.controller.abort(); removeScanListener?.()
+  timer = undefined; for (const check of directoryChecks.values()) check.abort(); stopWatcher?.abort(); for (const entry of activeTasks.values()) entry.controller.abort(); removeScanListener?.()
 }

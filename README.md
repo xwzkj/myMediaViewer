@@ -191,6 +191,8 @@ pnpm run start:compute
 | `MANGA_MODEL_DIR` | `<MEDIA_DATA_DIR>/models` | 模型目录，可与主服务共用同一份模型文件 |
 | `SEMANTIC_CLIP_MODEL_DIR` | `<MEDIA_DATA_DIR>/models/chinese-clip-vit-b16` | 可选：单独指定 CLIP 模型目录；不设置时首次使用自动下载到本进程的数据目录 |
 | `COMPUTE_INTRA_OP_THREADS` | 运行时决定 | ONNX Runtime 线程数，可按机器核数调整 |
+| `COMPUTE_CONCURRENCY` | `1` | 同时执行的计算任务数（1–4）。调高可让检测与 OCR 的空闲段重叠，但单任务延迟和内存占用会上升 |
+| `SEMANTIC_CLIP_THREADS` | `min(4, 核心数)` | 计算端 CLIP 单图编码线程数（1–16）；主服务本地 CLIP 仍用设置页的本地线程数 |
 
 在「AI 设置 → 本地 AI 执行位置」选择**远程计算端**，填入地址（例如 `http://192.168.1.10:3211`）和同一个 Key，点「测试连接」确认设备与模型状态。连接失败有两种策略：
 
@@ -198,6 +200,8 @@ pnpm run start:compute
 - **回退本地主机**：只有任务尚未被接收时的连接失败（拒绝连接、主机不可达、建连超时，默认 3 秒）才回退到本地主机；Key 错误、协议版本不符、资源超限、模型或推理失败都直接报错，不会悄悄算两遍。
 
 每个任务沿用提交时的设置，之后修改设置只影响新任务。远程任务总时限默认 15 分钟，与在线 AI 的请求超时相互独立。计算端从 /v1/jobs 接收原图，返回识别文本、坐标、底色和透明擦字覆盖层；主服务校验覆盖层摘要后原子写入自己的缓存，因此两端不需要共享目录。
+
+后台预热在远程模式下默认保留 3 个在途任务（`BACKGROUND_CONCURRENCY`，1–8），上传、排队、推理和结果下载互相重叠，计算端队列不会在两次计算之间空转；手动翻页/翻译会带 `x-compute-priority: manual`，计算端把它插到所有排队中的后台任务之前。计算端默认仍逐张执行，`COMPUTE_CONCURRENCY` 调到 2–4 可以进一步利用多核，代价是单任务延迟和内存上升。本地模式始终逐页执行。
 
 ## 日志
 
@@ -237,6 +241,7 @@ pnpm start
 | `PORT` | `3210` | HTTP 服务端口 |
 | `HOST` | `0.0.0.0` | 监听地址，仅本机可设为 `127.0.0.1` |
 | `MEDIA_DATA_DIR` | `./data` | 数据库、目录配置和缓存存放位置 |
+| `BACKGROUND_CONCURRENCY` | `3` | 远程模式下同时在途的后台预热任务数（1–8）；本地模式固定为 1 |
 | `HF_ENDPOINT` | `https://huggingface.co` | 漫画与 CLIP 模型的下载站点，可设置为镜像地址 |
 | `SEMANTIC_CLIP_MODEL_DIR` | `<MEDIA_DATA_DIR>/models/chinese-clip-vit-b16` | 可选：单独指定 CLIP 模型目录；不设置时首次使用自动下载 |
 | `FFMPEG_PATH` | `ffmpeg` | FFmpeg 可执行文件路径，也可直接加入 PATH |
