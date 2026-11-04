@@ -18,7 +18,6 @@ defineEmits<{ favorite: [work: Work]; cloudFavorite: [work: Work] }>()
 .favorite-action { display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border-radius: 6px; background: transparent; color: var(--muted); transition: background .15s, color .15s; }
 .favorite-action :deep(.icon) { width: 16px; height: 16px; }
 .favorite-action:hover { background: var(--surface-high); color: var(--text); }
-.favorite-action.local.selected { background: #f5e6e4; color: #9a555e; }
+.favorite-action.local.selected { background: var(--favorite-selected); color: var(--on-favorite-selected); }
 .favorite-action.cloud.selected { background: var(--primary-container); color: var(--primary); }
-:global(:root[data-theme=dark]) .favorite-action.local.selected { background: #543337; color: #e6b9b9; }
 </style>
