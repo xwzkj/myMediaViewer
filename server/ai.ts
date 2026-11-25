@@ -35,6 +35,8 @@ const defaults: AiSettings = {
   mangaAutoShowTranslated: true,
   // 默认仍在本机（主服务所在机器）计算，升级后现有行为不变。
   localCompute: {
+    // 本机 AI 计算总开关；关闭后只能用远程计算端（或暂停 AI 功能）。
+    localAiEnabled: true,
     mode: 'local',
     baseUrl: 'http://127.0.0.1:3211',
     fallback: 'error',
@@ -113,6 +115,8 @@ function parseLocalCompute(raw: unknown): { settings: LocalComputeSettings; apiK
   const apiKey = typeof value.apiKey === 'string' ? value.apiKey.trim() : ''
   return {
     settings: {
+      // 只有显式 false 才关闭；旧配置和异常值都保持"允许本机计算"。
+      localAiEnabled: typeof value.localAiEnabled === 'boolean' ? value.localAiEnabled : defaultsHere.localAiEnabled !== false,
       localThreads: clampRange(value.localThreads, defaultsHere.localThreads ?? 1, 1, 16),
       mode: asMode(value.mode, defaultsHere.mode),
       baseUrl: asText(value.baseUrl, defaultsHere.baseUrl) || defaultsHere.baseUrl,
@@ -217,6 +221,8 @@ export function saveAiSettings(input: unknown): AiSettings {
 
 /** 当前生效的本地计算配置（含 Key），只给服务端内部使用。 */
 export interface LocalComputeConfig {
+  /** 本机 AI 计算总开关；false 时不得在主机上加载或运行任何 ONNX 模型。 */
+  localAiEnabled: boolean
   mode: LocalComputeMode
   baseUrl: string
   fallback: LocalComputeFallback
@@ -228,11 +234,14 @@ export interface LocalComputeConfig {
 
 export function getLocalComputeConfig(): LocalComputeConfig {
   const lc = current.settings.localCompute
+  const localAiEnabled = lc.localAiEnabled !== false
   return {
+    localAiEnabled,
     localThreads: lc.localThreads ?? 1,
     mode: lc.mode,
     baseUrl: lc.baseUrl,
-    fallback: lc.fallback,
+    // 关闭本机 AI 后「回退本地主机」不再生效：任何本地计算都不会运行。
+    fallback: localAiEnabled ? lc.fallback : 'error',
     connectTimeoutMs: lc.connectTimeoutMs,
     timeoutMs: lc.timeoutMs,
     apiKey: effectiveComputeKey(),
@@ -247,11 +256,13 @@ export function mergeLocalComputeSettings(input: unknown): LocalComputeConfig {
     : {}
   const base = current.settings.localCompute
   const key = resolveLocalKey(input, effectiveComputeKey())
+  const localAiEnabled = typeof lc.localAiEnabled === 'boolean' ? lc.localAiEnabled : base.localAiEnabled !== false
   return {
+    localAiEnabled,
     localThreads: clampRange(lc.localThreads, base.localThreads ?? 1, 1, 16),
     mode: asMode(lc.mode, base.mode),
     baseUrl: typeof lc.baseUrl === 'string' && lc.baseUrl.trim() ? lc.baseUrl.trim() : base.baseUrl,
-    fallback: asFallback(lc.fallback, base.fallback),
+    fallback: localAiEnabled ? asFallback(lc.fallback, base.fallback) : 'error',
     connectTimeoutMs: clampRange(lc.connectTimeoutMs, base.connectTimeoutMs, MIN_COMPUTE_CONNECT, MAX_COMPUTE_CONNECT),
     timeoutMs: clampRange(lc.timeoutMs, base.timeoutMs, MIN_COMPUTE_TIMEOUT, MAX_COMPUTE_TIMEOUT),
     apiKey: key,
@@ -284,6 +295,7 @@ export function mergeAiSettings(input: unknown): AiSettings {
   // 设置页可能带着尚未保存的计算配置来测试连接，这里一并合并，但只保留公开字段。
   const compute = mergeLocalComputeSettings(input)
   merged.localCompute = {
+    localAiEnabled: compute.localAiEnabled,
     localThreads: compute.localThreads,
     mode: compute.mode,
     baseUrl: compute.baseUrl,

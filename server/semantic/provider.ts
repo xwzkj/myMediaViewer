@@ -26,6 +26,24 @@ export interface SemanticProvider {
 const unavailable = () => new SemanticError('semantic_unavailable', '语义模型不可用。请检查网络后重试，或切换回关键词搜索。', 503)
 const invalid = () => new SemanticError('semantic_model_invalid', '语义模型无法加载或格式不兼容；需要 Chinese-CLIP 的 ONNX 双塔导出与 tokenizer.json。', 503)
 
+/**
+ * 本机 AI 计算被关闭、又没有远程计算端时使用。
+ *
+ * 它连模型目录都不会碰：状态直接报告不可用，编码抛错，避免为了"看看能不能用"
+ * 而在低配主机上加载几百 MB 的 ONNX 会话。
+ */
+export class DisabledClipProvider implements SemanticProvider {
+  private readonly message: string
+  constructor(message = '本机 AI 计算已在设置中关闭：CLIP 语义索引与以文搜图已停用。要恢复请重新开启本机 AI，或改用远程计算端。') {
+    this.message = message
+  }
+  async status(): Promise<SemanticProviderStatus> {
+    return { ready: false, provider: 'local', model: '', dimensions: 512, message: this.message }
+  }
+  async embedText(): Promise<Float32Array> { throw new SemanticError('local_ai_disabled', this.message, 503) }
+  async embedImage(): Promise<Float32Array> { throw new SemanticError('local_ai_disabled', this.message, 503) }
+}
+
 /** 模型加载失败后短时间内不重复尝试，避免每次轮询都重新下载几百 MB。 */
 const FAILURE_COOLDOWN = 30_000
 

@@ -33,6 +33,27 @@ test('本地计算设置：Key 不回传、缺省保留、显式清除', async t
     assert.equal(settings.localCompute.mode, 'local')
     assert.equal(settings.localCompute.fallback, 'error')
     assert.equal(settings.localCompute.apiKeyConfigured, false)
+    assert.equal(settings.localCompute.localAiEnabled, true, '缺少开关字段的旧配置按开启处理')
+  })
+
+  await t.test('关闭本机 AI 写入配置，并让回退本机策略失效', () => {
+    saveAiSettings({
+      ...base,
+      localCompute: { mode: 'remote', baseUrl: 'http://10.0.0.9:3211', fallback: 'local', localAiEnabled: false },
+    })
+    assert.equal(getAiSettings().localCompute.localAiEnabled, false)
+    assert.equal(getAiSettings().localCompute.fallback, 'local', '保存的偏好保留，重新开启后还能用')
+    const effective = getLocalComputeConfig()
+    assert.equal(effective.localAiEnabled, false)
+    assert.equal(effective.fallback, 'error', '关闭本机 AI 后不得回退本地')
+    assert.equal(mergeLocalComputeSettings({}).fallback, 'error')
+    assert.equal(mergeLocalComputeSettings({ localCompute: { localAiEnabled: true } }).localAiEnabled, true)
+
+    saveAiSettings({
+      ...base,
+      localCompute: { mode: 'remote', baseUrl: 'http://10.0.0.9:3211', fallback: 'local', localAiEnabled: true },
+    })
+    assert.equal(getLocalComputeConfig().fallback, 'local', '重新开启后恢复原有回退策略')
   })
 
   await t.test('本地线程默认为 1，保存与测试配置始终限制在 1–16', () => {

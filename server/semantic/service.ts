@@ -6,13 +6,14 @@ import { formatDuration, logInfo, oneLine } from '../log.js'
 import { COMPUTE_MAX_UPLOAD_BYTES } from '../../shared/compute.js'
 import type { Work } from '../../shared/types.js'
 import type { SemanticIndexResult, SemanticSearchStatus } from '../../shared/semantic.js'
-import { LocalClipProvider, type SemanticProvider, type SemanticProviderStatus } from './provider.js'
+import { DisabledClipProvider, LocalClipProvider, type SemanticProvider, type SemanticProviderStatus } from './provider.js'
 import { RemoteClipProvider } from './remote.js'
 import { assetFingerprint, SemanticStore } from './store.js'
 import { SemanticError } from './vectors.js'
 
 export const semanticStore = new SemanticStore(db)
 let localProvider: LocalClipProvider | undefined
+const disabledProvider = new DisabledClipProvider()
 
 /** 正在自动下载模型时用可重试的错误码，后台任务据此稍后重试而不是判定失败。 */
 function semanticUnavailableCode(status: SemanticProviderStatus): string {
@@ -20,6 +21,8 @@ function semanticUnavailableCode(status: SemanticProviderStatus): string {
 }
 export function getSemanticProvider(): SemanticProvider {
   const config = getLocalComputeConfig()
+  // 本机 AI 被关闭且没有远程计算端：不创建本地会话，直接报告不可用。
+  if (config.mode !== 'remote' && !config.localAiEnabled) return disabledProvider
   // One immutable native model pair per process. CLIP 模型在首次使用时自动下载，
   // 线程数变更需要重启（见 SEMANTIC.md）；切换计算模式不会重新分配已有会话。
   localProvider ||= new LocalClipProvider({ threads: config.localThreads })

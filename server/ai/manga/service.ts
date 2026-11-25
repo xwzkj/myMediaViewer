@@ -6,7 +6,7 @@ import type { MangaJob, MangaModelStatus, MangaPageResult, MangaPipelineMode, Ma
 import { getAiSettings, getLocalComputeConfig, translateMangaTexts } from '../../ai.js'
 import { cacheDir } from '../../config.js'
 import { db, getAsset, type StoredAsset } from '../../database.js'
-import { MangaEngine, PIPELINE_VERSION, type EnginePage } from './engine.js'
+import { MangaEngine, MangaEngineError, PIPELINE_VERSION, type EnginePage } from './engine.js'
 import { checkRemoteCompute, RemoteComputeError, runRemoteMangaJob } from './remote.js'
 import { formatDuration, logError, logInfo, logWarn } from '../../log.js'
 import { modelRoot } from './models.js'
@@ -77,7 +77,19 @@ export function clearMangaStatusCache(): void {
  */
 export async function getMangaModelStatus(): Promise<MangaModelStatus> {
   const compute = getLocalComputeConfig()
-  if (compute.mode !== 'remote') return { ...localEngine.modelStatus(), location: 'local' }
+  if (compute.mode !== 'remote') {
+    const local = localEngine.modelStatus()
+    if (!compute.localAiEnabled) {
+      return {
+        ...local,
+        ready: false,
+        device: '本机（AI 计算已关闭）',
+        location: 'local',
+        message: '本机 AI 计算已在设置中关闭：漫画检测与识别不会运行。要恢复请重新开启本机计算，或把执行位置改为可用的远程计算端。',
+      }
+    }
+    return { ...local, location: 'local' }
+  }
 
   const configured = Boolean(compute.baseUrl && compute.apiKey)
   if (!configured) {
@@ -216,9 +228,7 @@ export async function runBackgroundMangaAsset(
   // 只有真实译文才能直接返回；OCR 预热结果仅用于跳过重复识别。
   if (info.cached) return info.cached
   if (!options.translate && info.prepared) return info.prepared
-  const page = info.prepared
-    ? await hydratePrepared(asset, info)
-    : await recognizePage(asset, info, () => {}, 'background', options.signal, options.onLocalFallback)
+  const page = await preparedOrRecognize(asset, info, () => {}, 'background', options.signal, options.onLocalFallback)
   options.signal?.throwIfAborted()
   if (page.empty) return page.empty
   // 预热只缓存「识别 + 底图」，不写 manga_translations，避免被当成已翻译结果。
@@ -292,6 +302,15 @@ function placeholderPage(): EnginePage {
   }
 }
 
+/** 本机 AI 关闭时的统一错误：告诉用户去哪里恢复，而不是让任务静默失败。 */
+function localAiDisabled(): MangaEngineError {
+  return new MangaEngineError(
+    '本机 AI 计算已在设置中关闭，这张图还没有识别结果，无法在本机完成。请重新开启本机 AI，或把执行位置改为可用的远程计算端。',
+    503,
+    'local_ai_disabled',
+  )
+}
+
 /**
  * 把一页交给当前选择的计算位置。
  *
@@ -300,6 +319,9 @@ function placeholderPage(): EnginePage {
  */
 async function computePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void, priority: 'manual' | 'background' = 'manual', signal?: AbortSignal, onLocalFallback?: () => void): Promise<EnginePage> {
   const compute = getLocalComputeConfig()
+  // 本机 AI 被关闭且没有远程计算端时，这一页不能在本机算；明确报错，
+  // 不要因为"页面没预热"就悄悄加载模型把主机拖慢。
+  if (compute.mode !== 'remote' && !compute.localAiEnabled) throw localAiDisabled()
   if (compute.mode === 'remote') {
     // 远程模式：后台任务按流水线深度并发，手动任务可以越过已满的后台名额。
     // 计算端会按请求头优先执行手动任务，所以再排队也只是上传先后不同。
@@ -333,6 +355,22 @@ async function recognizePage(asset: StoredAsset, info: PreparedAsset, setStage: 
   const prepared: PreparedPage = { asset, key: info.key, targetLanguage: info.targetLanguage, page }
   if (!page.regions.length) prepared.empty = emptyResult(asset, info.key, info.targetLanguage)
   return prepared
+}
+
+/**
+ * 所有翻译流水线都从这里拿「本地识别结果」。
+ *
+ * 已有 OCR 预热（`info.prepared`）时只还原文本与坐标，跳过检测 / OCR / 擦字：
+ * 预热本来就是为了让手点翻译时只补一次在线请求，不能因为换了一种流水线就在本机重算。
+ */
+async function preparedOrRecognize(
+  asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void,
+  priority: 'manual' | 'background' = 'manual', signal?: AbortSignal, onLocalFallback?: () => void,
+): Promise<PreparedPage> {
+  if (!info.prepared) return recognizePage(asset, info, setStage, priority, signal, onLocalFallback)
+  signal?.throwIfAborted()
+  setStage('复用 OCR 预热结果')
+  return hydratePrepared(asset, info)
 }
 
 /** 把一页的译文写进缓存并返回最终结果（底图在本地或远程计算阶段已经生成）。 */
@@ -629,11 +667,13 @@ async function runStreaming(job: InternalJob, assets: StoredAsset[], force: bool
         if (info.cached) {
           pushResult(job, asset.id, info.cached, assets.length)
         } else {
-          const page = await recognizePage(asset, info, stage => {
+          // 预热过就只还原文字与坐标，绝不能在点翻译时重新跑一遍本地识别。
+          const page = await preparedOrRecognize(asset, info, stage => {
             recognitionStage = `${prefix}${stage}`
             updateStage()
           })
-          logInfo('任务', `${jobLabel(job)} ${prefix}识别完成 · ${page.page.regions.length} 处文本 · 检测 ${formatDuration(page.page.timings.detectionMs)} / OCR ${formatDuration(page.page.timings.ocrMs)}`)
+          logInfo('任务', `${jobLabel(job)} ${prefix}${info.prepared ? '复用 OCR 预热结果' : '识别完成'} · ${page.page.regions.length} 处文本`
+            + (info.prepared ? '' : ` · 检测 ${formatDuration(page.page.timings.detectionMs)} / OCR ${formatDuration(page.page.timings.ocrMs)}`))
           if (page.empty) pushResult(job, asset.id, page.empty, assets.length)
           else pending.push(finishPage(page, prefix))
         }
@@ -675,9 +715,10 @@ async function runBatched(job: InternalJob, assets: StoredAsset[], force: boolea
         continue
       }
       job.stage = `${prefix}本地识别`
-      const page = await recognizePage(asset, info, stage => { job.stage = `${prefix}${stage}` })
+      const page = await preparedOrRecognize(asset, info, stage => { job.stage = `${prefix}${stage}` })
       prepared.push(page)
-      logInfo('任务', `${jobLabel(job)} ${prefix}识别完成 · ${page.page.regions.length} 处文本 · 检测 ${formatDuration(page.page.timings.detectionMs)} / OCR ${formatDuration(page.page.timings.ocrMs)}`)
+      logInfo('任务', `${jobLabel(job)} ${prefix}${info.prepared ? '复用 OCR 预热结果' : '识别完成'} · ${page.page.regions.length} 处文本`
+        + (info.prepared ? '' : ` · 检测 ${formatDuration(page.page.timings.detectionMs)} / OCR ${formatDuration(page.page.timings.ocrMs)}`))
     } catch (error) {
       recordFailure(job, asset, error, stage => { job.stage = `${prefix}${stage}` }, prefix)
     }
@@ -780,7 +821,7 @@ async function processAsset(
   setStage('等待本地识别资源')
   // 计算本身（本地或远程）由 computePage 串行化；这里只负责翻译与落盘。
   // 已有 OCR 预热时直接复用底图与文本，只补翻译这一次网络调用。
-  const page = info.prepared ? await hydratePrepared(asset, info) : await recognizePage(asset, info, setStage)
+  const page = await preparedOrRecognize(asset, info, setStage)
   if (page.empty) return page.empty
   setStage(`AI 翻译 ${page.page.regions.length} 处文字`)
   const translated = await translateMangaTexts({

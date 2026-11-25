@@ -31,6 +31,8 @@ const showKey = ref(false)
 const timeoutSeconds = ref(120)
 const pipelineMode = ref<AiSettings['mangaPipelineMode']>('streaming')
 const concurrency = ref(3)
+// 本机 AI 计算总开关：关闭后主服务所在机器不跑任何 ONNX 识别/编码。
+const localAiEnabled = ref(true)
 // 本地 AI 执行位置：本地主机或同一项目的远程计算端。Key 只在提交时上传，接口不回传明文。
 const computeMode = ref<LocalComputeMode>('local')
 const localThreads = ref(1)
@@ -65,6 +67,8 @@ function apply(data: AiSettings) {
   pipelineMode.value = data.mangaPipelineMode || 'streaming'
   concurrency.value = Math.min(10, Math.max(1, data.mangaConcurrency || 3))
   computeMode.value = data.localCompute.mode === 'remote' ? 'remote' : 'local'
+  // 旧服务端没有这个字段时按"允许本机计算"处理。
+  localAiEnabled.value = data.localCompute.localAiEnabled !== false
   localThreads.value = data.localCompute.localThreads || 1
   computeBaseUrl.value = data.localCompute.baseUrl || ''
   computeFallback.value = data.localCompute.fallback === 'local' ? 'local' : 'error'
@@ -97,6 +101,7 @@ function buildPayload() {
   const local = current.localCompute
   const key = computeKeyDraft.value.trim()
   const localCompute: LocalComputeSettings = {
+    localAiEnabled: localAiEnabled.value,
     localThreads: Math.min(16, Math.max(1, Math.round(Number(localThreads.value) || 1))),
     mode: computeMode.value,
     baseUrl: computeBaseUrl.value.trim() || local.baseUrl,
@@ -268,13 +273,23 @@ function pickModel(model: string) {
         <label v-if="pipelineMode === 'parallel' || pipelineMode === 'streaming'" class="concurrency-field">并发数<input v-model.number="concurrency" type="number" min="1" max="10" step="1" /><span>同时进行的翻译请求数，1 - 10，默认 3。接口限流时调小。</span></label>
       </div>
       <div class="field">
+        <span>本机 AI 计算</span>
+        <label class="manga-auto-setting">
+          <input v-model="localAiEnabled" type="checkbox" />
+          <span><strong>允许这台机器执行 AI 识别</strong><small>关闭后本机不再运行漫画检测、OCR、擦字与 CLIP 语义编码，后台索引 / 预热 / 自动翻译会暂停，已有译图与预热结果仍可复用；需要识别时请配置可用的远程计算端。在线翻译请求不受影响。</small></span>
+        </label>
+        <p v-if="!localAiEnabled && computeMode === 'local'" class="helper" role="status">
+          <Icon name="warning" :size="17" />本机 AI 已关闭，执行位置仍是「本地主机」：点击翻译或语义搜索会直接提示不可用。请重新开启本机 AI，或把执行位置改为远程计算端。
+        </p>
+      </div>
+      <div class="field">
         <span>本地 AI 执行位置</span>
         <div class="pipeline-options">
           <label class="pipeline-option" :class="{ active: computeMode === 'local' }">
-            <input v-model="computeMode" name="local-compute" type="radio" value="local" />
+            <input v-model="computeMode" name="local-compute" type="radio" value="local" :disabled="!localAiEnabled" />
             <span class="pipeline-copy">
               <span class="pipeline-name">本地主机</span>
-              <span class="pipeline-desc">检测、识别与擦字都在运行主服务的这台机器上完成。</span>
+              <span class="pipeline-desc">{{ localAiEnabled ? '检测、识别与擦字都在运行主服务的这台机器上完成。' : '本机 AI 计算已关闭，此选项不会执行任何计算。' }}</span>
             </span>
           </label>
           <label class="pipeline-option" :class="{ active: computeMode === 'remote' }">
@@ -285,7 +300,7 @@ function pickModel(model: string) {
             </span>
           </label>
         </div>
-        <label v-if="computeMode === 'local'" class="field">本地 ONNX 线程上限<input v-model.number="localThreads" type="number" min="1" max="16" required /><span>默认 1，给 API 和媒体读取预留算力。E3-1226 v3 等 CPU 主机建议 1–2；后台一次处理一项，并通过来源占空比休息。远程回退沿用已保存限制。</span></label>
+        <label v-if="computeMode === 'local' && localAiEnabled" class="field">本地 ONNX 线程上限<input v-model.number="localThreads" type="number" min="1" max="16" required /><span>默认 1，给 API 和媒体读取预留算力。E3-1226 v3 等 CPU 主机建议 1–2；后台一次处理一项，并通过来源占空比休息。远程回退沿用已保存限制。</span></label>
         <template v-if="computeMode === 'remote'">
           <label class="field">远程 API 地址<input v-model="computeBaseUrl" placeholder="http://192.168.1.10:3211" spellcheck="false" autocomplete="off" /><span>填写计算端的基础地址，默认端口 3211。</span></label>
           <label class="field">API Key
@@ -297,7 +312,7 @@ function pickModel(model: string) {
             <span v-else-if="computeKeyConfigured">已保存 Key，留空表示不修改。</span>
             <span v-else>尚未配置 Key，远程模式需要填写后才能测试连接。</span>
           </label>
-          <div class="field">
+          <div v-if="localAiEnabled" class="field">
             <span>连接失败策略</span>
             <div class="pipeline-options">
               <label class="pipeline-option" :class="{ active: computeFallback === 'error' }">
@@ -316,13 +331,14 @@ function pickModel(model: string) {
               </label>
             </div>
           </div>
+          <p v-else class="helper">本机 AI 计算已关闭：连不上远程计算端时只报错，不会回退到本机。</p>
           <div class="ai-actions">
             <button type="button" class="button tonal small" :disabled="testingCompute" @click="testCompute"><Icon name="refresh" :class="{ spinning: testingCompute }" :size="17" />{{ testingCompute ? '正在测试…' : '测试连接' }}</button>
           </div>
           <p v-if="computeResult" class="ai-result" role="status"><Icon name="success" :size="17" />协议 v{{ computeResult.protocol }} · 设备 {{ computeResult.device }} · {{ computeResult.ready ? '已就绪' : '尚未就绪' }}{{ computeResult.message ? ' · ' + computeResult.message : '' }}</p>
           <p v-if="computeError" class="inline-error" role="alert"><Icon name="warning" :size="19" />{{ computeError }}</p>
         </template>
-        <span>本地主机指运行主服务的这台机器；远程计算端只做检测、识别与擦字，在线翻译仍由主服务发起。</span>
+        <span>本地主机指运行主服务的这台机器；远程计算端只做检测、识别与擦字，在线翻译仍由主服务发起。关闭本机 AI 后，已有译图照常显示；没有识别结果的页面需要远程计算端才能翻译。</span>
       </div>
       <label class="manga-auto-setting">
         <input v-model="settings.mangaAutoShowTranslated" type="checkbox" />

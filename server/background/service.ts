@@ -20,6 +20,8 @@ let timer: ReturnType<typeof setInterval> | undefined
 let checking = false, ticking = false, synchronizing: Promise<void> | null = null, syncAgain = false
 let stopped = false, cooldownUntil = 0, roundRobin = 0
 let semanticRevision = 'unavailable'
+/** 本机 AI 关闭导致后台暂停时只提示一次，避免每秒刷日志。 */
+let localAiPaused = false
 const nextChecks = new Map<string, number>()
 const directoryChecks = new Map<string,AbortController>()
 const blockedUntil = new Map<string, number>()
@@ -104,7 +106,8 @@ export function controlBackground(sourceId: string, action: 'pause' | 'stop' | '
 }
 export function getBackgroundStatus(): BackgroundStatus {
   const signature = translationSignature()
-  return { localComputeMode: getLocalComputeConfig().mode, active: [...activeTasks.values()].map(({ task }) => ({ sourceId: task.source_id, assetId: task.asset_id, kind: task.kind })), sources: sources.map(source => {
+  const compute = getLocalComputeConfig()
+  return { localComputeMode: compute.mode, localAiEnabled: compute.localAiEnabled, active: [...activeTasks.values()].map(({ task }) => ({ sourceId: task.source_id, assetId: task.asset_id, kind: task.kind })), sources: sources.map(source => {
     const control = backgroundQueue.control(source.id), usage = backgroundQueue.usage(source.id)
     return { sourceId:source.id, settings:normalizeSourceBackground(source.background), state:control.state, counts:backgroundQueue.counts(source.id), pagesToday:usage.pages, translationRequestsToday:usage.requests, translationConsentValid:control.consent === signature, lastFileCount:control.file_count, lastCheckedAt:control.checked, message:control.message }
   }) }
@@ -241,6 +244,16 @@ function assetSpecificFailure(error: unknown): boolean {
 export async function runBackgroundTick(services?: BackgroundRuntimeServices) {
   if (ticking || stopped || scanStatus.running || Date.now() < cooldownUntil) return
   if (activeTasks.size >= backgroundWorkerLimit()) return
+  // 本机 AI 已关闭且没有远程计算端：后台任务必然失败，不要反复领取、刷日志。
+  const compute = getLocalComputeConfig()
+  if (compute.mode !== 'remote' && !compute.localAiEnabled) {
+    if (!localAiPaused) {
+      localAiPaused = true
+      logWarn('后台', '本机 AI 计算已关闭，后台 CLIP 索引、OCR 预热与自动翻译暂停；重新开启本机 AI 或改用远程计算端后自动恢复')
+    }
+    return
+  }
+  localAiPaused = false
   ticking = true
   try {
     if (!sources.some(source => enabledKinds(normalizeSourceBackground(source.background)).length)) return
