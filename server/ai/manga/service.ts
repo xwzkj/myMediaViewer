@@ -6,7 +6,7 @@ import type { MangaJob, MangaModelStatus, MangaPageResult, MangaPipelineMode, Ma
 import { getAiSettings, getLocalComputeConfig, translateMangaTexts } from '../../ai.js'
 import { cacheDir } from '../../config.js'
 import { db, getAsset, type StoredAsset } from '../../database.js'
-import { MangaEngine, MangaEngineError, PIPELINE_VERSION, type EnginePage } from './engine.js'
+import { MangaEngine, PIPELINE_VERSION, type EnginePage } from './engine.js'
 import { checkRemoteCompute, RemoteComputeError, runRemoteMangaJob } from './remote.js'
 import { formatDuration, logError, logInfo, logWarn } from '../../log.js'
 import { modelRoot } from './models.js'
@@ -77,19 +77,7 @@ export function clearMangaStatusCache(): void {
  */
 export async function getMangaModelStatus(): Promise<MangaModelStatus> {
   const compute = getLocalComputeConfig()
-  if (compute.mode !== 'remote') {
-    const local = localEngine.modelStatus()
-    if (!compute.localAiEnabled) {
-      return {
-        ...local,
-        ready: false,
-        device: '本机（AI 计算已关闭）',
-        location: 'local',
-        message: '本机 AI 计算已在设置中关闭：漫画检测与识别不会运行。要恢复请重新开启本机计算，或把执行位置改为可用的远程计算端。',
-      }
-    }
-    return { ...local, location: 'local' }
-  }
+  if (compute.mode !== 'remote') return { ...localEngine.modelStatus(), location: 'local' }
 
   const configured = Boolean(compute.baseUrl && compute.apiKey)
   if (!configured) {
@@ -302,15 +290,6 @@ function placeholderPage(): EnginePage {
   }
 }
 
-/** 本机 AI 关闭时的统一错误：告诉用户去哪里恢复，而不是让任务静默失败。 */
-function localAiDisabled(): MangaEngineError {
-  return new MangaEngineError(
-    '本机 AI 计算已在设置中关闭，这张图还没有识别结果，无法在本机完成。请重新开启本机 AI，或把执行位置改为可用的远程计算端。',
-    503,
-    'local_ai_disabled',
-  )
-}
-
 /**
  * 把一页交给当前选择的计算位置。
  *
@@ -319,9 +298,6 @@ function localAiDisabled(): MangaEngineError {
  */
 async function computePage(asset: StoredAsset, info: PreparedAsset, setStage: (stage: string) => void, priority: 'manual' | 'background' = 'manual', signal?: AbortSignal, onLocalFallback?: () => void): Promise<EnginePage> {
   const compute = getLocalComputeConfig()
-  // 本机 AI 被关闭且没有远程计算端时，这一页不能在本机算；明确报错，
-  // 不要因为"页面没预热"就悄悄加载模型把主机拖慢。
-  if (compute.mode !== 'remote' && !compute.localAiEnabled) throw localAiDisabled()
   if (compute.mode === 'remote') {
     // 远程模式：后台任务按流水线深度并发，手动任务可以越过已满的后台名额。
     // 计算端会按请求头优先执行手动任务，所以再排队也只是上传先后不同。

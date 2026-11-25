@@ -41,8 +41,6 @@ export interface BackgroundSourceStatus {
 }
 export interface BackgroundStatus {
   localComputeMode: 'local' | 'remote'
-  /** 本机 AI 计算是否允许；关闭且选择本地主机时后台任务会暂停。 */
-  localAiEnabled: boolean
   sources: BackgroundSourceStatus[]
   /** 远程模式可能同时有多项；本地模式最多一项。 */
   active: Array<{ sourceId: string; assetId: string; kind: BackgroundTaskKind }>

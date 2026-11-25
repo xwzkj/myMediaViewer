@@ -1,31 +1,28 @@
 import test, { after, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, writeFile, rm } from 'node:fs/promises'
 import { mkdtempSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { setImmediate as nextTurn } from 'node:timers/promises'
 import sharp from 'sharp'
-import { customRules } from '../shared/source-presets.js'
-import { normalizeSourceBackground } from '../shared/background.js'
 import type { StoredAsset } from '../server/database.js'
 
 /**
- * 本机 AI 开关，以及「预热过就不要再识别」。
+ * 预热过的页面，点翻译时只能补在线请求。
  *
- * 用户点翻译时，预热结果必须直接复用；本机 AI 关闭后，主服务不得再加载 ONNX 会话，
- * 也不能因为「页面还没预热」就悄悄回退到本机算一遍。
+ * 预热缓存本来就是为了跳过检测 / OCR；此前只有逐页模式复用预热结果，默认的
+ * 「边识别边并发翻译」和合并 / 并发模式会重新跑一遍本地识别。
  */
 
-const root = mkdtempSync(path.join(os.tmpdir(), 'media-local-ai-'))
+const root = mkdtempSync(path.join(os.tmpdir(), 'media-manga-prewarm-'))
 process.env.MEDIA_DATA_DIR = path.join(root, 'data')
 
-const { saveAiSettings, getAiSettings, getLocalComputeConfig } = await import('../server/ai.js')
+const { saveAiSettings } = await import('../server/ai.js')
 const { db } = await import('../server/database.js')
 const { ComicTextDetector } = await import('../server/ai/manga/detector.js')
 const { MangaOcrRecognizer } = await import('../server/ai/manga/recognizer.js')
 const manga = await import('../server/ai/manga/service.js')
-const semantic = await import('../server/semantic/service.js')
 
 after(async () => {
   db.close()
@@ -79,17 +76,8 @@ async function finished(id: string) {
   throw new Error('测试任务未在时限内完成')
 }
 
-async function waitFor(check: () => boolean, label: string, timeout = 3000) {
-  const deadline = Date.now() + timeout
-  while (Date.now() < deadline) {
-    if (check()) return
-    await new Promise(resolve => setTimeout(resolve, 10))
-  }
-  assert.fail(`等待超时：${label}`)
-}
-
 test('预热过的页面：点翻译复用 OCR 结果，不再跑本地检测与识别', async t => {
-  save({ mangaPipelineMode: 'streaming', localCompute: { mode: 'local', localAiEnabled: true } })
+  save({ mangaPipelineMode: 'streaming' })
   const { detect, ocr } = mockEngine(t)
   const fetchMock = mockTranslation(t)
   const asset = await makeAsset('warm-streaming')
@@ -109,7 +97,7 @@ test('预热过的页面：点翻译复用 OCR 结果，不再跑本地检测与
 })
 
 test('先批量识别再合并翻译：同样复用预热结果', async t => {
-  save({ mangaPipelineMode: 'merged', localCompute: { mode: 'local', localAiEnabled: true } })
+  save({ mangaPipelineMode: 'merged' })
   const { detect, ocr } = mockEngine(t)
   const fetchMock = mockTranslation(t)
   const asset = await makeAsset('warm-merged', '#224466')
@@ -124,56 +112,4 @@ test('先批量识别再合并翻译：同样复用预热结果', async t => {
   assert.equal(detect.mock.callCount(), 1, '合并模式也不能重新识别预热过的页面')
   assert.equal(ocr.mock.callCount(), 1)
   assert.equal(fetchMock.mock.callCount(), 1)
-})
-
-test('关闭本机 AI：本地模式不跑识别、明确报错，语义与后台同时停用', async t => {
-  save({ mangaPipelineMode: 'streaming', localCompute: { mode: 'local', localAiEnabled: false } })
-  assert.equal(getAiSettings().localCompute.mode, 'local', '保留用户的执行位置偏好')
-  assert.equal(getLocalComputeConfig().localAiEnabled, false)
-
-  const { detect, ocr } = mockEngine(t)
-  const fetchMock = mockTranslation(t)
-  const asset = await makeAsset('disabled-local', '#663322')
-  const job = await finished((await manga.startMangaTranslation(asset)).id)
-  assert.equal(job.state, 'failed')
-  assert.match(job.message || '', /本机 AI 计算已.*关闭/)
-  assert.equal(detect.mock.callCount(), 0, '关闭后不得检测')
-  assert.equal(ocr.mock.callCount(), 0, '关闭后不得 OCR')
-  assert.equal(fetchMock.mock.callCount(), 0, '没有识别结果就不该发翻译请求')
-
-  await t.test('模型状态与语义状态都明确说明本机 AI 已关闭', async () => {
-    const status = await manga.getMangaModelStatus()
-    assert.equal(status.ready, false)
-    assert.match(status.message || '', /本机 AI 计算已.*关闭/)
-    const semanticStatus = await semantic.getSemanticProvider().status()
-    assert.equal(semanticStatus.ready, false)
-    assert.match(semanticStatus.message || '', /本机 AI/)
-  })
-
-  await t.test('后台索引、预热与自动翻译暂停，重新开启后自动恢复', async () => {
-    const media = path.join(root, 'media')
-    await mkdir(media, { recursive: true })
-    await writeFile(path.join(media, '1.jpg'), 'test')
-    const { saveSources } = await import('../server/config.js')
-    const { scanLibrary } = await import('../server/scanner.js')
-    const background = await import('../server/background/service.js')
-    saveSources([{ id: 's', name: 'Test', kind: 'custom', path: media, rules: customRules() }])
-    await scanLibrary()
-    background.saveBackgroundSettings('s', { ...normalizeSourceBackground(undefined), ocr: true })
-    await background.synchronizeBackground()
-
-    let calls = 0
-    const runtime = { manga: { hasManualMangaWork: () => false, runBackgroundMangaAsset: async () => { calls++ } } }
-    await background.runBackgroundTick(runtime)
-    await new Promise(resolve => setTimeout(resolve, 20))
-    assert.equal(calls, 0, '本机 AI 关闭时不得领取后台任务')
-    assert.equal(background.getBackgroundStatus().localAiEnabled, false)
-
-    save({ localCompute: { mode: 'local', localAiEnabled: true } })
-    await background.runBackgroundTick(runtime)
-    await waitFor(() => calls === 1, '重新开启后后台继续')
-
-    background.stopBackgroundRuntime()
-    saveSources([])
-  })
 })

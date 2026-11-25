@@ -547,32 +547,11 @@ ready 时返回 `video/mp4`，支持 Range。未就绪、文件或来源不可�
   "params": { "thinking": { "type": "disabled" } },
   "timeoutMs": 120000,
   "mangaPipelineMode": "sequential",
-  "mangaConcurrency": 3,
-  "localCompute": {
-    "localAiEnabled": true,
-    "mode": "remote",
-    "baseUrl": "http://192.168.1.10:3211",
-    "fallback": "error",
-    "connectTimeoutMs": 3000,
-    "timeoutMs": 900000,
-    "localThreads": 1
-  }
+  "mangaConcurrency": 3
 }
 ```
 
 上例使用空追加提示词；需要保留内置默认追加内容时使用 GET 返回的值。
-
-`localCompute` 是主服务所在机器的 AI 计算配置：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `localAiEnabled` | boolean | 本机 AI 计算总开关，默认 `true`。`false` 时本机不加载或运行漫画检测 / OCR / 擦字与 CLIP 编码；执行位置为 `local` 时任务直接返回 503（`local_ai_disabled`），后台任务暂停 |
-| `mode` | `"local"` / `"remote"` | 本地主机或远程计算端；关闭本机 AI 后 `local` 不再生效 |
-| `baseUrl` | string | 远程计算端地址；`mode=remote` 时必须为 HTTP(S) |
-| `fallback` | `"error"` / `"local"` | 远程建连失败是否回退本机；`localAiEnabled=false` 时保存的偏好保留，但实际按 `error` 执行 |
-| `localThreads` | number | 本地 ONNX 线程上限，1–16，默认 1 |
-| `apiKeyConfigured` | boolean | 只读；响应里不返回计算端 Key 本体 |
-
 
 ### 7.4 POST /api/ai/test
 
@@ -677,7 +656,7 @@ ready 时返回 `video/mp4`，支持 Range。未就绪、文件或来源不可�
 }
 ```
 
-`message` 为可选展示文本，实际值可能包含服务端路径。`device` 按运行平台给出预期执行方式。首次需要 OCR 时会自动下载缺失的 HuggingFace 文件；所有平台使用固定 fp16 encoder，旧量化 encoder 不算模型就绪。关闭本机 AI 且执行位置为本地主机时，`ready` 恒为 `false`，`message` 会说明开关状态。
+`message` 为可选展示文本，实际值可能包含服务端路径。`device` 按运行平台给出预期执行方式。首次需要 OCR 时会自动下载缺失的 HuggingFace 文件；所有平台使用固定 fp16 encoder，旧量化 encoder 不算模型就绪。
 
 ### 8.2 POST /api/ai/manga/translate
 
@@ -697,7 +676,6 @@ ready 时返回 `video/mp4`，支持 Range。未就绪、文件或来源不可�
 - 无有效 ID 返回 400。逐个检查媒体，只允许 `kind=image` 且扩展名不是 gif；类型不符返回 400，不存在或目录离线返回 404，前置校验失败不创建任务。
 - 目标语言、流水线模式和并发数来自已保存配置，此接口没有对应覆盖参数。
 - 已有译图缓存直接返回 ready；只有 OCR 预热结果的页面复用其文本与坐标，不再重新检测 / OCR，只补在线翻译。
-- 本机 AI 关闭且执行位置为本地主机时，需要识别的页面按 503（`local_ai_disabled`）失败，不会加载本地 ONNX 模型。
 - `force: true` 请求重新识别和翻译。相同媒体 ID 集合已有 queued/processing 任务时复用该任务，force 不会另外创建并行副本。
 - 正常返回 **200 和 MangaJob**，不是 202。单页缓存命中可能直接 ready，其他情况异步处理；请求成功不保证任务最终成功。
 

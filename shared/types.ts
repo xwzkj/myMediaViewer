@@ -160,13 +160,6 @@ export type LocalComputeMode = 'local' | 'remote'
 export type LocalComputeFallback = 'error' | 'local'
 
 export interface LocalComputeSettings {
-  /**
-   * 是否允许在运行主服务的这台机器上执行 AI 计算（漫画检测 / OCR / 擦字与 CLIP 编码）。
-   *
-   * 关闭后本机不加载、也不运行任何 ONNX 模型；任务只能交给远程计算端完成，
-   * 连不上时直接报错，后台索引与预热暂停。旧配置缺少该字段时视为开启。
-   */
-  localAiEnabled: boolean
   /** 本地主机 ONNX 线程上限；旧配置默认为 1。 */
   localThreads?: number
   mode: LocalComputeMode

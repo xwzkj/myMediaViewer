@@ -9,7 +9,6 @@ const emit = defineEmits<{ changed: []; notice: [message: string] }>()
 const status = ref<BackgroundStatus | null>(null)
 const drafts = ref<Record<string, SourceBackgroundSettings>>({})
 const localMode = ref(false)
-const localAiEnabled = ref(true)
 const busy = ref(''), error = ref('')
 const confirmation = ref<{ sourceId:string; settings:SourceBackgroundSettings; token:string; warning:string } | null>(null)
 const accepted = ref(false)
@@ -20,7 +19,7 @@ watch(() => props.sources, sources => {
 }, { immediate:true })
 const poller = createStatusPoller(
   () => api<BackgroundStatus>('/background/status'),
-  value => { status.value=value; localMode.value=value.localComputeMode === 'local'; localAiEnabled.value=value.localAiEnabled !== false },
+  value => { status.value=value; localMode.value=value.localComputeMode === 'local' },
   e => { error.value=(e as Error).message }, 5000,
 )
 const refresh = poller.refresh
@@ -77,7 +76,6 @@ async function control(id:string, action:'pause'|'stop'|'resume'|'retry') {
   <section class="settings-section background-settings">
     <div class="section-heading"><div><h3>后台索引与漫画预热</h3><p>所有功能默认关闭，按媒体来源启用。手动翻译优先；暂停和停止在当前计算检查点生效，不重复计费重试。</p></div></div>
     <p class="helper">CLIP 以文搜图需要单独安装匹配的模型和分词器；缺少模型时明确提示，不生成虚假结果。OCR 预热只缓存识别与透明擦字层，不调用收费翻译接口，也不修改原图。</p>
-    <p v-if="localMode && !localAiEnabled" class="warning" role="status">本机 AI 计算已关闭：CLIP 索引、OCR 预热与自动翻译会暂停。在「AI 翻译 → 本机 AI 计算」重新开启，或改用可用的远程计算端后自动恢复。</p>
     <p v-if="!sources.length" class="helper">先添加媒体来源，再启用需要的后台功能。</p>
     <details v-for="source in sources" :key="source.id" class="background-source">
       <summary>{{ source.name }} <small>{{ sourceStatus(source.id)?.state === 'paused' ? '已暂停' : sourceStatus(source.id)?.state === 'stopped' ? '已停止' : '可运行' }} · 待处理 {{ sourceStatus(source.id)?.counts.queued || 0 }} · 完成 {{ sourceStatus(source.id)?.counts.done || 0 }}</small></summary>
@@ -90,7 +88,7 @@ async function control(id:string, action:'pause'|'stop'|'resume'|'retry') {
         <div class="budget-fields">
           <label class="field">每日后台计算项上限<input v-model.number="drafts[source.id]!.maxPagesPerDay" type="number" min="1" max="100000" required /></label>
           <label v-if="drafts[source.id]!.autoTranslate" class="field">每日翻译请求上限<input v-model.number="drafts[source.id]!.maxTranslationRequestsPerDay" type="number" min="1" max="10000" required /></label>
-          <label v-if="localMode && localAiEnabled" class="field">本地后台占空比（%）<input v-model.number="drafts[source.id]!.localDutyPercent" type="number" min="5" max="100" required /><span>通过任务间休息降低平均负载，并非 CPU 使用率硬上限。E3 等低配主机建议 25%。</span></label>
+          <label v-if="localMode" class="field">本地后台占空比（%）<input v-model.number="drafts[source.id]!.localDutyPercent" type="number" min="5" max="100" required /><span>通过任务间休息降低平均负载，并非 CPU 使用率硬上限。E3 等低配主机建议 25%。</span></label>
         </div>
         <p v-if="activeLabel(source.id)" class="helper" role="status">{{ activeLabel(source.id) }}</p>
         <p class="helper">今日已尝试 {{ sourceStatus(source.id)?.pagesToday || 0 }} 项计算 / {{ sourceStatus(source.id)?.translationRequestsToday || 0 }} 次翻译请求。按 UTC 日期重置；请求上限不等于金额上限，失败调用也可能计费。</p>

@@ -388,15 +388,9 @@ export async function createApp(logging = true, semanticProvider?: SemanticProvi
 
   app.get('/api/ai/settings', async () => getAiSettings())
   app.put<{ Body: Record<string, unknown> }>('/api/ai/settings', async request => {
-    const before = getAiSettings().localCompute
     const saved = saveAiSettings(request.body)
     clearMangaStatusCache()
     logInfo('配置', `AI 接口设置已更新 · 模型 ${saved.model || '未选择'} · ${saved.baseUrl}`)
-    if (before.localAiEnabled !== saved.localCompute.localAiEnabled) {
-      logInfo('配置', saved.localCompute.localAiEnabled
-        ? '本机 AI 计算已开启'
-        : `本机 AI 计算已关闭：不再在本机执行检测、OCR 与语义编码（当前执行位置 ${saved.localCompute.mode === 'remote' ? '远程计算端' : '本地主机'}）`)
-    }
     return saved
   })
   // 测试与模型列表允许带上设置页里还没保存的表单内容，避免必须“先保存才能测试”。
