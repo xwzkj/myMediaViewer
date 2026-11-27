@@ -30,10 +30,15 @@ export async function getSemanticStatus(provider = getSemanticProvider()): Promi
   const status = await provider.status()
   return { ...status, ...(status.model ? await semanticStore.counts(status.model) : { indexedAssets: 0, indexedWorks: 0 }) }
 }
-/** Include this in background job stamps; model files are immutable until server restart. */
-export async function semanticIndexRevision(): Promise<string> {
+/**
+ * Include this in background job stamps; model files are immutable until server restart.
+ *
+ * 未就绪时返回 null，绝不把「暂时不可用」写进指纹：否则计算端离线期间只要同步一次，
+ * 已完成的任务就全部作废，等它恢复后再整体重排一遍。
+ */
+export async function semanticIndexRevision(): Promise<string | null> {
   const status = await getSemanticProvider().status()
-  return status.ready ? status.model : `unavailable:${status.provider}`
+  return status.ready ? status.model : null
 }
 export function invalidateSemanticAsset(assetId: string): void { semanticStore.invalidate(assetId) }
 const pending = new Map<string, Promise<SemanticIndexResult>>()

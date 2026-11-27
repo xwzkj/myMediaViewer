@@ -19,10 +19,13 @@ const activeTasks = new Map<string, ActiveTask>()
 let timer: ReturnType<typeof setInterval> | undefined
 let checking = false, ticking = false, synchronizing: Promise<void> | null = null, syncAgain = false
 let stopped = false, cooldownUntil = 0, roundRobin = 0
-let semanticRevision = 'unavailable'
+/** CLIP 模型版本；只在模型真正就绪时记录，未知时保持 null，不参与指纹计算。 */
+let semanticRevision: string | null = null
 const nextChecks = new Map<string, number>()
 const directoryChecks = new Map<string,AbortController>()
+const BACKOFF_BASE_MS = 60_000, BACKOFF_MAX_MS = 30 * 60_000
 const blockedUntil = new Map<string, number>()
+const backoffSteps = new Map<string, number>()
 let stopWatcher: AbortController | null = null
 let removeScanListener: (() => void) | undefined
 const httpError = (message: string, statusCode = 400) => Object.assign(new Error(message), { statusCode, expose: true })
@@ -37,7 +40,7 @@ export function translationSignature(): string {
   return createHash('sha256').update(JSON.stringify([settings.baseUrl,settings.apiKey,settings.model,settings.targetLanguage,settings.appendPrompt,settings.params,settings.outputMode])).digest('hex')
 }
 function taskStamp(asset: StoredAsset, kind: BackgroundTaskKind) {
-  return JSON.stringify([asset.path,asset.size,asset.modified,kind === 'translate' ? translationSignature() : kind === 'semantic' ? semanticRevision : 'v2'])
+  return JSON.stringify([asset.path,asset.size,asset.modified,kind === 'translate' ? translationSignature() : kind === 'semantic' ? semanticRevision ?? '' : 'v2'])
 }
 function enabledKinds(settings: SourceBackgroundSettings): BackgroundTaskKind[] {
   return [...(settings.semantic ? ['semantic' as const] : []), ...(settings.autoTranslate ? ['translate' as const] : settings.ocr ? ['ocr' as const] : [])]
@@ -52,14 +55,35 @@ function abortSource(sourceId: string) {
 /** 同一种任务同时只跑一个：CLIP 会话与付费翻译都不适合并发堆积。 */
 function allowedKinds(): BackgroundTaskKind[] {
   const kinds: BackgroundTaskKind[] = ['semantic', 'ocr', 'translate']
-  if ([...activeTasks.values()].some(entry => entry.task.kind === 'semantic')) kinds.splice(kinds.indexOf('semantic'), 1)
-  if ([...activeTasks.values()].some(entry => entry.task.kind === 'translate')) kinds.splice(kinds.indexOf('translate'), 1)
+  const drop = (kind: BackgroundTaskKind) => { const index = kinds.indexOf(kind); if (index >= 0) kinds.splice(index, 1) }
+  // CLIP 版本未知时先不碰语义任务：保持原指纹，等模型恢复后的同步再决定是否重排。
+  if (!semanticRevision) drop('semantic')
+  if ([...activeTasks.values()].some(entry => entry.task.kind === 'semantic')) drop('semantic')
+  if ([...activeTasks.values()].some(entry => entry.task.kind === 'translate')) drop('translate')
   return kinds
+}
+/**
+ * 来源级退避：连接、鉴权、预算这类整源问题不要每秒重撞。
+ * 60 秒起步、逐次翻倍、上限 30 分钟；成功一次或手动继续/暂停/停止都会清零。
+ */
+export function backoffDelayMs(step: number): number {
+  return Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (Math.max(1, Math.floor(step)) - 1))
+}
+function deferSource(sourceId: string, message: string) {
+  const step = Math.min((backoffSteps.get(sourceId) ?? 0) + 1, 6)
+  backoffSteps.set(sourceId, step)
+  const delay = backoffDelayMs(step)
+  blockedUntil.set(sourceId, Date.now() + delay)
+  backgroundQueue.message(sourceId, `${message}（已退避 ${Math.round(delay / 60000)} 分钟，点「继续」立即重试）`)
+  return delay
+}
+function clearBackoff(sourceId: string) {
+  blockedUntil.delete(sourceId)
+  backoffSteps.delete(sourceId)
 }
 function deferTask(sourceId: string, task: Task, message: string) {
   backgroundQueue.mark(task.id, 'queued', message)
-  backgroundQueue.message(sourceId, message)
-  blockedUntil.set(sourceId, Date.now() + 60000)
+  deferSource(sourceId, message)
 }
 
 export function createTranslationConfirmation(sourceId: string, raw: unknown) {
@@ -89,7 +113,7 @@ export function saveBackgroundSettings(sourceId: string, raw: unknown, token?: s
   if (!settings.autoTranslate) backgroundQueue.consent(sourceId,'')
   abortSource(sourceId)
   directoryChecks.get(sourceId)?.abort()
-  blockedUntil.delete(sourceId); nextChecks.delete(sourceId)
+  clearBackoff(sourceId); nextChecks.delete(sourceId)
   void synchronizeBackground().catch(error => backgroundQueue.message(sourceId, String(error)))
   return settings
 }
@@ -99,7 +123,8 @@ export function controlBackground(sourceId: string, action: 'pause' | 'stop' | '
   backgroundQueue.setState(sourceId,state)
   if (action === 'retry') backgroundQueue.retry(sourceId)
   if (action === 'pause' || action === 'stop') { directoryChecks.get(sourceId)?.abort(); abortSource(sourceId) }
-  blockedUntil.delete(sourceId)
+  // 手动继续 / 重试不清退避就白点了：人工干预始终立即生效。
+  clearBackoff(sourceId)
   if (state === 'running') void synchronizeBackground().catch(error => backgroundQueue.message(sourceId,String(error)))
 }
 export function getBackgroundStatus(): BackgroundStatus {
@@ -116,12 +141,19 @@ export async function synchronizeBackground(): Promise<void> {
       syncAgain = false
       if (sources.some(source => normalizeSourceBackground(source.background).semantic && backgroundQueue.control(source.id).state === 'running')) {
         const semantic = await import('../semantic/service.js')
-        semanticRevision = await semantic.semanticIndexRevision()
+        try {
+          const revision = await semantic.semanticIndexRevision()
+          // 只在模型真正就绪时更新。计算端离线时保持上一次的版本，已完成的任务才不会被重排。
+          if (revision) semanticRevision = revision
+        } catch (error) { logWarn('后台', `CLIP 状态探测失败，沿用上次版本 · ${(error as Error).message}`) }
       }
       for (const source of [...sources]) {
         const kinds = enabledKinds(normalizeSourceBackground(source.background))
         backgroundQueue.removeDisabled(source.id,kinds)
         if (!kinds.length) continue
+        // 版本未知时跳过语义入队（也不删旧行）：等模型恢复后的同步再决定。
+        const enqueueKinds = semanticRevision ? kinds : kinds.filter(kind => kind !== 'semantic')
+        if (!enqueueKinds.length) continue
         let after = ''
         while (!stopped) {
           const rows = db.prepare('SELECT a.id,a.data FROM assets a JOIN works w ON w.id=a.work_id WHERE w.source_id=? AND a.id>? ORDER BY a.id LIMIT 128').all(source.id,after) as Array<{id:string;data:string}>
@@ -129,7 +161,7 @@ export async function synchronizeBackground(): Promise<void> {
           for (const row of rows) {
             const asset = JSON.parse(row.data) as StoredAsset
             if (!asset.display || asset.kind !== 'image' || asset.extension === 'gif') continue
-            for (const kind of kinds) backgroundQueue.enqueue(source.id,asset.id,taskStamp(asset,kind),kind)
+            for (const kind of enqueueKinds) backgroundQueue.enqueue(source.id,asset.id,taskStamp(asset,kind),kind)
           }
           after = rows.at(-1)!.id
           await yieldToRequests()
@@ -232,6 +264,19 @@ function assetSpecificFailure(error: unknown): boolean {
 }
 
 /**
+ * 计算端暂时连不上：任务回到队列等下一次，而不是记成失败项让人手动重试。
+ * 已经预留过付费请求的除外——那种情况必须人工确认，避免重复计费。
+ */
+const TRANSIENT_FAILURE_CODES = new Set([
+  'compute_connect_timeout', 'compute_unreachable', 'compute_disconnected', 'compute_not_ready',
+  'semantic_unavailable',
+])
+function transientFailure(error: unknown): boolean {
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'string' && TRANSIENT_FAILURE_CODES.has(code)
+}
+
+/**
  * 启动一轮后台任务。
  *
  * 远程模式会一次补满流水线（默认 3 个），而不是算完一张再等下一次 1 秒定时器：
@@ -318,10 +363,13 @@ async function runBackgroundTask(
     }
     backgroundQueue.mark(task.id, 'done')
     backgroundQueue.message(source.id, '')
+    clearBackoff(source.id)
   } catch (error) {
     // 首次启用语义索引会先自动下载 CLIP 模型：这不是失败，等下载完成后重试。
     const downloading = (error as { code?: string }).code === 'semantic_downloading'
-    const deferred = error instanceof DeferredTask || controller.signal.aborted || downloading
+    // 计算端连不上是暂时的：任务留在队列，退避后自动再来，不堆成「失败项」。
+    const transient = !billed && transientFailure(error)
+    const deferred = error instanceof DeferredTask || controller.signal.aborted || downloading || transient
     // After a request was reserved, interruption is ambiguous: require an explicit retry to avoid surprise billing.
     const state = deferred && !billed ? (backgroundQueue.control(task.source_id).state === 'stopped' ? 'stopped' : 'queued') : 'failed'
     backgroundQueue.mark(task.id, state, (error as Error).message)
@@ -330,8 +378,8 @@ async function runBackgroundTask(
     else if (downloading) logInfo('后台', 'CLIP 模型正在下载/加载，任务稍后自动重试')
     else logWarn('后台', `暂缓任务 · ${(error as Error).message}`)
     // 单页资源超限/格式损坏只标记这一页失败，立即补位；连接、鉴权、预算或
-    // 配置问题才让整个来源退避 60 秒，避免反复撞同一个错误。
-    if (!assetSpecificFailure(error)) blockedUntil.set(task.source_id, Date.now() + 60000)
+    // 配置问题才让整个来源退避（60 秒起步、逐次翻倍），避免反复撞同一个错误。
+    if (!assetSpecificFailure(error)) deferSource(task.source_id, (error as Error).message)
   } finally {
     activeTasks.delete(task.id)
     if (usedLocal) duty = settings.localDutyPercent
@@ -341,12 +389,30 @@ async function runBackgroundTask(
   }
 }
 
+/**
+ * CLIP 模型在服务启动后才恢复时，没人再触发同步就会一直不跑语义任务。
+ * 版本未知时每分钟轻量探测一次，就绪后补一次同步把语义任务接回去。
+ */
+let revisionProbeAt = 0
+async function probeSemanticRevision() {
+  if (semanticRevision || Date.now() < revisionProbeAt) return
+  if (!sources.some(source => normalizeSourceBackground(source.background).semantic && backgroundQueue.control(source.id).state === 'running')) return
+  revisionProbeAt = Date.now() + 60000
+  try {
+    const semantic = await import('../semantic/service.js')
+    const revision = await semantic.semanticIndexRevision()
+    if (!revision) return
+    semanticRevision = revision
+    await synchronizeBackground()
+  } catch { /* 探测失败继续等下个周期 */ }
+}
+
 export function startBackgroundRuntime() {
   if (timer) return
   stopped = false; stopWatcher = new AbortController()
   removeScanListener = onScanComplete(() => { void synchronizeBackground().catch(() => {}) })
   void synchronizeBackground().catch(() => {})
-  timer = setInterval(() => { void checkBackgroundDirectories().catch(() => {}); void runBackgroundTick().catch(() => {}) },1000)
+  timer = setInterval(() => { void checkBackgroundDirectories().catch(() => {}); void runBackgroundTick().catch(() => {}); void probeSemanticRevision().catch(() => {}) },1000)
   timer.unref()
 }
 export function stopBackgroundRuntime() {
