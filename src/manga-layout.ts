@@ -71,35 +71,62 @@ export function chooseMangaTextLayout(
   return vertical
 }
 
-/** 横排：从大到小找到能塞进区域的字号，都塞不下时用最小字号并交给调用方裁剪。 */
+/**
+ * 横排：找到能塞进区域的最大字号，都塞不下时用最小字号并交给调用方裁剪。
+ *
+ * 字号越小越容易放下，所以用二分而不是从 maxSize 逐个往下试：一个 600×200 的
+ * 气泡原本要试近两百次、每次都整段重新排版，大页面上画一页能卡好几秒。
+ */
 export function fitHorizontalText(ctx: TextMeasureContext, text: string, maxWidth: number, maxHeight: number): MangaTextLayout {
-  const maxSize = Math.max(8, Math.floor(Math.min(maxWidth, maxHeight)))
-  for (let size = maxSize; size >= MANGA_MIN_FONT_SIZE; size--) {
+  let lowest = MANGA_MIN_FONT_SIZE
+  let highest = Math.max(8, Math.floor(Math.min(maxWidth, maxHeight)))
+  let best: MangaTextLayout | null = null
+  while (lowest <= highest) {
+    const size = Math.floor((lowest + highest) / 2)
     const lines = wrapCanvasText(ctx, text, size, MANGA_FONT_FAMILY, maxWidth)
     if (lines.every(line => ctx.measureText(line).width <= maxWidth) && lines.length * size * MANGA_LINE_HEIGHT <= maxHeight) {
-      return { size, lines, vertical: false }
+      best = { size, lines, vertical: false }
+      lowest = size + 1
+    } else {
+      highest = size - 1
     }
   }
+  if (best) return best
   return { size: MANGA_MIN_FONT_SIZE, lines: wrapCanvasText(ctx, text, MANGA_MIN_FONT_SIZE, MANGA_FONT_FAMILY, maxWidth), vertical: false }
 }
 
-/** 竖排：按字号算出每列能放几个字，再要求所有列加起来的宽度不超出气泡。 */
+/**
+ * 竖排：按字号算出每列能放几个字，再要求所有列加起来的宽度不超出气泡。
+ * 同样用二分找最大字号：字号越小每列越能多放字、列数越少。
+ */
 export function fitVerticalText(ctx: TextMeasureContext, chars: string[], maxWidth: number, maxHeight: number): MangaTextLayout | null {
-  const maxSize = Math.max(8, Math.floor(Math.min(maxWidth, maxHeight)))
-  for (let size = maxSize; size >= MANGA_MIN_FONT_SIZE; size--) {
+  const layoutAt = (size: number): MangaTextLayout | null => {
     const pitch = size * MANGA_COLUMN_PITCH
     const perColumn = Math.max(1, Math.floor(maxHeight / pitch))
     const columns = Math.ceil(chars.length / perColumn)
-    if (columns * pitch > maxWidth) continue
+    if (columns * pitch > maxWidth) return null
     ctx.font = `600 ${size}px ${MANGA_FONT_FAMILY}`
     let widest = 0
     for (const char of chars) widest = Math.max(widest, ctx.measureText(char).width)
-    if (widest > maxWidth) continue
+    if (widest > maxWidth) return null
     const lines: string[] = []
     for (let i = 0; i < chars.length; i += perColumn) lines.push(chars.slice(i, i + perColumn).join(''))
     return { size, lines, vertical: true }
   }
-  return null
+  let lowest = MANGA_MIN_FONT_SIZE
+  let highest = Math.max(8, Math.floor(Math.min(maxWidth, maxHeight)))
+  let best: MangaTextLayout | null = null
+  while (lowest <= highest) {
+    const size = Math.floor((lowest + highest) / 2)
+    const layout = layoutAt(size)
+    if (layout) {
+      best = layout
+      lowest = size + 1
+    } else {
+      highest = size - 1
+    }
+  }
+  return best
 }
 
 /** 竖排只适合方块字：英文、数字竖起来会变成一列难认的单字母。 */

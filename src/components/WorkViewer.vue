@@ -191,6 +191,8 @@ async function handleMangaJob(job: MangaJob, token: number, notify: boolean) {
   for (const item of incoming) {
     mangaResults.value[item.assetId] = item.result
     mangaMisses.delete(item.assetId)
+    // 浮层开着的时候整部翻译可能在继续出结果，邻近的页跟着换成译文。
+    refreshPreviewTranslation(item.assetId)
   }
 
   const currentResult = asset.value ? mangaResults.value[asset.value.id] : undefined
@@ -366,6 +368,7 @@ watch(() => asset.value?.id, async (assetId, _previous, onCleanup) => {
         mangaResults.value[item.id] = result
         mangaMisses.delete(item.id)
         if (asset.value?.id === item.id) void showMangaTranslated(item.id)
+        refreshPreviewTranslation(item.id)
       } else {
         // 没有缓存就记住，本次作品会话里不再重复请求同一张图片。
         mangaMisses.add(item.id)
@@ -469,6 +472,8 @@ const contentStyle = computed(() => workOffset.value !== 0 || workAnimating.valu
   : undefined)
 // 放大浮层（Vant ImagePreview）只保留我们自己的会话信息，浮层本体由 vant 托管。
 type PreviewAsset = { item: WorkDetail['assets'][number]; pageIndex: number }
+/** 一页生成好的整页译图：key 识别结果版本，url 可能是 blob: 或 data:。 */
+type PreviewTranslation = { key: string; url: string }
 type PreviewSession = {
   id: number
   workId: string
@@ -476,11 +481,28 @@ type PreviewSession = {
   images: string[]
   index: number
   closing: boolean
+  /** 每一页最初解析出的图片地址；译图被释放时回退到这里。 */
+  sources: string[]
   /** 原图地址 → 预览图地址；原图 403/404 时兜底换回。 */
   fallbacks: Map<string, string>
-  /** 用 Canvas 译图代替原图的页（打开时的那一页）。 */
-  translatedIndex: number
+  /** 打开浮层时的那一页。 */
+  initial: number
+  /**
+   * 主舞台当时明确显示成原图、但这一页其实有译文的资源 id（用户点过「查看原图」）。
+   * 只对打开时这一页生效：翻到别的页、或主舞台自己切回译文后都清掉，之后和主查看器一样。
+   */
+  sourcePage?: string
+  /** 已经生成好的整页译图（按作品资源 id 记）。 */
+  translations: Map<string, PreviewTranslation>
+  /** 正在生成的整页译图，同一页翻来翻去只画一次。 */
+  pending: Map<string, Promise<string>>
+  /** 关闭浮层时要释放的 blob 地址。 */
+  objectUrls: Set<string>
 }
+/** 浮层里最多同时保留几页译图；超出后释放最早生成的一页，避免整部漫画都驻留内存。 */
+const PREVIEW_TRANSLATION_LIMIT = 8
+/** 浮层译图的 JPEG 质量：整页图按屏幕尺寸看，0.92 看不出压缩痕迹，编码却比 PNG 快得多。 */
+const PREVIEW_IMAGE_QUALITY = 0.92
 /** showImagePreview 返回的实例（vant 的类型是 any，这里只声明用到的部分）。 */
 type ImagePreviewHandle = { close: () => void }
 /** function-call 的选项类型漏掉了这两个点击开关，组件本身是支持的。 */
@@ -692,35 +714,223 @@ function openPreview() {
   if (!entries.length) return
   const found = entries.findIndex(entry => entry.item.id === asset.value?.id)
   const initialIndex = found >= 0 ? found : 0
-  const translated = mangaResult.value && mangaMode.value === 'translated' && mangaCanvas.value
-    ? mangaCanvas.value.toDataURL('image/png')
-    : ''
+  // 和放大前保持一致：当前页显示译图就点开译图；当前页被手动切回原图时，这一页保持原图。
+  const current = asset.value
+  const result = mangaResult.value
+  const showsTranslation = mangaMode.value === 'translated' && Boolean(result?.regions.length)
+  const sourcePage = mangaMode.value === 'source' && result?.regions.length ? current.id : undefined
   // Bug 1：浮层与主舞台共用同一套分辨率解析；正在放大的这一页按需升级到原图。
   const originals = new Set(originalAssets.value)
   const fallbacks = new Map<string, string>()
-  const urls = entries.map((entry, at) => {
-    if (translated && at === initialIndex) return translated
+  const sources = entries.map((entry, at) => {
     const source = resolvePreviewSource(entry.item, originals, { forceOriginal: at === initialIndex })
     if (!source) return entry.item.url
     if (source.fallback) fallbacks.set(source.src, source.fallback)
     return source.src
   })
-  if (!translated && asset.value.origin === 'pixiv') originals.add(asset.value.id)
+  if (!showsTranslation && current.origin === 'pixiv') originals.add(current.id)
   originalAssets.value = originals
   closePreview(false)
   const session: PreviewSession = {
     id: ++previewSessionId,
     workId: props.work.id,
     assets: entries,
-    images: urls,
+    images: [...sources],
+    sources,
     index: initialIndex,
     closing: false,
     fallbacks,
-    translatedIndex: translated ? initialIndex : -1,
+    initial: initialIndex,
+    sourcePage,
+    translations: new Map(),
+    pending: new Map(),
+    objectUrls: new Set(),
+  }
+  // 主舞台上的译图已经是画好的 canvas：直接转成图片给浮层，打开时不会先闪一下原图。
+  if (showsTranslation && result) {
+    const canvas = mangaCanvas.value
+    const url = canvas && canvas.width > 0 ? canvasImageUrl(canvas) : ''
+    if (url) {
+      session.images[initialIndex] = url
+      session.translations.set(current.id, { key: result.key, url })
+    }
   }
   previewSession = session
   previewing.value = true
   previewHandle = showImagePreview(previewOptions(session, initialIndex)) as ImagePreviewHandle
+  void preparePreviewTranslations(session, initialIndex)
+}
+/** canvas 转图片 data URL；超大画布可能失败，失败时给空串。 */
+function canvasImageUrl(canvas: HTMLCanvasElement): string {
+  // 整页译图是不透明的页面照片 + 文字，JPEG 比 PNG 快一个数量级、体积也小得多；
+  // 预览按屏幕尺寸显示，0.92 的压缩完全看不出来，PNG 反而会让翻页卡住。
+  try { return canvas.toDataURL('image/jpeg', PREVIEW_IMAGE_QUALITY) } catch { return '' }
+}
+/** canvas 转浮层能直接用的地址：优先 blob（不进 JS 字符串内存），不行再退回 data URL。 */
+function canvasObjectUrl(canvas: HTMLCanvasElement): Promise<string> {
+  return new Promise(resolve => {
+    try {
+      canvas.toBlob(blob => resolve(blob ? URL.createObjectURL(blob) : canvasImageUrl(canvas)), 'image/jpeg', PREVIEW_IMAGE_QUALITY)
+    } catch {
+      resolve(canvasImageUrl(canvas))
+    }
+  })
+}
+/** 把一页的擦字底图、覆盖层和译文画进目标 canvas；主舞台与浮层共用同一套画法。 */
+function paintMangaResult(canvas: HTMLCanvasElement, result: MangaPageResult, base: CanvasImageSource, overlay: CanvasImageSource | null): boolean {
+  if (!result.width || !result.height) return false
+  canvas.width = result.width
+  canvas.height = result.height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return false
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
+  ctx.drawImage(base, 0, 0, result.width, result.height)
+  if (overlay) {
+    try { ctx.drawImage(overlay, 0, 0, result.width, result.height) } catch { /* 覆盖层失败不影响文字层 */ }
+  }
+  for (const region of result.regions) drawMangaRegion(ctx, region)
+  return true
+}
+/** 给放大浮层生成一页整页译图；底图与覆盖层直接复用主舞台的图片缓存。 */
+async function renderMangaComposite(result: MangaPageResult): Promise<HTMLCanvasElement | null> {
+  let base: HTMLImageElement
+  let overlay: HTMLImageElement | null = null
+  try {
+    base = await loadPreviewImage(result.baseUrl)
+    if (result.overlayUrl) overlay = await loadPreviewImage(result.overlayUrl)
+  } catch {
+    return null
+  }
+  if (disposed) return null
+  const canvas = document.createElement('canvas')
+  return paintMangaResult(canvas, result, base, overlay) ? canvas : null
+}
+/**
+ * 译图渲染专用取图：先走共享缓存；缓存容量小，被主舞台的预热挤掉时
+ * （加载会被取消并抛错）退回独立加载，浏览器缓存让这次请求依然很便宜。
+ */
+async function loadPreviewImage(url: string): Promise<HTMLImageElement> {
+  try {
+    return await images.load(url, url)
+  } catch {
+    return await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image()
+      image.decoding = 'async'
+      image.onload = () => { void image.decode().catch(() => {}).then(() => resolve(image)) }
+      image.onerror = () => reject(new Error('图片加载失败'))
+      image.src = url
+    })
+  }
+}
+/** 浮层里这一页换成译图：更新会话地址，已经渲染出来的页直接换 <img>，不重开浮层。 */
+function applyPreviewTranslation(session: PreviewSession, at: number, url: string) {
+  session.images[at] = url
+  // 翻到这一页时 Vant 可能刚按旧地址渲染完 <img>，所以每次都按当前地址校正一遍。
+  const item = previewItemElement(at)
+  const image = item?.querySelector('img')
+  if (image) {
+    if (image.getAttribute('src') !== url) image.src = url
+    return
+  }
+  // Vant 加载失败时会把 <img> 从 DOM 里摘掉，只能重开一次让它按新地址重建。
+  if (at === session.index && item?.querySelector('.van-image__error')) reopenPreview(session)
+}
+function releasePreviewTranslation(session: PreviewSession, assetId: string) {
+  const item = session.translations.get(assetId)
+  if (!item) return
+  session.translations.delete(assetId)
+  if (!item.url.startsWith('blob:')) return
+  session.objectUrls.delete(item.url)
+  try { URL.revokeObjectURL(item.url) } catch { /* 已经释放过 */ }
+}
+/** 译图有数量上限：翻过很多页后释放最早生成的，正在看的那一页除外。 */
+function trimPreviewTranslations(session: PreviewSession) {
+  for (const [assetId, item] of [...session.translations]) {
+    if (session.translations.size <= PREVIEW_TRANSLATION_LIMIT) return
+    const at = session.assets.findIndex(entry => entry.item.id === assetId)
+    if (at === session.index) continue
+    releasePreviewTranslation(session, assetId)
+    if (at < 0 || session.images[at] !== item.url) continue
+    // 图片已经释放：这一页退回原图地址，免得下次翻回来显示成坏图。
+    session.images[at] = session.sources[at] || session.assets[at]!.item.url
+    const image = previewItemElement(at)?.querySelector('img')
+    if (image) image.src = session.images[at]!
+  }
+}
+/** 让浮层里某一页显示整页译图；没有译文、或这一页被手动切成了原图就保持原图。 */
+async function showPreviewTranslation(session: PreviewSession, at: number): Promise<void> {
+  const entry = session.assets[at]
+  if (!entry || session.sourcePage === entry.item.id) return
+  const result = mangaResults.value[entry.item.id]
+  if (!result?.regions.length) return
+  const ready = session.translations.get(entry.item.id)
+  if (ready?.key === result.key) {
+    applyPreviewTranslation(session, at, ready.url)
+    return
+  }
+  let pending = session.pending.get(entry.item.id)
+  if (!pending) {
+    pending = (async () => {
+      const canvas = await renderMangaComposite(result)
+      return canvas ? await canvasObjectUrl(canvas) : ''
+    })()
+    session.pending.set(entry.item.id, pending)
+    // 生成完就清掉进行中的标记；失败也允许下次重试。
+    void pending.finally(() => { if (session.pending.get(entry.item.id) === pending) session.pending.delete(entry.item.id) })
+  }
+  const url = await pending
+  if (!url) return
+  // 浮层已关闭 / 换成别的作品，或者等待期间又出了新版本：这张图用不上，直接释放。
+  if (previewSession !== session || session.closing || mangaResults.value[entry.item.id] !== result) {
+    if (url.startsWith('blob:')) { try { URL.revokeObjectURL(url) } catch { /* 已经释放过 */ } }
+    return
+  }
+  // 同一页可能被并发等待（翻页补齐 + 译文晚到），先到的那次已经装好了同一张图：
+  // 不能再释放一遍，否则正在加载的 <img> 会变成 ERR_FILE_NOT_FOUND。
+  if (session.translations.get(entry.item.id)?.url === url) {
+    applyPreviewTranslation(session, at, url)
+    return
+  }
+  releasePreviewTranslation(session, entry.item.id)
+  session.translations.set(entry.item.id, { key: result.key, url })
+  if (url.startsWith('blob:')) session.objectUrls.add(url)
+  applyPreviewTranslation(session, at, url)
+  trimPreviewTranslations(session)
+}
+/** 等翻页动画走完再画相邻页，别和滑动抢主线程；固定延时比 requestIdleCallback 可预期。 */
+function prefetchLater(callback: () => void) {
+  setTimeout(callback, 260)
+}
+/** 打开 / 翻页时补当前页；相邻两页稍后预热，翻过去时通常已经画好。 */
+async function preparePreviewTranslations(session: PreviewSession, at: number) {
+  await showPreviewTranslation(session, at)
+  prefetchLater(() => { void prefetchPreviewNeighbors(session, at) })
+}
+async function prefetchPreviewNeighbors(session: PreviewSession, at: number) {
+  // 用户已经翻走 / 关了浮层就别再画了，省得给新的一页添乱。
+  const stale = () => previewSession !== session || session.closing || session.index !== at
+  for (const offset of [1, -1]) {
+    if (stale()) return
+    const next = at + offset
+    if (next < 0 || next >= session.assets.length) continue
+    await showPreviewTranslation(session, next)
+  }
+}
+/** 译文结果晚到（任务轮询或缓存预热）时，更新已经打开的浮层里邻近的页。 */
+function refreshPreviewTranslation(assetId: string) {
+  const session = previewSession
+  if (!session || session.closing) return
+  const at = session.assets.findIndex(entry => entry.item.id === assetId)
+  if (at < 0 || Math.abs(at - session.index) > 1) return
+  void showPreviewTranslation(session, at)
+}
+function releasePreviewTranslations(session: PreviewSession) {
+  for (const url of session.objectUrls) {
+    try { URL.revokeObjectURL(url) } catch { /* 已经释放过 */ }
+  }
+  session.objectUrls.clear()
+  session.translations.clear()
+  session.pending.clear()
 }
 function previewOptions(session: PreviewSession, startPosition: number): MediaPreviewOptions {
   return {
@@ -752,6 +962,8 @@ function reopenPreview(session: PreviewSession) {
 function changePreviewPage(session: PreviewSession, at: number) {
   if (previewSession !== session || session.closing) return
   session.index = at
+  // 和主查看器一样：翻到别的页就不再保留「这一页手动看原图」，翻回来按有没有译文重新决定。
+  if (at !== session.initial) session.sourcePage = undefined
   resetPreviewZoom()
   const entry = session.assets[at]
   if (!entry) return
@@ -761,6 +973,7 @@ function changePreviewPage(session: PreviewSession, at: number) {
     selectPage(entry.pageIndex, false)
   }
   void upgradePreviewPage(session, at)
+  void preparePreviewTranslations(session, at)
 }
 /** 方向键翻页：function-call 没暴露 prev/next，用 startPosition 跳到相邻页。 */
 function stepPreview(step: 1 | -1) {
@@ -774,7 +987,10 @@ function stepPreview(step: 1 | -1) {
 /** 正在浏览 / 放大的 Pixiv 页按需取原图；拿不到就继续用预览图。 */
 async function upgradePreviewPage(session: PreviewSession, at: number) {
   const entry = session.assets[at]
-  if (!entry || entry.item.origin !== 'pixiv' || session.translatedIndex === at) return
+  if (!entry || entry.item.origin !== 'pixiv') return
+  // 已经按整页译图渲染（或马上要换成译图）的页本身就是原图尺寸，不必再下载一次原图。
+  if (session.translations.has(entry.item.id)) return
+  if (mangaResults.value[entry.item.id]?.regions.length && session.sourcePage !== entry.item.id) return
   const url = originalAssetUrl(entry.item)
   if (session.images[at] === url) return
   const source = resolvePreviewSource(entry.item, originalAssets.value, { forceOriginal: true })
@@ -786,6 +1002,7 @@ async function upgradePreviewPage(session: PreviewSession, at: number) {
   }
   if (previewSession !== session || session.closing || session.assets[at] !== entry) return
   session.images[at] = url
+  session.sources[at] = url
   session.fallbacks.set(url, source.fallback)
   originalAssets.value = new Set([...originalAssets.value, entry.item.id])
   const element = previewItemElement(at)?.querySelector('img')
@@ -814,6 +1031,7 @@ function previewImageError(event: Event) {
     originalAssets.value = next
   }
   session.images = session.images.map(image => image === src ? fallback : image)
+  session.sources = session.sources.map(image => image === src ? fallback : image)
   reopenPreview(session)
 }
 // Vant ImagePreview 只处理触摸：桌面端补上滚轮缩放与拖拽平移（不重写成第二个查看器）。
@@ -893,6 +1111,7 @@ function closePreview(sync = true) {
   previewSession = undefined
   previewing.value = false
   resetPreviewZoom()
+  if (session) releasePreviewTranslations(session)
   if (sync && session) {
     const entry = session.assets[session.index]
     if (entry && entry.pageIndex !== index.value) {
@@ -992,32 +1211,18 @@ async function drawMangaResult() {
   const version = ++drawVersion
   const workId = props.work.id
   const assetId = asset.value?.id
-  let image: HTMLImageElement
+  let base: HTMLImageElement
+  let overlay: HTMLImageElement | null = null
   try {
-    image = await images.load(result.baseUrl, result.baseUrl)
+    base = await images.load(result.baseUrl, result.baseUrl)
     // 新缓存把擦字结果存成透明覆盖层，叠加在原图之上；旧缓存没有这一层。
-    if (result.overlayUrl) await images.load(result.overlayUrl, result.overlayUrl)
+    if (result.overlayUrl) overlay = await images.load(result.overlayUrl, result.overlayUrl)
   } catch (e) {
     if (!disposed && version === drawVersion && asset.value?.id === assetId) mangaError.value = (e as Error).message
     return
   }
   if (disposed || version !== drawVersion || props.work.id !== workId || asset.value?.id !== assetId || mangaCanvas.value !== canvas || mangaResult.value?.key !== result.key || mangaMode.value !== 'translated') return
-  canvas.width = result.width
-  canvas.height = result.height
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return
-  ctx.clearRect(0, 0, canvas.width, canvas.height)
-  ctx.drawImage(image, 0, 0, result.width, result.height)
-  if (result.overlayUrl) {
-    try {
-      const overlay = await images.load(result.overlayUrl, result.overlayUrl)
-      if (version !== drawVersion || mangaCanvas.value !== canvas || mangaResult.value?.key !== result.key) return
-      ctx.drawImage(overlay, 0, 0, result.width, result.height)
-    } catch {
-      // 覆盖层失败不影响文字层：气泡底色仍由每处文本的 background 兜底。
-    }
-  }
-  for (const region of result.regions) drawMangaRegion(ctx, region)
+  paintMangaResult(canvas, result, base, overlay)
   mangaReadyKey.value = result.key
 }
 
@@ -1039,6 +1244,11 @@ async function showMangaTranslated(assetId: string) {
   if (disposed || asset.value?.id !== assetId) return
   mangaMode.value = 'translated'
   mangaReadyKey.value = result.key
+  // 主舞台这一页已经切回译图，浮层里对应页（打开时被手动切原图的那一页）也跟着切。
+  if (previewSession?.sourcePage === assetId) {
+    previewSession.sourcePage = undefined
+    refreshPreviewTranslation(assetId)
+  }
   await nextTick()
   void drawMangaResult()
 }
